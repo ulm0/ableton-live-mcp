@@ -69,7 +69,10 @@ export function trackSummary(track: Track<V>, role?: string) {
   };
 }
 
-export function clipSummary(clip: Clip<V>) {
+// `detail` adds note_count / full warp_markers — both marshal every note/marker
+// across the host boundary, so bulk listings (track_get) stay light and only
+// clip_get pays for it.
+export function clipSummary(clip: Clip<V>, detail = false) {
   const base: Record<string, unknown> = {
     id: remember(clip),
     class: classOf(clip),
@@ -86,15 +89,17 @@ export function clipSummary(clip: Clip<V>) {
     loop_end: num(clip.loopEnd),
   };
   if (clip instanceof MidiClip) {
-    base.note_count = clip.notes.length;
+    if (detail) base.note_count = clip.notes.length;
   } else if (clip instanceof AudioClip) {
     base.file_path = clip.filePath;
     base.warping = clip.warping;
     base.warp_mode = WarpMode[num(clip.warpMode)];
-    base.warp_markers = clip.warpMarkers.map((m) => ({
-      sample_time: num(m.sampleTime),
-      beat_time: num(m.beatTime),
-    }));
+    if (detail) {
+      base.warp_markers = clip.warpMarkers.map((m) => ({
+        sample_time: num(m.sampleTime),
+        beat_time: num(m.beatTime),
+      }));
+    }
   }
   return base;
 }
@@ -112,7 +117,7 @@ export function takeLaneSummary(lane: TakeLane<V>) {
   return {
     id: remember(lane),
     name: lane.name,
-    clips: lane.clips.map(clipSummary),
+    clips: lane.clips.map((c) => clipSummary(c)),
   };
 }
 
@@ -136,7 +141,7 @@ export function deviceSummary(device: Device<V>) {
   return base;
 }
 
-export function parameterSummary(param: DeviceParameter<V>) {
+export function parameterSummary(param: DeviceParameter<V>, includeValueItems = true) {
   return {
     id: remember(param),
     name: param.name,
@@ -144,7 +149,7 @@ export function parameterSummary(param: DeviceParameter<V>) {
     max: num(param.max),
     default_value: num(param.defaultValue),
     is_quantized: param.isQuantized,
-    value_items: param.isQuantized
+    value_items: includeValueItems && param.isQuantized
       ? param.valueItems.map((v, i) => ({ index: i, name: v.name, short_name: v.shortName }))
       : undefined,
   };

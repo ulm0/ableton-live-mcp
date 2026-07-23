@@ -12,7 +12,7 @@ await esbuild.build({
   platform: "node",
   sourcesContent: false,
   // The Extension Host evaluates the bundle in a VM context without `global`.
-  define: { global: "globalThis" },
+  define: { global: "globalThis", __EXT_VERSION__: JSON.stringify(manifest.version) },
   // That VM context also lacks web globals (Request, Response, ReadableStream,
   // fetch, EventTarget, ...) that the MCP SDK needs at load time. Core modules
   // are shared with the main Node context, so a core-module function's Function

@@ -36,6 +36,12 @@ const opDetail = await call("device_get", { device_id: op.id });
 assert.ok(opDetail.parameters.length > 10);
 step(`inserted Operator with ${opDetail.parameters.length} parameters`);
 
+// filtered + valued parameter fetch
+const volOnly = await call("device_get", { device_id: op.id, parameter_filter: "volume", include_values: true });
+assert.ok(volOnly.parameters.length >= 1 && volOnly.parameters.length < opDetail.parameters.length);
+assert.equal(typeof volOnly.parameters[0].value, "number");
+step(`parameter_filter "volume" -> ${volOnly.parameters.length} params with values`);
+
 const vol = opDetail.parameters.find((p) => p.name === "Volume") ?? opDetail.parameters[1];
 const target = (vol.min + vol.max) / 2;
 await call("parameter_set", { values: [{ parameter_id: vol.id, value: target }] });
@@ -44,23 +50,35 @@ assert.ok(Math.abs(volNow.value - target) < 1e-6);
 step(`parameter roundtrip on "${vol.name}" = ${volNow.value}`);
 
 // --- MIDI clip + notes ------------------------------------------------------
-const trackDetail = await call("track_get", { track_id: midi.id });
-const slot = trackDetail.clip_slots[0];
-const clip = await call("clip_create", { type: "midi", target_id: slot.id, duration: 4 });
-await call("midi_clip_set_notes", {
-  clip_id: clip.id,
+// one-call create: track target + scene_index + inline notes + name/color
+const clip = await call("clip_create", {
+  type: "midi", target_id: midi.id, scene_index: 0, duration: 4,
+  name: "Smoke Chord", color: "#00ff88",
   notes: [
     { pitch: 60, start_time: 0, duration: 1, velocity: 100 },
     { pitch: 64, start_time: 1, duration: 1, velocity: 90 },
     { pitch: 67, start_time: 2, duration: 2, velocity: 80, probability: 0.9 },
   ],
 });
+assert.equal(clip.name, "Smoke Chord");
+assert.equal(clip.note_count, 3);
 const notes = await call("midi_clip_get_notes", { clip_id: clip.id });
-assert.equal(notes.note_count, 3);
 assert.equal(notes.notes[0].pitch, 60);
-const named = await call("clip_set", { clip_id: clip.id, name: "Smoke Chord", color: "#00ff88" });
-assert.equal(named.name, "Smoke Chord");
-step("session MIDI clip: 3 notes written+read, renamed, recolored");
+step("one-call session MIDI clip: scene_index target, 3 inline notes, named, colored");
+
+// merge + server-side edit
+await call("midi_clip_set_notes", { clip_id: clip.id, mode: "merge", notes: [{ pitch: 42, start_time: 0.5, duration: 0.25 }] });
+const edited = await call("midi_clip_edit_notes", { clip_id: clip.id, select: { pitch_min: 42, pitch_max: 42 }, transpose: 12, velocity_scale: 0.8 });
+assert.equal(edited.note_count, 4);
+assert.equal(edited.changed_count, 1);
+const afterEdit = await call("midi_clip_get_notes", { clip_id: clip.id });
+assert.ok(afterEdit.notes.some((n) => n.pitch === 54));
+step("merge + midi_clip_edit_notes (transpose selected) verified");
+
+// track addressing by name
+const byName = await call("track_get", { track_name: "MCP Smoke", include: ["devices"] });
+assert.equal(byName.devices.length, 1);
+step("track_get by name with include selector");
 
 // arrangement clip
 const arr = await call("clip_create", { type: "midi", target_id: midi.id, start_time: 8, duration: 4 });
@@ -85,7 +103,14 @@ if (chainDetail.receiving_note !== undefined) {
 // --- mixer ------------------------------------------------------------------
 const mixer = await call("mixer_get", { target_id: midi.id });
 assert.ok(mixer.volume.id && mixer.panning.id);
+assert.match(mixer.volume.hint, /0 dB/);
 step(`mixer_get: volume=${mixer.volume.value.toFixed(3)}, ${mixer.sends.length} sends`);
+
+const origVol = mixer.volume.value;
+const setMix = await call("mixer_set", { target_id: midi.id, volume: 0.7, panning: -0.2 });
+assert.ok(Math.abs(setMix.volume.value - 0.7) < 1e-6);
+await call("mixer_set", { target_id: midi.id, volume: origVol, panning: 0 });
+step("mixer_set volume+pan roundtrip, restored");
 
 // --- audio: generate wav -> import -> clip -> warp -> render ----------------
 const wavPath = path.join(os.tmpdir(), "mcp-smoke-tone.wav");
@@ -111,8 +136,9 @@ step(`audio clip from generated wav, imported to ${aclip.imported_path}`);
 
 const warped = await call("clip_set", { clip_id: aclip.id, warping: true, warp_mode: "Tones" });
 assert.equal(warped.warp_mode, "Tones");
-assert.ok(Array.isArray(warped.warp_markers));
-step(`warp mode set to Tones, ${warped.warp_markers.length} warp markers`);
+const aclipDetail = await call("clip_get", { clip_id: aclip.id });
+assert.ok(Array.isArray(aclipDetail.warp_markers));
+step(`warp mode set to Tones, ${aclipDetail.warp_markers.length} warp markers (clip_get)`);
 
 const render = await call("render_track_audio", { track_id: audio.id, start_time: 0, end_time: 2 });
 assert.ok(fs.existsSync(render.audio_path), `rendered audio missing: ${render.audio_path}`);

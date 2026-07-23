@@ -50,8 +50,13 @@ import {
 
 type Ctx = ExtensionContext<"1.0.0">;
 
+declare const __EXT_VERSION__: string | undefined;
+
 const DEFAULT_PORT = 8722;
-const SERVER_INFO = { name: "ableton-live", version: "1.0.0" };
+const SERVER_INFO = {
+  name: "ableton-live",
+  version: typeof __EXT_VERSION__ !== "undefined" ? __EXT_VERSION__ : "dev",
+};
 
 const WARP_MODES = ["Beats", "Tones", "Texture", "Repitch", "Complex", "ComplexPro"] as const;
 
@@ -63,7 +68,7 @@ function json(data: unknown) {
     content: [
       {
         type: "text" as const,
-        text: JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2),
+        text: JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
       },
     ],
   };
@@ -82,6 +87,28 @@ const noteShape = {
   velocity_deviation: z.number().optional(),
   release_velocity: z.number().min(0).max(127).optional(),
 };
+
+function toNoteDescription(n: {
+  pitch: number;
+  start_time: number;
+  duration: number;
+  velocity?: number;
+  muted?: boolean;
+  probability?: number;
+  velocity_deviation?: number;
+  release_velocity?: number;
+}): NoteDescription {
+  return {
+    pitch: n.pitch,
+    startTime: n.start_time,
+    duration: n.duration,
+    velocity: n.velocity,
+    muted: n.muted,
+    probability: n.probability,
+    velocityDeviation: n.velocity_deviation,
+    releaseVelocity: n.release_velocity,
+  };
+}
 
 const loopSettingsShape = z
   .object({
@@ -110,11 +137,23 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     shape: S,
     handler: (args: z.objectOutputType<S, z.ZodTypeAny>) => Promise<unknown> | unknown,
   ) {
-    server.registerTool(name, { description, inputSchema: shape }, (async (args: never) => {
+    // Spec-legal tools/call may omit `arguments` entirely; a bare z.object(shape)
+    // rejects undefined. Preprocess coerces undefined -> {}, and gluing `shape`
+    // back on keeps the SDK's tools/list schema generation intact.
+    const schema = Object.assign(z.preprocess((v) => v ?? {}, z.object(shape)), { shape });
+    server.registerTool(name, { description, inputSchema: schema as never }, (async (args: never) => {
       try {
-        return json(await handler(args));
+        return json(await handler(args ?? ({} as never)));
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        // The host rejects most async operations with no error value at all —
+        // surface something actionable instead of "undefined".
+        const msg =
+          e instanceof Error
+            ? e.message
+            : e === undefined
+              ? "the Live host rejected the operation without details — check argument " +
+                "values (device name spelling, index ranges, file paths, clip overlaps)."
+              : String(e);
         return {
           content: [{ type: "text" as const, text: `Error: ${msg}\n${STALE_HINT}` }],
           isError: true,
@@ -127,13 +166,20 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "song_get",
-    "Get the full state of the current Live Set: tempo, scale, grid, all tracks " +
+    "Get the state of the current Live Set: tempo, scale, grid, all tracks " +
       "(with ids), return tracks, main track, scenes, cue points, and extension " +
       "environment info. This is the entry point — object ids returned here are " +
-      "used by every other tool. Times are in beats throughout the API.",
-    {},
-    () => {
+      "used by every other tool. Times are in beats throughout the API. Use " +
+      "`include` to fetch only some sections (tempo/grid/scale always included).",
+    {
+      include: z
+        .array(z.enum(["tracks", "scenes", "cue_points", "environment"]))
+        .optional()
+        .describe("Sections to include; omit for everything"),
+    },
+    ({ include }) => {
       const s = song();
+      const want = (k: string) => !include || include.includes(k as never);
       return {
         tempo: num(s.tempo),
         grid: { quantization: gridName(s.gridQuantization), is_triplet: s.gridIsTriplet },
@@ -143,18 +189,20 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           mode_enabled: s.scaleMode,
           intervals: s.scaleIntervals.map(num),
         },
-        tracks: s.tracks.map((t) => trackSummary(t)),
-        return_tracks: s.returnTracks.map((t) => trackSummary(t, "return")),
-        main_track: trackSummary(s.mainTrack, "main"),
-        scenes: s.scenes.map(sceneSummary),
-        cue_points: s.cuePoints.map(cuePointSummary),
-        environment: {
-          storage_directory: context.environment.storageDirectory,
-          temp_directory: context.environment.tempDirectory,
-          language: context.environment.language,
-          host_api_version: hostApiVersion,
-          mcp_port: port,
-        },
+        tracks: want("tracks") ? s.tracks.map((t) => trackSummary(t)) : undefined,
+        return_tracks: want("tracks") ? s.returnTracks.map((t) => trackSummary(t, "return")) : undefined,
+        main_track: want("tracks") ? trackSummary(s.mainTrack, "main") : undefined,
+        scenes: want("scenes") ? s.scenes.map(sceneSummary) : undefined,
+        cue_points: want("cue_points") ? s.cuePoints.map(cuePointSummary) : undefined,
+        environment: want("environment")
+          ? {
+              storage_directory: context.environment.storageDirectory,
+              temp_directory: context.environment.tempDirectory,
+              language: context.environment.language,
+              host_api_version: hostApiVersion,
+              mcp_port: port,
+            }
+          : undefined,
       };
     },
   );
@@ -171,33 +219,74 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   // -- tracks ----------------------------------------------------------------
 
+  // Track addressing without a prior song_get: by index or (case-insensitive)
+  // name across regular, return, and main tracks.
+  function findTrack(args: { track_id?: string; track_index?: number; track_name?: string }) {
+    if (args.track_id !== undefined) return resolve(args.track_id, Track);
+    const s = song();
+    if (args.track_index !== undefined) {
+      const t = s.tracks[args.track_index];
+      if (!t) throw new Error(`track_index ${args.track_index} out of range (0-${s.tracks.length - 1}).`);
+      return t;
+    }
+    if (args.track_name !== undefined) {
+      const all = [...s.tracks, ...s.returnTracks, s.mainTrack];
+      const exact = all.filter((t) => t.name === args.track_name);
+      const ci = exact.length
+        ? exact
+        : all.filter((t) => t.name.toLowerCase() === args.track_name!.toLowerCase());
+      if (ci.length === 1) return ci[0];
+      throw new Error(
+        (ci.length ? `Ambiguous track name` : `No track named`) +
+          ` "${args.track_name}". Tracks: ${all.map((t) => JSON.stringify(t.name)).join(", ")}.`,
+      );
+    }
+    throw new Error("Provide track_id, track_index, or track_name.");
+  }
+
+  async function mixerDetail(mixer: TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">) {
+    const returnNames = mixer instanceof TrackMixer ? song().returnTracks.map((t) => t.name) : [];
+    const [volume, panning, sends] = await Promise.all([
+      parameterWithValue(mixer.volume),
+      parameterWithValue(mixer.panning),
+      Promise.all(mixer.sends.map(parameterWithValue)),
+    ]);
+    return {
+      id: remember(mixer),
+      volume: { ...volume, hint: "normalized 0-1 (0.85 = 0 dB unity, 1.0 = +6 dB)" },
+      panning: { ...panning, hint: "-1 = full left, 0 = center, 1 = full right" },
+      sends: sends.map((s, i) => ({ ...s, return_track: returnNames[i] })),
+    };
+  }
+
   tool(
     "track_get",
-    "Get full detail for one track: properties, clip slots (session view, with " +
+    "Get detail for one track: properties, clip slots (session view, with " +
       "clips), take lanes, arrangement clips, devices, and mixer (volume/pan/sends " +
-      "with current values). Works for regular, return, and main tracks.",
-    { track_id: z.string() },
-    async ({ track_id }) => {
-      const track = resolve(track_id, Track);
-      const mixer = track.mixer;
-      const returnNames = song().returnTracks.map((t) => t.name);
-      const [volume, panning, sends] = await Promise.all([
-        parameterWithValue(mixer.volume),
-        parameterWithValue(mixer.panning),
-        Promise.all(mixer.sends.map(parameterWithValue)),
-      ]);
+      "with current values). Works for regular, return, and main tracks. Address " +
+      "by track_id, track_index (0-based, regular tracks only), or track_name. " +
+      "Use `include` to fetch only some sections.",
+    {
+      track_id: z.string().optional(),
+      track_index: z.number().int().min(0).optional(),
+      track_name: z.string().optional(),
+      include: z
+        .array(z.enum(["clip_slots", "take_lanes", "arrangement_clips", "devices", "mixer"]))
+        .optional()
+        .describe("Sections to include; omit for everything"),
+    },
+    async (args) => {
+      const track = findTrack(args);
+      const want = (k: string) => !args.include || args.include.includes(k as never);
       return {
         ...trackSummary(track),
-        clip_slots: track.clipSlots.map(clipSlotSummary),
-        take_lanes: track.takeLanes.map(takeLaneSummary),
-        arrangement_clips: track.arrangementClips.map(clipSummary),
-        devices: track.devices.map(deviceSummary),
-        mixer: {
-          id: remember(mixer),
-          volume,
-          panning,
-          sends: sends.map((s, i) => ({ ...s, return_track: returnNames[i] })),
-        },
+        clip_slots: want("clip_slots") ? track.clipSlots.map(clipSlotSummary) : undefined,
+        take_lanes: want("take_lanes") ? track.takeLanes.map(takeLaneSummary) : undefined,
+        arrangement_clips: want("arrangement_clips")
+          ? track.arrangementClips.map((c) => clipSummary(c))
+          : undefined,
+        devices: want("devices") ? track.devices.map(deviceSummary) : undefined,
+        mixer: want("mixer") ? await mixerDetail(track.mixer) : undefined,
       };
     },
   );
@@ -345,16 +434,27 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_create",
-    "Create a MIDI or audio clip. Target is one of: a clip slot id (session view), " +
-      "a track id (arrangement — MidiTrack for midi, AudioTrack for audio; requires " +
-      "start_time), or a take lane id (requires start_time). MIDI clips require " +
-      "duration. Audio clips require file_path (absolute path to an audio file); by " +
-      "default the file is first imported into the Live project (recommended).",
+    "Create a MIDI or audio clip. Target: a clip slot id (session view), a track " +
+      "id (arrangement — MidiTrack for midi, AudioTrack for audio; requires " +
+      "start_time — OR session view when scene_index is given), or a take lane id " +
+      "(requires start_time). MIDI clips require duration and can be created with " +
+      "their notes inline. Audio clips require file_path; by default the file is " +
+      "first imported into the Live project (recommended). Optional name/color " +
+      "apply right after creation.",
     {
       type: z.enum(["midi", "audio"]),
       target_id: z.string().describe("ClipSlot, Track, or TakeLane id"),
+      scene_index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("With a track target: create in this session clip slot instead of the arrangement"),
       start_time: z.number().optional().describe("Arrangement position in beats (track/take-lane targets)"),
       duration: z.number().positive().optional().describe("Clip length in beats"),
+      notes: z.array(z.object(noteShape)).optional().describe("MIDI only: initial notes"),
+      name: z.string().optional(),
+      color: z.string().optional().describe("#RRGGBB"),
       file_path: z.string().optional().describe("Audio file path (audio clips only)"),
       is_warped: z.boolean().optional().describe("Audio only. Required when loop_settings is set"),
       loop_settings: loopSettingsShape.optional(),
@@ -364,9 +464,25 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         .describe("Audio only: copy the file into the Live project first"),
     },
     async (args) => {
-      const target = resolve(args.target_id, DataModelObject);
+      let target = resolve(args.target_id, DataModelObject);
+      if (args.scene_index !== undefined) {
+        if (!(target instanceof Track))
+          throw new Error(`scene_index requires a Track target, got ${classOf(target)}.`);
+        const slot = target.clipSlots[args.scene_index];
+        if (!slot)
+          throw new Error(
+            `scene_index ${args.scene_index} out of range (track has ${target.clipSlots.length} slots).`,
+          );
+        target = slot;
+      }
       const need = (cond: unknown, what: string) => {
         if (cond === undefined || cond === null) throw new Error(`${what} is required for this target/type.`);
+      };
+      const parsedColor = args.color !== undefined ? hexToColor(args.color) : undefined;
+      const finish = (clip: Clip<"1.0.0">, extra?: Record<string, unknown>) => {
+        if (args.name !== undefined) clip.name = args.name;
+        if (parsedColor !== undefined) clip.color = parsedColor;
+        return { ...clipSummary(clip, true), ...extra };
       };
 
       if (args.type === "midi") {
@@ -382,10 +498,18 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
             `MIDI clips need a ClipSlot, MidiTrack, or TakeLane target, got ${classOf(target)}.`,
           );
         }
-        return clipSummary(clip);
+        if (args.notes?.length) clip.notes = args.notes.map(toNoteDescription);
+        return finish(clip);
       }
 
       need(args.file_path, "file_path");
+      // Validate the target before importing so a bad target doesn't leave an
+      // orphan copy in the project folder.
+      if (!(target instanceof ClipSlot) && !(target instanceof AudioTrack) && !(target instanceof TakeLane))
+        throw new Error(
+          `Audio clips need a ClipSlot, AudioTrack, or TakeLane target, got ${classOf(target)}.`,
+        );
+      if (args.notes) throw new Error("notes only apply to MIDI clips.");
       const filePath = args.import_into_project
         ? await context.resources.importIntoProject(args.file_path!)
         : args.file_path!;
@@ -399,7 +523,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       let clip: AudioClip<"1.0.0">;
       if (target instanceof ClipSlot) {
         clip = await target.createAudioClip({ filePath, isWarped: args.is_warped, loopSettings });
-      } else if (target instanceof AudioTrack || target instanceof TakeLane) {
+      } else {
         need(args.start_time, "start_time");
         clip = await target.createAudioClip({
           filePath,
@@ -408,12 +532,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           isWarped: args.is_warped,
           loopSettings,
         });
-      } else {
-        throw new Error(
-          `Audio clips need a ClipSlot, AudioTrack, or TakeLane target, got ${classOf(target)}.`,
-        );
       }
-      return { ...clipSummary(clip), imported_path: args.import_into_project ? filePath : undefined };
+      return finish(clip, { imported_path: args.import_into_project ? filePath : undefined });
     },
   );
 
@@ -422,7 +542,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "Get full detail for one clip (MIDI: note count; audio: file, warp settings " +
       "and warp markers). Use midi_clip_get_notes for the actual notes.",
     { clip_id: z.string() },
-    ({ clip_id }) => clipSummary(resolve(clip_id, Clip)),
+    ({ clip_id }) => clipSummary(resolve(clip_id, Clip), true),
   );
 
   tool(
@@ -502,24 +622,87 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "midi_clip_set_notes",
-    "Replace ALL notes of a MIDI clip with the given notes. To edit incrementally, " +
-      "first read with midi_clip_get_notes, modify, then write back the full list.",
-    { clip_id: z.string(), notes: z.array(z.object(noteShape)) },
-    ({ clip_id, notes }) => {
+    "Write notes to a MIDI clip. mode 'replace' (default) replaces ALL notes; " +
+      "mode 'merge' adds the given notes on top of the existing ones (layering " +
+      "without re-sending the current content). For mechanical edits of existing " +
+      "notes (transpose, shift, quantize, ...) prefer midi_clip_edit_notes.",
+    {
+      clip_id: z.string(),
+      notes: z.array(z.object(noteShape)),
+      mode: z.enum(["replace", "merge"]).default("replace"),
+    },
+    ({ clip_id, notes, mode }) => {
       const clip = resolve(clip_id, MidiClip);
-      clip.notes = notes.map(
-        (n): NoteDescription => ({
-          pitch: n.pitch,
-          startTime: n.start_time,
-          duration: n.duration,
-          velocity: n.velocity,
-          muted: n.muted,
-          probability: n.probability,
-          velocityDeviation: n.velocity_deviation,
-          releaseVelocity: n.release_velocity,
-        }),
-      );
-      return { note_count: clip.notes.length };
+      const incoming = notes.map(toNoteDescription);
+      clip.notes = mode === "merge" ? [...clip.notes, ...incoming] : incoming;
+      return { note_count: mode === "merge" ? undefined : notes.length, added: mode === "merge" ? notes.length : undefined };
+    },
+  );
+
+  tool(
+    "midi_clip_edit_notes",
+    "Transform existing notes of a MIDI clip server-side — no need to read and " +
+      "rewrite the note list. Optional `select` restricts which notes are " +
+      "affected (by pitch/time range); others pass through untouched. Transforms " +
+      "(applied in this order): transpose (semitones), time_shift (beats), " +
+      "velocity_scale, velocity_offset, quantize (snap start times to a beat " +
+      "grid, strength 0-1), or delete=true to remove the selected notes. " +
+      "Results are clamped to valid MIDI ranges.",
+    {
+      clip_id: z.string(),
+      select: z
+        .object({
+          pitch_min: z.number().int().min(0).max(127).optional(),
+          pitch_max: z.number().int().min(0).max(127).optional(),
+          time_min: z.number().optional(),
+          time_max: z.number().optional(),
+        })
+        .optional(),
+      transpose: z.number().int().optional().describe("Semitones, negative = down"),
+      time_shift: z.number().optional().describe("Beats, negative = earlier"),
+      velocity_scale: z.number().min(0).optional(),
+      velocity_offset: z.number().optional(),
+      quantize: z
+        .object({ grid: z.number().positive().describe("Grid in beats, e.g. 0.25 = 1/16"), strength: z.number().min(0).max(1).default(1) })
+        .optional(),
+      delete: z.boolean().optional().describe("Delete the selected notes instead of transforming"),
+    },
+    (args) => {
+      const clip = resolve(args.clip_id, MidiClip);
+      const sel = args.select ?? {};
+      const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+      const selected = (n: NoteDescription) =>
+        (sel.pitch_min === undefined || num(n.pitch) >= sel.pitch_min) &&
+        (sel.pitch_max === undefined || num(n.pitch) <= sel.pitch_max) &&
+        (sel.time_min === undefined || num(n.startTime) >= sel.time_min) &&
+        (sel.time_max === undefined || num(n.startTime) <= sel.time_max);
+      let changed = 0;
+      const out: NoteDescription[] = [];
+      for (const n of clip.notes) {
+        if (!selected(n)) {
+          out.push(n);
+          continue;
+        }
+        if (args.delete) {
+          changed++;
+          continue;
+        }
+        const t = { ...n, pitch: num(n.pitch), startTime: num(n.startTime) };
+        if (args.transpose) t.pitch = clamp(t.pitch + args.transpose, 0, 127);
+        if (args.time_shift) t.startTime = Math.max(0, t.startTime + args.time_shift);
+        if (args.velocity_scale !== undefined || args.velocity_offset !== undefined) {
+          const v = num(t.velocity ?? 100) * (args.velocity_scale ?? 1) + (args.velocity_offset ?? 0);
+          t.velocity = clamp(v, 1, 127);
+        }
+        if (args.quantize) {
+          const snapped = Math.round(t.startTime / args.quantize.grid) * args.quantize.grid;
+          t.startTime = t.startTime + (snapped - t.startTime) * args.quantize.strength;
+        }
+        changed++;
+        out.push(t);
+      }
+      clip.notes = out;
+      return { note_count: out.length, changed_count: changed };
     },
   );
 
@@ -527,16 +710,39 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_get",
-    "Get full detail for one device: all parameters (with metadata and ids), " +
-      "rack chains, drum rack pads, or Simpler sample.",
-    { device_id: z.string() },
-    ({ device_id }) => {
+    "Get detail for one device: parameters (metadata + ids), rack chains, drum " +
+      "rack pads, or Simpler sample. Big devices have 100+ parameters — use " +
+      "parameter_filter (case-insensitive substring on the name) to fetch only " +
+      "what you need, include_values to read current values in the same call, " +
+      "and include_chain_devices to inline each rack chain's devices (e.g. map " +
+      "a whole drum kit pad→note→sample in one call).",
+    {
+      device_id: z.string(),
+      parameter_filter: z.string().optional(),
+      include_value_items: z.boolean().default(true),
+      include_values: z.boolean().default(false),
+      include_chain_devices: z.boolean().default(false),
+    },
+    async ({ device_id, parameter_filter, include_value_items, include_values, include_chain_devices }) => {
       const device = resolve(device_id, Device);
-      const base = deviceSummary(device);
+      let params = device.parameters;
+      if (parameter_filter !== undefined) {
+        const q = parameter_filter.toLowerCase();
+        params = params.filter((par) => par.name.toLowerCase().includes(q));
+      }
+      const parameters = include_values
+        ? await Promise.all(params.map((par) => parameterWithValue(par)))
+        : params.map((par) => parameterSummary(par, include_value_items));
       return {
-        ...base,
-        parameters: device.parameters.map(parameterSummary),
-        chains: device instanceof RackDevice ? device.chains.map(chainSummary) : undefined,
+        ...deviceSummary(device),
+        parameters,
+        chains:
+          device instanceof RackDevice
+            ? device.chains.map((c) => ({
+                ...chainSummary(c),
+                devices: include_chain_devices ? c.devices.map(deviceSummary) : undefined,
+              }))
+            : undefined,
       };
     },
   );
@@ -599,16 +805,10 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     { chain_id: z.string() },
     async ({ chain_id }) => {
       const chain = resolve(chain_id, Chain);
-      const mixer = chain.mixer;
-      const [volume, panning, sends] = await Promise.all([
-        parameterWithValue(mixer.volume),
-        parameterWithValue(mixer.panning),
-        Promise.all(mixer.sends.map(parameterWithValue)),
-      ]);
       return {
         ...chainSummary(chain),
         devices: chain.devices.map(deviceSummary),
-        mixer: { id: remember(mixer), volume, panning, sends },
+        mixer: await mixerDetail(chain.mixer),
       };
     },
   );
@@ -689,27 +889,50 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     async ({ target_id }) => {
       const target = resolve(target_id, DataModelObject);
       const mixer =
-        target instanceof Track
+        target instanceof Track || target instanceof Chain
           ? target.mixer
-          : target instanceof Chain
-            ? target.mixer
-            : target instanceof TrackMixer || target instanceof ChainMixer
-              ? target
-              : null;
+          : target instanceof TrackMixer || target instanceof ChainMixer
+            ? target
+            : null;
       if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
-      const returnNames =
-        mixer instanceof TrackMixer ? song().returnTracks.map((t) => t.name) : [];
-      const [volume, panning, sends] = await Promise.all([
-        parameterWithValue(mixer.volume),
-        parameterWithValue(mixer.panning),
-        Promise.all(mixer.sends.map(parameterWithValue)),
-      ]);
-      return {
-        id: remember(mixer),
-        volume,
-        panning,
-        sends: sends.map((s, i) => ({ ...s, return_track: returnNames[i] })),
-      };
+      return await mixerDetail(mixer);
+    },
+  );
+
+  tool(
+    "mixer_set",
+    "Set volume, panning, and/or sends of a track or rack chain mixer in one " +
+      "call (single undo step). Volume is normalized 0-1 (0.85 = 0 dB unity, " +
+      "1.0 = +6 dB); panning is -1..1; sends are addressed by index (order " +
+      "matches the return tracks).",
+    {
+      target_id: z.string().describe("Track, Chain, or mixer id"),
+      volume: z.number().min(0).max(1).optional(),
+      panning: z.number().min(-1).max(1).optional(),
+      sends: z
+        .array(z.object({ index: z.number().int().min(0), value: z.number().min(0).max(1) }))
+        .optional(),
+    },
+    async ({ target_id, volume, panning, sends }) => {
+      const target = resolve(target_id, DataModelObject);
+      const mixer =
+        target instanceof Track || target instanceof Chain
+          ? target.mixer
+          : target instanceof TrackMixer || target instanceof ChainMixer
+            ? target
+            : null;
+      if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
+      const writes: Array<() => Promise<void>> = [];
+      if (volume !== undefined) writes.push(() => mixer.volume.setValue(volume));
+      if (panning !== undefined) writes.push(() => mixer.panning.setValue(panning));
+      for (const send of sends ?? []) {
+        const p = mixer.sends[send.index];
+        if (!p) throw new Error(`send index ${send.index} out of range (${mixer.sends.length} sends).`);
+        writes.push(() => p.setValue(send.value));
+      }
+      if (!writes.length) throw new Error("Nothing to set — provide volume, panning, and/or sends.");
+      await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
+      return await mixerDetail(mixer);
     },
   );
 
@@ -827,6 +1050,11 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
         res.end("Not found. MCP endpoint: POST /mcp");
         return;
       }
+      if (Number(req.headers["content-length"]) > 16_000_000) {
+        res.writeHead(413, { "content-type": "text/plain" });
+        res.end("Payload too large");
+        return;
+      }
       // Stateless mode: a fresh server+transport per request. Object ids live in
       // the module-level store, so state survives across requests regardless.
       const transport = new StreamableHTTPServerTransport({
@@ -876,11 +1104,9 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
     `<button onclick="(window.webkit?.messageHandlers?.live??window.chrome?.webview).postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
     `</body>`;
   context.commands.registerCommand("ableton-live-mcp.status", () => {
-    void context.ui.showModalDialog(
-      `data:text/html,${encodeURIComponent(statusHtml())}`,
-      420,
-      220,
-    );
+    context.ui
+      .showModalDialog(`data:text/html,${encodeURIComponent(statusHtml())}`, 420, 220)
+      .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
   });
   for (const scope of ["AudioTrack", "MidiTrack"] as const) {
     void context.ui.registerContextMenuAction(

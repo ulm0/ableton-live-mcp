@@ -41,7 +41,15 @@ const call = async (name, args = {}) => {
 
 // tools/list
 const { tools } = await client.listTools();
-assert.ok(tools.length >= 35, `expected >=35 tools, got ${tools.length}`);
+assert.equal(tools.length, 40, `expected exactly 40 tools, got ${tools.length}`);
+
+// song_get with NO arguments key at all (spec-legal; regression for empty-shape validation)
+const noArgs = await client.callTool({ name: "song_get" });
+assert.ok(!noArgs.isError, `song_get without arguments failed: ${noArgs.content[0].text}`);
+
+// song_get include selector: only tempo/grid/scale + scenes
+const partial = await call("song_get", { include: ["scenes"] });
+assert.ok(partial.scenes && !partial.tracks && !partial.cue_points && !partial.environment);
 
 // song_get
 let song = await call("song_get");
@@ -63,8 +71,19 @@ const track = await call("track_get", { track_id: midiTrackId });
 assert.equal(track.name, "Bass");
 assert.equal(track.devices.length, 1);
 assert.equal(track.clip_slots.length, 2);
-assert.equal(track.clip_slots[0].clip.note_count, 2);
+assert.equal(track.clip_slots[0].clip.class, "MidiClip");
 assert.equal(track.mixer.volume.value, 0.85);
+assert.match(track.mixer.volume.hint, /0 dB/);
+
+// track addressing by index and name, include selector
+const byIndex = await call("track_get", { track_index: 0, include: ["devices"] });
+assert.equal(byIndex.name, "Bass");
+assert.ok(byIndex.devices && !byIndex.clip_slots && !byIndex.mixer);
+const byName = await call("track_get", { track_name: "drums", include: [] });
+assert.equal(byName.name, "Drums");
+const badName = await client.callTool({ name: "track_get", arguments: { track_name: "nope" } });
+assert.equal(badName.isError, true);
+assert.match(badName.content[0].text, /No track named/);
 const clipId = track.clip_slots[0].clip.id;
 const emptySlotId = track.clip_slots[1].id;
 const deviceId = track.devices[0].id;
@@ -75,6 +94,7 @@ assert.equal((await call("track_set", { track_id: midiTrackId, name: "Bass 2", m
 // midi notes roundtrip
 const notes = await call("midi_clip_get_notes", { clip_id: clipId });
 assert.equal(notes.note_count, 2);
+assert.equal((await call("clip_get", { clip_id: clipId })).note_count, 2);
 await call("midi_clip_set_notes", {
   clip_id: clipId,
   notes: [
@@ -85,25 +105,61 @@ await call("midi_clip_set_notes", {
 });
 assert.equal((await call("midi_clip_get_notes", { clip_id: clipId })).note_count, 3);
 
-// clip_create midi in empty session slot
-const newClip = await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8 });
+// merge mode: layer 1 note on top without resending
+await call("midi_clip_set_notes", {
+  clip_id: clipId, mode: "merge",
+  notes: [{ pitch: 42, start_time: 0.5, duration: 0.25, velocity: 70 }],
+});
+assert.equal((await call("midi_clip_get_notes", { clip_id: clipId })).note_count, 4);
+
+// edit_notes: transpose only the hi-hat (pitch 42) up 12, then quantize + velocity scale all
+const edit1 = await call("midi_clip_edit_notes", {
+  clip_id: clipId, select: { pitch_min: 42, pitch_max: 42 }, transpose: 12,
+});
+assert.equal(edit1.changed_count, 1);
+assert.ok((await call("midi_clip_get_notes", { clip_id: clipId })).notes.some((n) => n.pitch === 54));
+const edit2 = await call("midi_clip_edit_notes", { clip_id: clipId, velocity_scale: 0.5, quantize: { grid: 1 } });
+assert.equal(edit2.changed_count, 4);
+const afterEdit = await call("midi_clip_get_notes", { clip_id: clipId });
+assert.ok(afterEdit.notes.every((n) => n.start_time % 1 === 0));
+assert.equal(afterEdit.notes.find((n) => n.pitch === 36).velocity, 50);
+// delete selected
+const edit3 = await call("midi_clip_edit_notes", { clip_id: clipId, select: { pitch_min: 54, pitch_max: 54 }, delete: true });
+assert.equal(edit3.note_count, 3);
+
+// clip_create midi via track + scene_index, with inline notes, name, color
+const newClip = await call("clip_create", {
+  type: "midi", target_id: midiTrackId, scene_index: 1, duration: 8,
+  name: "Lead", color: "#00ff88",
+  notes: [
+    { pitch: 72, start_time: 0, duration: 1 },
+    { pitch: 76, start_time: 1, duration: 1 },
+  ],
+});
 assert.equal(newClip.class, "MidiClip");
 assert.equal(newClip.duration, 8);
+assert.equal(newClip.name, "Lead");
+assert.equal(newClip.color, "#00ff88");
+assert.equal(newClip.note_count, 2);
+assert.equal((await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8 })).class, "MidiClip");
 
-// clip_set + clip_get
-const colored = await call("clip_set", { clip_id: newClip.id, name: "Lead", color: "#00ff88" });
-assert.equal(colored.name, "Lead");
-assert.equal(colored.color, "#00ff88");
+// clip_set roundtrip
+const colored = await call("clip_set", { clip_id: newClip.id, name: "Lead 2" });
+assert.equal(colored.name, "Lead 2");
 
 // clip_delete (session clip, via parent slot)
 await call("clip_delete", { clip_id: newClip.id });
-const trackAfter = await call("track_get", { track_id: midiTrackId });
+const trackAfter = await call("track_get", { track_id: midiTrackId, include: ["clip_slots"] });
 assert.equal(trackAfter.clip_slots[1].clip, null);
 
-// device_get + parameters
+// device_get + parameters, filtered + with values
 const device = await call("device_get", { device_id: deviceId });
 assert.equal(device.name, "Operator");
 assert.equal(device.parameters.length, 2);
+const filtered = await call("device_get", { device_id: deviceId, parameter_filter: "filter", include_values: true });
+assert.equal(filtered.parameters.length, 1);
+assert.equal(filtered.parameters[0].name, "Filter Freq");
+assert.equal(typeof filtered.parameters[0].value, "number");
 const paramId = device.parameters[1].id;
 
 // parameter set/get roundtrip
@@ -122,6 +178,45 @@ const mixer = await call("mixer_get", { target_id: audioTrackId });
 assert.equal(mixer.volume.name, "Volume");
 assert.equal(mixer.sends.length, 1);
 assert.equal(mixer.sends[0].return_track, "A-Reverb");
+
+// mixer_set: volume + pan + send in one call
+const mixed = await call("mixer_set", { target_id: audioTrackId, volume: 0.7, panning: -0.25, sends: [{ index: 0, value: 0.3 }] });
+assert.equal(mixed.volume.value, 0.7);
+assert.equal(mixed.panning.value, -0.25);
+assert.equal(mixed.sends[0].value, 0.3);
+
+// drum rack family: insert -> chain -> pad note -> chain devices deep
+const drumTrackE = await call("track_create", { type: "midi" });
+const rackE = await call("device_insert", { target_id: drumTrackE.id, device_name: "Drum Rack" });
+assert.equal(rackE.is_drum_rack, true);
+const chainE = await call("rack_insert_chain", { rack_device_id: rackE.id, index: 0 });
+assert.equal(chainE.receiving_note, 60);
+await call("drum_chain_set", { drum_chain_id: chainE.id, receiving_note: 36 });
+const chainDetail = await call("chain_get", { chain_id: chainE.id });
+assert.equal(chainDetail.receiving_note, 36);
+assert.equal(chainDetail.mixer.volume.name, "Volume");
+const simplerE = await call("device_insert", { target_id: chainE.id, device_name: "Simpler" });
+const sampleE = await call("simpler_replace_sample", { simpler_device_id: simplerE.id, file_path: "/tmp/kick.wav" });
+assert.ok(sampleE.file_path.includes("kick.wav"));
+const deepRack = await call("device_get", { device_id: rackE.id, include_chain_devices: true });
+assert.equal(deepRack.chains[0].devices[0].name, "Simpler");
+assert.ok(deepRack.chains[0].devices[0].sample.file_path.includes("kick.wav"));
+
+// duplicates
+const dupDev = await call("device_duplicate", { device_id: simplerE.id });
+assert.equal(dupDev.name, "Simpler");
+const dupTrack = await call("track_duplicate", { track_id: drumTrackE.id });
+assert.match(dupTrack.name, /Copy/);
+const dupScene = await call("scene_duplicate", { scene_id: song.scenes[0].id });
+assert.match(dupScene.name, /Copy/);
+await call("scene_delete", { scene_id: dupScene.id });
+await call("track_delete", { track_id: dupTrack.id });
+
+// stale id: delete the drum track, then use its id — error must carry re-fetch hint
+await call("track_delete", { track_id: drumTrackE.id });
+const stale = await client.callTool({ name: "track_get", arguments: { track_id: drumTrackE.id } });
+assert.equal(stale.isError, true);
+assert.match(stale.content[0].text, /re-fetch ids via song_get/);
 
 // scenes / cue points
 const scene = await call("scene_create", { index: -1 });

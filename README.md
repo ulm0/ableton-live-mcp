@@ -18,13 +18,13 @@ MCP client (Claude, ...) ──streamable HTTP──▶ http://127.0.0.1:8722/mc
 ## Requirements
 
 - Ableton Live 12 with Extensions support (Live 12.4+ / the Extensions-enabled beta)
-- Node.js >= 24.14 (build only)
+- Node.js >= 22.11 (build only)
 
 ## Install
 
 ```bash
 npm install
-npm run package        # builds and produces Ableton-Live-MCP-1.0.0.ablx
+npm run package        # builds and produces Ableton-Live-MCP-<version>.ablx
 ```
 
 Then drag the `.ablx` file onto **Settings → Extensions** in Live. The MCP endpoint starts with
@@ -85,13 +85,13 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 ### Song
 | Tool | Description |
 |------|-------------|
-| `song_get` | Full Live Set state: tempo, scale, grid, tracks, return/main tracks, scenes, cue points, environment info. The entry point — returns the object ids used everywhere else. |
+| `song_get` | Live Set state: tempo, scale, grid, tracks, return/main tracks, scenes, cue points, environment info. The entry point — returns the object ids used everywhere else. `include` fetches only selected sections. |
 | `song_set` | Set song properties (tempo). |
 
 ### Tracks
 | Tool | Description |
 |------|-------------|
-| `track_get` | Full track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. |
+| `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. |
 | `track_set` | Name / mute / solo / arm. |
 | `track_create` | New audio or MIDI track. |
 | `track_delete` | Delete track. |
@@ -109,17 +109,18 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 ### Clips
 | Tool | Description |
 |------|-------------|
-| `clip_create` | Create MIDI or audio clips in a session slot, arrangement track, or take lane. Audio files are imported into the project automatically. |
+| `clip_create` | Create MIDI or audio clips in a session slot (by id or track + `scene_index`), arrangement track, or take lane. MIDI clips take inline `notes`; `name`/`color` apply at creation. Audio files are imported into the project automatically. |
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count). |
 | `clip_set` | Name, color, mute, looping, warping, warp mode. |
 | `clip_delete` | Delete a session or arrangement clip. |
 | `midi_clip_get_notes` | Read all MIDI notes. |
-| `midi_clip_set_notes` | Replace all MIDI notes (read–modify–write for edits). |
+| `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top). |
+| `midi_clip_edit_notes` | Server-side note transforms — transpose, time-shift, velocity scale/offset, quantize, delete — with pitch/time selection. No read-modify-write roundtrip. |
 
 ### Devices & racks
 | Tool | Description |
 |------|-------------|
-| `device_get` | Device detail: all parameters with ranges/value items, rack chains, Simpler sample. |
+| `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample. |
 | `device_insert` | Insert a built-in Live device into a track or rack chain. |
 | `device_delete` / `device_duplicate` | Remove or copy devices. |
 | `chain_get` | Rack chain detail: devices + chain mixer. |
@@ -132,7 +133,8 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 |------|-------------|
 | `parameter_get` | Read device/mixer parameter values (batch). |
 | `parameter_set` | Write parameter values (batch, single undo step). |
-| `mixer_get` | Volume / pan / sends of a track or chain, with parameter ids. |
+| `mixer_get` | Volume / pan / sends of a track or chain, with parameter ids and unit hints. |
+| `mixer_set` | Set volume / pan / sends of a track or chain in one call (single undo step). |
 
 ### Files & rendering
 | Tool | Description |
@@ -197,6 +199,18 @@ Two behaviors of the beta Extension Host that this project works around:
 
 Also: if the dev Extension Host crashes, Live may refuse the next control-channel handshake
 ("bring-up timed out") — restart Live and run `npm start` again.
+
+## Troubleshooting
+
+- **Endpoint not responding**: check `curl http://127.0.0.1:8722/health`. Right-click any
+  track in Live — the "Ableton Live MCP: Status" context-menu action shows the endpoint the
+  extension actually bound.
+- **Port already in use**: if another process holds the configured port, the server logs the
+  failure to `ExtensionHost.txt` and does not start. Change `port` in the extension's
+  `config.json` (path shown by `song_get` under `environment.storage_directory`) — the file
+  is read once at startup, so restart Live afterwards.
+- **Changed config.json but nothing happened**: config is only read when the extension
+  starts. Restart Live (or the dev Extension Host).
 
 ## License
 

@@ -162,8 +162,24 @@ const dataModel = {
     s.scenes = s.scenes.filter((x) => x.handle.id !== sh.id);
     ok();
   },
-  songDuplicateTrack: (h, th, ok) => ok(th),
-  songDuplicateScene: (h, sh, ok) => ok(sh),
+  songDuplicateTrack: (h, th, ok) => {
+    const src = get(th);
+    const t = make([...src.classes], {
+      name: src.name + " Copy", mute: src.mute, solo: src.solo, arm: src.arm,
+      slots: [makeSlot(null), makeSlot(null)], takeLanes: [], arrClips: [], devices: [],
+      mixer: makeMixer("MixerDevice", 1), group: null,
+    });
+    const s = get(h);
+    s.tracks.splice(s.tracks.findIndex((x) => x.handle.id === th.id) + 1, 0, t);
+    ok(t.handle);
+  },
+  songDuplicateScene: (h, sh, ok) => {
+    const src = get(sh);
+    const sc = make(["Scene"], { name: src.name + " Copy", tempo: src.tempo, sigN: src.sigN, sigD: src.sigD });
+    const s = get(h);
+    s.scenes.splice(s.scenes.findIndex((x) => x.handle.id === sh.id) + 1, 0, sc);
+    ok(sc.handle);
+  },
   songCreateCuePoint: (h, time, ok) => {
     const c = make(["CuePoint"], { name: "Locator", time });
     get(h).cues.push(c);
@@ -215,7 +231,14 @@ const dataModel = {
     ok(c.handle);
   },
   trackInsertDevice: (h, name, index, ok) => {
-    const d = make(["Device"], { name, params: [makeParam("Device On", { quantized: true })] });
+    const classes =
+      name === "Drum Rack" ? ["DrumRackDevice", "RackDevice", "Device"]
+      : name === "Instrument Rack" ? ["RackDevice", "Device"]
+      : name === "Simpler" ? ["Simpler", "Device"]
+      : ["Device"];
+    const d = make(classes, { name, params: [makeParam("Device On", { quantized: true })] });
+    if (classes.includes("RackDevice")) d.chains = [];
+    if (classes.includes("Simpler")) d.sample = null;
     d.parentObj = get(h);
     get(h).devices.splice(Number(index), 0, d);
     ok(d.handle);
@@ -225,7 +248,16 @@ const dataModel = {
     t.devices = t.devices.filter((d) => d.handle.id !== dh.id);
     ok();
   },
-  trackDuplicateDevice: (h, dh, ok) => ok(dh),
+  trackDuplicateDevice: (h, dh, ok) => {
+    const src = get(dh);
+    const d = make([...src.classes], { name: src.name, params: [makeParam("Device On", { quantized: true })] });
+    if (src.chains) d.chains = [];
+    if ("sample" in src) d.sample = null;
+    d.parentObj = get(h);
+    const t = get(h);
+    t.devices.splice(t.devices.findIndex((x) => x.handle.id === dh.id) + 1, 0, d);
+    ok(d.handle);
+  },
   trackDeleteClip: (h, ch, ok) => {
     const t = get(h);
     t.arrClips = t.arrClips.filter((c) => c.handle.id !== ch.id);
@@ -297,8 +329,14 @@ const dataModel = {
   chainDuplicateDevice: (h, dh, ok) => ok(dh),
   rackdeviceGetChains: (h) => get(h).chains.map((c) => c.handle),
   rackdeviceInsertChain: (h, index, ok) => {
-    const c = make(["Chain"], { devices: [], mixer: makeMixer("ChainMixerDevice", 0) });
-    get(h).chains.splice(Number(index), 0, c);
+    const rack = get(h);
+    const isDrum = rack.classes.includes("DrumRackDevice");
+    const c = make(isDrum ? ["DrumChain", "Chain"] : ["Chain"], {
+      devices: [], mixer: makeMixer("ChainMixerDevice", 0),
+      ...(isDrum ? { receivingNote: 60 } : {}),
+    });
+    c.parentObj = rack;
+    rack.chains.splice(Number(index), 0, c);
     ok(c.handle);
   },
   drumchainGetReceivingNote: (h) => BigInt(get(h).receivingNote),
