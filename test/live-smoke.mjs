@@ -19,6 +19,16 @@ const call = async (name, args = {}) => {
   return JSON.parse(text);
 };
 const step = (msg) => console.log(`  ✓ ${msg}`);
+// Live applies data-model writes asynchronously; immediate read-back can lag
+// by tens of ms. Retry read-based assertions briefly instead of racing.
+const eventually = async (fn, tries = 25) => {
+  for (let i = 0; ; i++) {
+    try { return await fn(); } catch (e) {
+      if (i >= tries) throw e;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+};
 
 console.log("live smoke vs", URL_);
 const song = await call("song_get");
@@ -62,17 +72,24 @@ const clip = await call("clip_create", {
 });
 assert.equal(clip.name, "Smoke Chord");
 assert.equal(clip.note_count, 3);
-const notes = await call("midi_clip_get_notes", { clip_id: clip.id });
-assert.equal(notes.notes[0].pitch, 60);
+await eventually(async () => {
+  const notes = await call("midi_clip_get_notes", { clip_id: clip.id });
+  assert.equal(notes.notes[0].pitch, 60);
+});
 step("one-call session MIDI clip: scene_index target, 3 inline notes, named, colored");
 
 // merge + server-side edit
 await call("midi_clip_set_notes", { clip_id: clip.id, mode: "merge", notes: [{ pitch: 42, start_time: 0.5, duration: 0.25 }] });
-const edited = await call("midi_clip_edit_notes", { clip_id: clip.id, select: { pitch_min: 42, pitch_max: 42 }, transpose: 12, velocity_scale: 0.8 });
-assert.equal(edited.note_count, 4);
-assert.equal(edited.changed_count, 1);
-const afterEdit = await call("midi_clip_get_notes", { clip_id: clip.id });
-assert.ok(afterEdit.notes.some((n) => n.pitch === 54));
+const edited = await eventually(async () => {
+  const r = await call("midi_clip_edit_notes", { clip_id: clip.id, select: { pitch_min: 42, pitch_max: 42 }, transpose: 12, velocity_scale: 0.8 });
+  assert.equal(r.note_count, 4);
+  assert.equal(r.changed_count, 1);
+  return r;
+});
+await eventually(async () => {
+  const afterEdit = await call("midi_clip_get_notes", { clip_id: clip.id });
+  assert.ok(afterEdit.notes.some((n) => n.pitch === 54), "transposed note (54) not visible yet");
+});
 step("merge + midi_clip_edit_notes (transpose selected) verified");
 
 // track addressing by name

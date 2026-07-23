@@ -196,6 +196,10 @@ Two behaviors of the beta Extension Host that this project works around:
 2. **bigint numerics.** The host returns `bigint` for some values the SDK types as `number`
    (clip colors, note pitches, ...). `src/serialize.ts` normalizes with `num()` before
    arithmetic/JSON.
+3. **Asynchronous writes.** SDK property setters (notes, names, values) return before Live
+   has applied the change; a read within a few tens of ms can return the previous state.
+   Agents rarely notice, but read-after-write tests must retry briefly
+   (see `eventually()` in `test/live-smoke.mjs`).
 
 Also: if the dev Extension Host crashes, Live may refuse the next control-channel handshake
 ("bring-up timed out") — restart Live and run `npm start` again.
