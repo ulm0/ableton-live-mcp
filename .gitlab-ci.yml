@@ -3,6 +3,7 @@ image: node:24
 stages:
   - test
   - package
+  - release
 
 cache:
   key:
@@ -29,3 +30,29 @@ package:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_COMMIT_TAG
+
+# On tags: upload the .ablx to the generic package registry, then create a
+# GitLab Release pointing at it.
+upload:
+  stage: release
+  image: curlimages/curl:latest
+  needs: [package]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - FILE=$(ls *.ablx)
+    - 'curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$FILE" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}/${FILE}"'
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [upload, package]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - FILE=$(ls *.ablx)
+    - release-cli create
+      --name "$CI_COMMIT_TAG"
+      --tag-name "$CI_COMMIT_TAG"
+      --description "Ableton Live MCP $CI_COMMIT_TAG — drag the .ablx onto Live's Settings → Extensions page to install."
+      --assets-link "{\"name\":\"${FILE}\",\"url\":\"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}/${FILE}\",\"link_type\":\"package\"}"
