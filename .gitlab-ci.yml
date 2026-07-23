@@ -23,9 +23,11 @@ package:
   script:
     - npm ci --cache .npm --prefer-offline
     - npm run package
+    - sha256sum *.ablx > SHA256SUMS
   artifacts:
     paths:
       - "*.ablx"
+      - SHA256SUMS
     expire_in: 30 days
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -40,8 +42,11 @@ upload:
   rules:
     - if: $CI_COMMIT_TAG
   script:
-    - FILE=$(ls *.ablx)
-    - 'curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$FILE" "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}/${FILE}"'
+    - |
+      for f in *.ablx SHA256SUMS; do
+        curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$f" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}/${f}"
+      done
 
 release:
   stage: release
@@ -51,8 +56,10 @@ release:
     - if: $CI_COMMIT_TAG
   script:
     - FILE=$(ls *.ablx)
+    - BASE="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}"
     - release-cli create
       --name "$CI_COMMIT_TAG"
       --tag-name "$CI_COMMIT_TAG"
-      --description "Ableton Live MCP $CI_COMMIT_TAG — drag the .ablx onto Live's Settings → Extensions page to install."
-      --assets-link "{\"name\":\"${FILE}\",\"url\":\"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/ableton-live-mcp/${CI_COMMIT_TAG}/${FILE}\",\"link_type\":\"package\"}"
+      --description "Ableton Live MCP $CI_COMMIT_TAG — drag the .ablx onto Live's Settings → Extensions page to install. Verify with SHA256SUMS."
+      --assets-link "{\"name\":\"${FILE}\",\"url\":\"${BASE}/${FILE}\",\"link_type\":\"package\"}"
+      --assets-link "{\"name\":\"SHA256SUMS\",\"url\":\"${BASE}/SHA256SUMS\",\"link_type\":\"other\"}"
