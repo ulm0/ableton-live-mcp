@@ -18,7 +18,7 @@ MCP client (Claude, ...) ──streamable HTTP──▶ http://127.0.0.1:8722/mc
 ## Requirements
 
 - Ableton Live 12.4.5 or newer (Extensions support)
-- Node.js >= 22.11 (build only)
+- Node.js >= 24.14 (build only)
 
 ## Install
 
