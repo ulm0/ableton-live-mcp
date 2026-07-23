@@ -1,0 +1,7 @@
+{
+    "name": "Ableton Live MCP",
+    "author": "ulm0",
+    "entry": "dist/extension.cjs",
+    "version": "1.0.0",
+    "minimumApiVersion": "1.0.0"
+}
