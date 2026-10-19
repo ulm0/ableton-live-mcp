@@ -580,19 +580,21 @@ function errorMessage(e: unknown): string {
 // Shared addressing: a tool that acts on one track takes any of track_id,
 // track_index and track_name, a scene tool any of scene_id, scene_index and
 // scene_name. When several are given they must name the same object.
-const trackAddress = {
+// Shapes used more than once in a tool (top level and in `items`) are factories:
+// a reused zod instance is emitted as a JSON Schema $ref in tools/list.
+const trackAddress = () => ({
   track_id: z.string().optional().describe("Track id"),
   track_index: z.number().int().min(0).optional().describe("0-based index among the regular tracks"),
   track_name: z
     .string()
     .optional()
     .describe("Track name, exact match first, then case-insensitive (regular, return and main tracks)"),
-};
-const sceneAddress = {
+});
+const sceneAddress = () => ({
   scene_id: z.string().optional().describe("Scene id"),
   scene_index: z.number().int().min(0).optional().describe("0-based scene index"),
   scene_name: z.string().optional().describe("Scene name, exact match first, then case-insensitive"),
-};
+});
 // Destructive tools match names exactly: a case-insensitive guess must not delete.
 const exactTrackName = z.string().optional().describe("Exact track name (case-sensitive)");
 const exactSceneName = z.string().optional().describe("Exact scene name (case-sensitive)");
@@ -617,7 +619,7 @@ const deviceStep = () =>
   ]);
 const deviceAddress = {
   device_id: z.string().optional().describe("Device id"),
-  ...trackAddress,
+  ...trackAddress(),
   device: z
     .union([deviceStep(), z.array(z.union([deviceStep(), chainStep])).min(1)])
     .optional()
@@ -2102,7 +2104,7 @@ function buildServer(
       "by track_id, track_index (0-based, regular tracks only), or track_name. " +
       "Use `include` to fetch only some sections.",
     {
-      ...trackAddress,
+      ...trackAddress(),
       include: z
         .array(z.enum(["clip_slots", "take_lanes", "arrangement_clips", "devices", "mixer"]))
         .optional()
@@ -2124,13 +2126,13 @@ function buildServer(
     },
   );
 
-  const trackProps = {
+  const trackProps = () => ({
     name: z.string().optional(),
     mute: z.boolean().optional(),
     solo: z.boolean().optional(),
     arm: z.boolean().optional(),
-  };
-  const TRACK_PROPS = Object.keys(trackProps);
+  });
+  const TRACK_PROPS = Object.keys(trackProps());
 
   tool(
     "track_set",
@@ -2140,16 +2142,16 @@ function buildServer(
       "fields) to change many tracks at once, e.g. mute all but the vocals. All " +
       "changes form one undo step; nothing is changed if any entry is invalid.",
     {
-      ...trackAddress,
-      ...trackProps,
+      ...trackAddress(),
+      ...trackProps(),
       items: z
-        .array(z.object({ ...trackAddress, ...trackProps }))
+        .array(z.object({ ...trackAddress(), ...trackProps() }))
         .min(1)
         .optional()
         .describe("Batch form: one entry per track; returns {items}"),
     },
     (args) => {
-      const { list, batch } = entries(args, args.items, [...Object.keys(trackAddress), ...TRACK_PROPS]);
+      const { list, batch } = entries(args, args.items, [...Object.keys(trackAddress()), ...TRACK_PROPS]);
       // Validate every entry before the first setter runs.
       const plan = list.map((it, i) =>
         at(itemLabel(batch, i), () => {
@@ -2254,7 +2256,7 @@ function buildServer(
     "track_delete",
     { title: "Delete track", annotations: DESTRUCTIVE },
     "Delete a track, addressed by track_id, track_index or its exact track_name.",
-    { ...trackAddress, track_name: exactTrackName },
+    { ...trackAddress(), track_name: exactTrackName },
     async (args) => {
       const track = findTrack(args, { exactName: true });
       const deleted = { deleted: remember(track), name: track.name };
@@ -2267,7 +2269,7 @@ function buildServer(
     "track_duplicate",
     { title: "Duplicate track", annotations: CREATE },
     "Duplicate a track. The copy is inserted right after the original.",
-    { ...trackAddress },
+    { ...trackAddress() },
     async (args) => summarizeTrack(await song().duplicateTrack(findTrack(args))),
   );
 
@@ -2276,7 +2278,7 @@ function buildServer(
     { title: "Clear arrangement clips in range", annotations: DESTRUCTIVE },
     "Delete all arrangement clips of a track within a beat range. Clips " +
       "overlapping a boundary are truncated to the range edge.",
-    { ...trackAddress, start_time: z.number(), end_time: z.number() },
+    { ...trackAddress(), start_time: z.number(), end_time: z.number() },
     async ({ start_time, end_time, ...address }) => {
       await findTrack(address).clearClipsInRange(start_time, end_time);
       return { cleared: [start_time, end_time] };
@@ -2287,7 +2289,7 @@ function buildServer(
     "take_lane_create",
     { title: "Create take lane", annotations: CREATE },
     "Create a new take lane on a track (appended after existing lanes).",
-    { ...trackAddress },
+    { ...trackAddress() },
     async (args) => takeLaneSummary(await findTrack(args).createTakeLane()),
   );
 
@@ -2359,7 +2361,7 @@ function buildServer(
     );
   }
 
-  const sceneCreateItem = {
+  const sceneCreateItem = () => ({
     index: z
       .number()
       .int()
@@ -2367,7 +2369,7 @@ function buildServer(
       .optional()
       .describe("0-based insert position; -1 or omitted = append at the end"),
     name: z.string().optional(),
-  };
+  });
 
   tool(
     "scene_create",
@@ -2378,9 +2380,9 @@ function buildServer(
       "inserted. A batch takes two undo steps (creates, then names) and reports a " +
       "failed entry as {error} instead of failing the call.",
     {
-      ...sceneCreateItem,
+      ...sceneCreateItem(),
       items: z
-        .array(z.object(sceneCreateItem))
+        .array(z.object(sceneCreateItem()))
         .min(1)
         .optional()
         .describe("Batch form: one entry per new scene; returns {items}"),
@@ -2416,16 +2418,16 @@ function buildServer(
     "Rename a scene, addressed by scene_id, scene_index or scene_name; or rename " +
       "several with `items` (one entry per scene). All renames form one undo step.",
     {
-      ...sceneAddress,
+      ...sceneAddress(),
       name: z.string().optional().describe("New name (required unless items is given)"),
       items: z
-        .array(z.object({ ...sceneAddress, name: z.string() }))
+        .array(z.object({ ...sceneAddress(), name: z.string() }))
         .min(1)
         .optional()
         .describe("Batch form: one entry per scene; returns {items}"),
     },
     (args) => {
-      const { list, batch } = entries(args, args.items, [...Object.keys(sceneAddress), "name"]);
+      const { list, batch } = entries(args, args.items, [...Object.keys(sceneAddress()), "name"]);
       const plan = list.map((it, i) =>
         at(itemLabel(batch, i), () => {
           if (it.name === undefined) throw new UsageError("name is required.");
@@ -2444,7 +2446,7 @@ function buildServer(
     "scene_delete",
     { title: "Delete scene", annotations: DESTRUCTIVE },
     "Delete a scene, addressed by scene_id, scene_index or its exact scene_name.",
-    { ...sceneAddress, scene_name: exactSceneName },
+    { ...sceneAddress(), scene_name: exactSceneName },
     async (args) => {
       const { scene } = findScene(args, { exactName: true });
       const deleted = { deleted: remember(scene), name: scene.name };
@@ -2457,7 +2459,7 @@ function buildServer(
     "scene_duplicate",
     { title: "Duplicate scene", annotations: CREATE },
     "Duplicate a scene. The copy is inserted right after the original.",
-    { ...sceneAddress },
+    { ...sceneAddress() },
     async (args) => {
       const scene = await song().duplicateScene(findScene(args).scene);
       return sceneSummary(scene, sceneIndexOf(scene));
@@ -2473,7 +2475,7 @@ function buildServer(
       "only_clips leaves out the empty slots. For the whole session at a glance use " +
       "session_grid.",
     {
-      ...sceneAddress,
+      ...sceneAddress(),
       only_clips: z.boolean().default(false).describe("Leave out the tracks whose slot in this scene is empty"),
     },
     ({ only_clips, ...address }) => {
@@ -2514,7 +2516,7 @@ function buildServer(
       "one scene with full clip summaries use scene_get.",
     {
       tracks: z
-        .array(z.object(trackAddress))
+        .array(z.object(trackAddress()))
         .min(1)
         .optional()
         .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
@@ -2764,7 +2766,7 @@ function buildServer(
         .optional()
         .describe("Range end in beats (exclusive); default: everything after start_time"),
       tracks: z
-        .array(z.object(trackAddress))
+        .array(z.object(trackAddress()))
         .min(1)
         .optional()
         .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
@@ -2888,7 +2890,7 @@ function buildServer(
         .string()
         .optional()
         .describe("ClipSlot, Track, or TakeLane id; or give the track by track_id/track_index/track_name"),
-      ...trackAddress,
+      ...trackAddress(),
       scene_index: z
         .number()
         .int()
@@ -3013,16 +3015,16 @@ function buildServer(
     },
   );
 
-  const clipProps = {
+  const clipProps = () => ({
     name: z.string().optional(),
     color: z.string().optional().describe("#RRGGBB"),
     muted: z.boolean().optional(),
     looping: z.boolean().optional(),
     warping: z.boolean().optional().describe("Audio clips only"),
     warp_mode: z.enum(WARP_MODES).optional().describe("Audio clips only"),
-  };
-  const CLIP_PROPS = Object.keys(clipProps);
-  type ClipProps = z.objectOutputType<typeof clipProps, z.ZodTypeAny>;
+  });
+  const CLIP_PROPS = Object.keys(clipProps());
+  type ClipProps = z.objectOutputType<ReturnType<typeof clipProps>, z.ZodTypeAny>;
 
   // Validates one clip's changes and returns the setters, so that a batch can
   // check every clip before the first write.
@@ -3073,15 +3075,15 @@ function buildServer(
       "step; nothing is changed if any clip is invalid.",
     {
       clip_id: z.string().optional(),
-      ...clipProps,
+      ...clipProps(),
       items: z
-        .array(z.object({ clip_id: z.string(), ...clipProps }))
+        .array(z.object({ clip_id: z.string(), ...clipProps() }))
         .min(1)
         .optional()
         .describe("Batch form: one entry per clip; returns {items}"),
       select: z
         .object({
-          ...trackAddress,
+          ...trackAddress(),
           scope: z
             .enum(CLIP_SCOPES)
             .default("all")
@@ -3272,7 +3274,7 @@ function buildServer(
         .string()
         .optional()
         .describe("ClipSlot, Track or TakeLane id; or give the track by track_id/track_index/track_name"),
-      ...trackAddress,
+      ...trackAddress(),
       scene_index: z
         .number()
         .int()
@@ -3443,7 +3445,7 @@ function buildServer(
       end_time: z.number().describe("End of the range to copy (exclusive), in beats"),
       to_time: z.number().min(0).describe("Where the copy starts, in beats"),
       tracks: z
-        .array(z.object(trackAddress))
+        .array(z.object(trackAddress()))
         .min(1)
         .optional()
         .describe("Only these tracks (each by track_id, track_index or track_name); omit for every audio and MIDI track"),
@@ -4039,7 +4041,7 @@ function buildServer(
       "cannot be set, none are, and the device is still inserted with `errors` saying why.",
     {
       target_id: z.string().optional().describe("Track or Chain id"),
-      ...trackAddress,
+      ...trackAddress(),
       device_name: z.string(),
       index: z.number().int().min(0).optional(),
       sample_path: z
@@ -4322,7 +4324,7 @@ function buildServer(
         .string()
         .optional()
         .describe("Track or Chain id; or give the track by track_id/track_index/track_name"),
-      ...trackAddress,
+      ...trackAddress(),
       index: z
         .number()
         .int()
@@ -4661,7 +4663,7 @@ function buildServer(
       "rack and, per pad, the chain, the Simpler, the loaded sample and what was created. " +
       "Undo steps: rack, chains, notes, Simplers, samples, mixer.",
     {
-      ...trackAddress,
+      ...trackAddress(),
       rack_device_id: z.string().optional().describe("The Drum Rack to build in; or give a MIDI track"),
       pads: z
         .array(
@@ -4967,15 +4969,15 @@ function buildServer(
     "Get the mixer of a track or rack chain: volume, panning, and sends with " +
       "current values and parameter ids (settable via parameter_set). Address it " +
       "by target_id, or the track by track_id/track_index/track_name.",
-    { target_id: z.string().optional().describe("Track, Chain, or mixer id"), ...trackAddress },
+    { target_id: z.string().optional().describe("Track, Chain, or mixer id"), ...trackAddress() },
     async (args) => await mixerDetail(findMixer(args).mixer),
   );
 
-  const mixerTarget = {
+  const mixerTarget = () => ({
     target_id: z.string().optional().describe("Track, Chain, or mixer id"),
-    ...trackAddress,
-  };
-  const mixerValues = {
+    ...trackAddress(),
+  });
+  const mixerValues = () => ({
     volume: z.number().min(0).max(1).optional(),
     panning: z.number().min(-1).max(1).optional(),
     sends: z
@@ -4990,8 +4992,8 @@ function buildServer(
         }),
       )
       .optional(),
-  };
-  type MixerValues = z.objectOutputType<typeof mixerValues, z.ZodTypeAny>;
+  });
+  type MixerValues = z.objectOutputType<ReturnType<typeof mixerValues>, z.ZodTypeAny>;
   type AnyMixer = TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">;
 
   // Validates one mixer's values and returns its parameter writes.
@@ -5080,10 +5082,10 @@ function buildServer(
       "other tracks are. A single target returns its mixer; the other forms return " +
       "{items} (plus `skipped` for all_tracks).",
     {
-      ...mixerTarget,
-      ...mixerValues,
+      ...mixerTarget(),
+      ...mixerValues(),
       targets: z
-        .array(z.object(mixerTarget))
+        .array(z.object(mixerTarget()))
         .min(1)
         .optional()
         .describe("Several mixers that get the top-level values"),
@@ -5092,11 +5094,11 @@ function buildServer(
         .optional()
         .describe("Apply the top-level values to every regular track (volume: top-most only, see description)"),
       exclude: z
-        .array(z.object(trackAddress))
+        .array(z.object(trackAddress()))
         .optional()
         .describe("With all_tracks: tracks to leave alone, including everything inside an excluded group"),
       items: z
-        .array(z.object({ ...mixerTarget, ...mixerValues }))
+        .array(z.object({ ...mixerTarget(), ...mixerValues() }))
         .min(1)
         .optional()
         .describe("One entry per mixer, each with its own values"),
@@ -5116,7 +5118,7 @@ function buildServer(
             : "Provide target_id or track_id/track_index/track_name, targets, all_tracks, or items.",
         );
       if (args.exclude && !args.all_tracks) throw new UsageError("exclude only applies with all_tracks.");
-      const hasValues = given(args, Object.keys(mixerValues));
+      const hasValues = given(args, Object.keys(mixerValues()));
       if (args.items && hasValues)
         throw new UsageError("With items, give volume/panning/sends in each entry instead.");
       if (!args.items && !hasValues)
@@ -5226,11 +5228,11 @@ function buildServer(
       "WAVs are read. Audio tracks only, addressed by track_id, track_index or " +
       "track_name — or `tracks` to render several over the same range (returns {items}).",
     {
-      ...trackAddress,
+      ...trackAddress(),
       start_time: z.number(),
       end_time: z.number(),
       tracks: z
-        .array(z.object(trackAddress))
+        .array(z.object(trackAddress()))
         .min(1)
         .optional()
         .describe("Several audio tracks (each by track_id, track_index or track_name), rendered one by one"),
@@ -5297,7 +5299,7 @@ function buildServer(
       "error says so and where the render is — undo in Live restores the clips. Undo steps: " +
       "clear, create, name and color.",
     {
-      ...trackAddress,
+      ...trackAddress(),
       start_time: z.number().min(0).describe("Start of the range in beats"),
       end_time: z.number().describe("End of the range in beats"),
       name: z.string().optional().describe("Name of the new clip"),

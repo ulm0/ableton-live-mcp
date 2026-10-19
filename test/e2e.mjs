@@ -62,6 +62,11 @@ const usageError = async (name, args, pattern) => {
 // tools/list
 const { tools } = await client.listTools();
 assert.equal(tools.length, 60, `expected exactly 60 tools, got ${tools.length}`);
+// A zod schema instance used twice in one tool becomes a JSON Schema $ref, which
+// some MCP clients cannot resolve. Shared shapes are factories for that reason.
+for (const t of tools) {
+  assert.ok(!JSON.stringify(t.inputSchema).includes('"$ref"'), `${t.name}: inputSchema contains $ref`);
+}
 
 // every tool has a title and explicit hints — the spec defaults
 // (destructiveHint/openWorldHint true) must never apply by omission
