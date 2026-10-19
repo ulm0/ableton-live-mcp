@@ -746,7 +746,19 @@ byDevice = await call("parameter_get", { parameters: [
   { track_name: "Kit", device: [0, { chain: 1 }, 0], parameter: "Volume" },
 ] });
 assert.deepEqual(byDevice.map((p) => [p.device_id, p.value]), [[kickSimpler.id, 0.4], [snare.id, 0.7]]);
+// pads and receiving notes also by note name (C3 = 60, so C1 = 36, D1 = 38); chains report the name
+const padNamed = await call("drum_chain_set", { drum_chain_id: pads[1], receiving_note: "D1" });
+assert.deepEqual([padNamed.receiving_note, padNamed.receiving_note_name], [38, "D1"]);
+const kitChains = (await call("device_get", { device_id: kitRack })).chains;
+assert.deepEqual(kitChains.map((c) => [c.receiving_note, c.receiving_note_name]), [[36, "C1"], [38, "D1"]]);
+byDevice = await call("parameter_get", { parameters: [
+  { track_name: "Kit", device: ["Drum Rack", { pad: "C1" }, "Simpler"], parameter: "Volume" },
+  { track_name: "Kit", device: ["Drum Rack", { pad: "d1" }, 0], parameter: "Volume" },
+] });
+assert.deepEqual(byDevice.map((p) => p.device_id), [kickSimpler.id, snare.id]);
 const kitPath = (device) => ({ parameters: [{ track_name: "Kit", device, parameter: "Volume" }] });
+await usageError("parameter_get", kitPath(["Drum Rack", { pad: "X1" }, 0]), /device\[1\]: pad: "X1" is not a MIDI pitch/);
+await usageError("drum_chain_set", { drum_chain_id: pads[1], receiving_note: "G#8" }, /receiving_note: "G#8" is outside the MIDI range/);
 await usageError("parameter_get", kitPath(["Drum Rack", { pad: 40 }, "Simpler"]),
   /device\[1\]: No pad receives note 40 in "Drum Rack" \(id \d+\) \(pads: 36, 38\)/);
 await usageError("parameter_get", kitPath(["Drum Rack", { chain: 5 }, 0]), /device\[1\]: chain 5 out of range in "Drum Rack" \(id \d+\) \(0-1\)/);
@@ -995,6 +1007,227 @@ fs.rmSync(path.join(presetDir, "Link.json"));
 
 for (const id of [filterCopy.id, eqCopy.id, drumsFilter]) await call("device_delete", { device_id: id });
 for (const id of [synth.id, kit.id]) await call("track_delete", { track_id: id });
+assert.equal((await tracksNow()).length, 2);
+
+// MIDI write shortcuts: note names, step patterns ("X" = accent) and repeat
+const notesTrack = await call("track_create", { type: "midi", name: "Notes" });
+const notesOf = async (clip_id) => (await call("midi_clip_get_notes", { clip_id })).notes;
+const startsOf = (notes, pitch) => notes.filter((n) => n.pitch === pitch).map((n) => n.start_time);
+const beat = await call("clip_create", {
+  type: "midi", track_name: "Notes", scene_index: 0, duration: 8,
+  notes: [{ pitch: "C3", start_time: 0, duration: 4 }],
+  patterns: [
+    { note: "C1", steps: "x... x... | x... x..." },
+    { note: "F#1", steps: "xX", step: 0.5, velocity: 80, accent_velocity: 120, duration: 0.1 },
+  ],
+  repeat: { length: 4 },
+});
+assert.equal(beat.note_count, 14, "7 notes per bar, repeated to fill the 8 beats");
+let beatNotes = await notesOf(beat.id);
+assert.deepEqual(startsOf(beatNotes, 60), [0, 4]);
+assert.deepEqual(startsOf(beatNotes, 36), [0, 1, 2, 3, 4, 5, 6, 7]);
+assert.deepEqual(beatNotes.find((n) => n.pitch === 36), { pitch: 36, start_time: 0, duration: 0.25, velocity: 100 },
+  "a hit lasts one step by default");
+assert.deepEqual(beatNotes.filter((n) => n.pitch === 42).map((n) => [n.start_time, n.velocity, n.duration]),
+  [[0, 80, 0.1], [0.5, 120, 0.1], [4, 80, 0.1], [4.5, 120, 0.1]]);
+// filling drops the notes of the last copy that would start at or after the clip's end
+let written = await call("midi_clip_set_notes", { clip_id: beat.id, notes: [
+  { pitch: "A2", start_time: 0, duration: 0.5 }, { pitch: 57, start_time: 2.5, duration: 0.5 },
+], repeat: { length: 3 } });
+assert.deepEqual([written.note_count, written.copies], [5, 3]);
+assert.deepEqual(startsOf(await notesOf(beat.id), 57), [0, 2.5, 3, 5.5, 6]);
+// `times` writes that many copies, also past the end; merge keeps what is there
+written = await call("midi_clip_set_notes", {
+  clip_id: beat.id, mode: "merge", patterns: [{ note: 38, steps: "x" }], repeat: { length: 4, times: 3 },
+});
+assert.deepEqual([written.added, written.copies, written.note_count], [3, 3, undefined]);
+assert.deepEqual(startsOf(await notesOf(beat.id), 38), [0, 4, 8]);
+// bad names, steps and shortcuts fail before anything is written
+await usageError("midi_clip_set_notes", { clip_id: beat.id, patterns: [{ note: "C1", steps: "x.o." }] },
+  /patterns\[0\]\.steps: unexpected "o"/);
+await usageError("midi_clip_set_notes", { clip_id: beat.id, notes: [
+  { pitch: 36, start_time: 0, duration: 1 }, { pitch: "H2", start_time: 0, duration: 1 },
+] }, /notes\[1\]\.pitch: "H2" is not a MIDI pitch/);
+await usageError("midi_clip_set_notes", { clip_id: beat.id, notes: [{ pitch: "G#8", start_time: 0, duration: 1 }] },
+  /outside the MIDI range \(C-2 = 0 to G8 = 127\)/);
+await usageError("midi_clip_set_notes", { clip_id: beat.id }, /Give notes and\/or patterns/);
+await usageError("midi_clip_set_notes", { clip_id: beat.id, notes: [], repeat: { length: 1 } }, /repeat needs notes or patterns/);
+await usageError("midi_clip_set_notes", { clip_id: beat.id, patterns: [{ note: 36, steps: "x" }], repeat: { length: 0.0001 } },
+  /would write \d+ notes; at most 50000/);
+assert.equal((await notesOf(beat.id)).length, 8, "failed writes change nothing");
+await usageError("clip_create", { type: "midi", track_name: "Notes", scene_index: 1, duration: 4,
+  patterns: [{ note: "Q1", steps: "x" }] }, /patterns\[0\]\.note: "Q1" is not a MIDI pitch/);
+assert.equal((await slotsOf(notesTrack.id))[1].clip, null, "a bad pattern creates no clip");
+await usageError("clip_create", { type: "audio", track_id: audioTrackId, start_time: 0, file_path: "/tmp/kick.wav",
+  patterns: [{ note: 36, steps: "x" }], repeat: { length: 4 } }, /patterns, repeat only apply to MIDI clips/);
+
+// reads: select (pitches by name too), compact tuples
+const CHORDS = [
+  { pitch: "C3", start_time: 0, duration: 1, velocity: 100 },
+  { pitch: "E3", start_time: 0, duration: 1, velocity: 100 },
+  { pitch: "F#3", start_time: 1, duration: 0.5, velocity: 100 },
+  { pitch: "Bb3", start_time: 2, duration: 0.5, velocity: 100, probability: 0.5 },
+  { pitch: "D#3", start_time: 3, duration: 0.25, velocity: 100 },
+];
+const chords = await call("clip_create", { type: "midi", track_name: "Notes", scene_index: 1, duration: 4, notes: CHORDS });
+const resetChords = () => call("midi_clip_set_notes", { clip_id: chords.id, notes: CHORDS });
+const chordPitches = async () => (await notesOf(chords.id)).map((n) => n.pitch);
+assert.deepEqual(await chordPitches(), [60, 64, 66, 70, 63]);
+let compact = await call("midi_clip_get_notes", { clip_id: chords.id, format: "compact" });
+assert.deepEqual([compact.note_count, compact.total_note_count, compact.fields],
+  [5, undefined, ["pitch", "start_time", "duration", "velocity"]]);
+assert.deepEqual(compact.defaults, { muted: false, probability: 1, velocity_deviation: 0, release_velocity: 64, selected: false });
+assert.deepEqual(compact.notes,
+  [[60, 0, 1, 100], [64, 0, 1, 100], [66, 1, 0.5, 100], [70, 2, 0.5, 100, { probability: 0.5 }], [63, 3, 0.25, 100]]);
+const outOfKey = await call("midi_clip_get_notes", { clip_id: chords.id, select: { in_scale: false }, format: "compact" });
+assert.deepEqual([outOfKey.notes.map((n) => n[0]), outOfKey.note_count, outOfKey.total_note_count], [[66, 70, 63], 3, 5]);
+assert.deepEqual(outOfKey.scale, { root_note: 0, intervals: [0, 2, 4, 5, 7, 9, 11], name: "Major" });
+const pick = async (select) => (await call("midi_clip_get_notes", { clip_id: chords.id, select })).notes.map((n) => n.pitch);
+assert.deepEqual(await pick({ pitch_min: "E3", pitch_max: "F#3", time_max: 1 }), [64, 66]);
+// every_nth counts the matching notes in time order (start, then pitch)
+assert.deepEqual(await pick({ every_nth: 2 }), [60, 66, 63]);
+assert.deepEqual(await pick({ every_nth: { n: 2, offset: 1 } }), [64, 70]);
+assert.deepEqual(await pick({ every_nth: 2, pitch_min: 64 }), [64, 70]);
+
+// the user's note selection (NoteDescription.selected), when the host reports it
+let picked = await call("midi_clip_get_notes", { clip_id: chords.id, only_selected: true });
+assert.deepEqual([picked.note_count, picked.total_note_count], [0, 5]);
+assert.match(picked.warning, /reported no selection state/);
+fixtures.selectNotes(chords.id, [66, 70]);
+picked = await call("midi_clip_get_notes", { clip_id: chords.id, only_selected: true });
+assert.deepEqual([picked.notes.map((n) => n.pitch), picked.warning], [[66, 70], undefined]);
+assert.deepEqual((await notesOf(chords.id)).map((n) => n.selected), [false, false, true, true, false]);
+// compact defaults are this result's most common values
+picked = await call("midi_clip_get_notes", { clip_id: chords.id, select: { only_selected: true, pitch_min: 70 }, format: "compact" });
+assert.deepEqual([picked.notes, picked.defaults.selected, picked.defaults.probability], [[[70, 2, 0.5, 100]], true, 0.5]);
+let edit = await call("midi_clip_edit_notes", { clip_id: chords.id, select: { only_selected: true }, transpose: 12 });
+assert.deepEqual([edit.changed_count, edit.warning], [2, undefined]);
+assert.deepEqual(await chordPitches(), [60, 64, 78, 82, 63]);
+fixtures.selectNotes(chords.id, []);
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, select: { only_selected: true }, transpose: 12 });
+assert.deepEqual([edit.changed_count, edit.warning], [0, "No note of this clip is selected in Live."]);
+fixtures.selectNotes(chords.id, null);
+
+// snap_to_scale: the nearest scale note, ties go down (every C major neighbour here is a tie)
+await resetChords();
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, snap_to_scale: "song" });
+assert.deepEqual([edit.changed_count, edit.scale.name], [5, "Major"]);
+assert.deepEqual(await chordPitches(), [60, 64, 65, 69, 62]);
+// a custom scale: root by name, intervals folded into one octave
+await resetChords();
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, snap_to_scale: { root: "D", intervals: [7, 12] } });
+assert.deepEqual(edit.scale, { root_note: 2, intervals: [0, 7] });
+assert.deepEqual(await chordPitches(), [62, 62, 69, 69, 62]);
+await resetChords();
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, select: { in_scale: false },
+  snap_to_scale: { root: 2, intervals: [0, 2, 4, 5, 7, 9, 11, 12] } });
+assert.deepEqual([edit.changed_count, await chordPitches()], [3, [59, 64, 66, 69, 62]]);
+await usageError("midi_clip_edit_notes", { clip_id: chords.id, snap_to_scale: { root: "H", intervals: [0] } },
+  /snap_to_scale\.root: "H" is not a note/);
+// "song" follows Live's current scale: E major
+await resetChords();
+fixtures.setScale({ root: 4, name: "Major", intervals: [0, 2, 4, 5, 7, 9, 11] });
+assert.deepEqual(await pick({ in_scale: false }), [60, 70]);
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, select: { in_scale: false }, snap_to_scale: "song" });
+assert.deepEqual([edit.changed_count, edit.scale.root_note, await chordPitches()], [2, 4, [59, 64, 66, 69, 63]]);
+fixtures.setScale({ root: 0, name: "Major", intervals: [0, 2, 4, 5, 7, 9, 11] });
+
+// set: fields on the selected notes
+await resetChords();
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, select: { every_nth: 2 },
+  set: { velocity: 64, muted: true, probability: 0.25, velocity_deviation: 10, release_velocity: 30 } });
+assert.equal(edit.changed_count, 3);
+assert.deepEqual((await notesOf(chords.id))[0], { pitch: 60, start_time: 0, duration: 1, velocity: 64, muted: true,
+  probability: 0.25, velocity_deviation: 10, release_velocity: 30 });
+compact = await call("midi_clip_get_notes", { clip_id: chords.id, format: "compact" });
+assert.deepEqual(compact.defaults, { muted: true, probability: 0.25, velocity_deviation: 10, release_velocity: 30, selected: false });
+const unset = { muted: false, velocity_deviation: 0, release_velocity: 64 };
+assert.deepEqual(compact.notes, [[60, 0, 1, 64], [64, 0, 1, 100, { ...unset, probability: 1 }], [66, 1, 0.5, 64],
+  [70, 2, 0.5, 100, { ...unset, probability: 0.5 }], [63, 3, 0.25, 64]]);
+
+// durations: scale or set, then legato
+await resetChords();
+await call("midi_clip_edit_notes", { clip_id: chords.id, select: { pitch_max: "E3" }, duration_scale: 0.5 });
+assert.deepEqual((await notesOf(chords.id)).map((n) => n.duration), [0.5, 0.5, 0.5, 0.5, 0.125]);
+await call("midi_clip_edit_notes", { clip_id: chords.id, select: { time_min: 3 }, duration_set: 2 });
+assert.deepEqual((await notesOf(chords.id)).map((n) => n.duration), [0.5, 0.5, 0.5, 0.5, 2]);
+await usageError("midi_clip_edit_notes", { clip_id: chords.id, duration_set: 1, duration_scale: 2 }, /not both/);
+// legato: a chord (starts < 1/64 beat apart) ends together at the next start; the last keeps its length
+await resetChords();
+await call("midi_clip_set_notes", { clip_id: chords.id, mode: "merge", notes: [{ pitch: "G3", start_time: 0.01, duration: 0.1 }] });
+await call("midi_clip_edit_notes", { clip_id: chords.id, legato: true });
+assert.deepEqual((await notesOf(chords.id)).map((n) => [n.pitch, n.duration]),
+  [[60, 1], [64, 1], [66, 1], [70, 1], [63, 0.25], [67, 0.99]]);
+
+// humanize: seeded, so a call can be repeated exactly; the seed used is returned
+await resetChords();
+const human = { clip_id: chords.id, humanize: { timing: 0.05, velocity: 10, seed: 7 } };
+edit = await call("midi_clip_edit_notes", human);
+assert.equal(edit.humanize_seed, 7);
+const humanized = await notesOf(chords.id);
+for (const [i, n] of humanized.entries()) {
+  assert.ok(n.start_time >= 0 && Math.abs(n.start_time - CHORDS[i].start_time) <= 0.05, `start ${n.start_time}`);
+  assert.ok(Number.isInteger(n.velocity) && Math.abs(n.velocity - 100) <= 10, `velocity ${n.velocity}`);
+}
+assert.ok(humanized.some((n, i) => n.start_time !== CHORDS[i].start_time), "timing moved");
+await resetChords();
+await call("midi_clip_edit_notes", human);
+assert.deepEqual(await notesOf(chords.id), humanized, "the same seed humanizes alike");
+await resetChords();
+edit = await call("midi_clip_edit_notes", { clip_id: chords.id, humanize: { velocity: 10 } });
+assert.ok(Number.isInteger(edit.humanize_seed));
+const unseeded = await notesOf(chords.id);
+await resetChords();
+await call("midi_clip_edit_notes", { clip_id: chords.id, humanize: { velocity: 10, seed: edit.humanize_seed } });
+assert.deepEqual(await notesOf(chords.id), unseeded, "the returned seed reproduces the call");
+await usageError("midi_clip_edit_notes", { clip_id: chords.id, humanize: { seed: 1 } }, /humanize: give timing and\/or velocity/);
+
+// swing: every second grid step moves amount × grid/2 later, positions in between proportionally
+const groove = await call("clip_create", { type: "midi", track_name: "Notes", start_time: 0, duration: 4,
+  notes: [{ pitch: 42, start_time: 0.125, duration: 0.1 }], patterns: [{ note: 42, steps: "xxxx", duration: 0.1 }] });
+await call("midi_clip_edit_notes", { clip_id: groove.id, swing: { amount: 1 } });
+assert.deepEqual(startsOf(await notesOf(groove.id), 42), [0.1875, 0, 0.375, 0.5, 0.875]);
+// grid "song": Live's grid setting (Quarter in the mock = 1 beat)
+edit = await call("midi_clip_edit_notes", { clip_id: groove.id, quantize: { grid: "song" } });
+assert.deepEqual(edit.song_grid, { beats: 1, quantization: "Quarter", is_triplet: false });
+assert.deepEqual(startsOf(await notesOf(groove.id), 42), [0, 0, 0, 1, 1]);
+fixtures.setGrid(8, true); // 1/16 triplets: 1/6 beat
+await call("midi_clip_set_notes", { clip_id: groove.id, notes: [{ pitch: 42, start_time: 0.2, duration: 0.1 }] });
+edit = await call("midi_clip_edit_notes", { clip_id: groove.id, quantize: { grid: "song" } });
+assert.deepEqual([edit.song_grid.quantization, edit.song_grid.is_triplet], ["Sixteenth", true]);
+assert.ok(Math.abs(edit.song_grid.beats - 1 / 6) < 1e-12);
+assert.ok(Math.abs((await notesOf(groove.id))[0].start_time - 1 / 6) < 1e-12);
+fixtures.setGrid(4); // Bar: the first scene's time signature, 4/4
+await call("midi_clip_set_notes", { clip_id: groove.id, notes: [{ pitch: 42, start_time: 2.5, duration: 0.1 }] });
+edit = await call("midi_clip_edit_notes", { clip_id: groove.id, quantize: { grid: "song" } });
+assert.deepEqual([edit.song_grid.beats, (await notesOf(groove.id))[0].start_time], [4, 4]);
+fixtures.setGrid(0); // No Grid
+await usageError("midi_clip_edit_notes", { clip_id: groove.id, swing: { amount: 0.5, grid: "song" } },
+  /Live's grid is off: give the grid in beats/);
+fixtures.setGrid(6);
+
+// clip_ids: several clips alike, one notes write each, all one undo step
+await resetChords();
+const multi = await undoSteps(() => call("midi_clip_edit_notes", { clip_ids: [chords.id, groove.id], transpose: 1 }));
+assert.equal(multi.steps, 1);
+assert.deepEqual(multi.result.items.map((it) => [it.clip_id, it.note_count, it.changed_count]),
+  [[chords.id, 5, 5], [groove.id, 1, 1]]);
+assert.deepEqual(await chordPitches(), [61, 65, 67, 71, 64]);
+// every clip is checked before the first write
+await usageError("midi_clip_edit_notes", { clip_ids: [chords.id, notesTrack.id], transpose: 1 },
+  /clip_ids\[1\]: Object "\d+" is a MidiTrack, expected MidiClip/);
+await usageError("midi_clip_edit_notes", { clip_ids: [chords.id, chords.id], transpose: 1 }, /clip_ids\[1\]: clip \d+ is listed twice/);
+await usageError("midi_clip_edit_notes", { clip_id: chords.id, clip_ids: [beat.id], transpose: 1 }, /Give clip_id or clip_ids/);
+await usageError("midi_clip_edit_notes", { transpose: 1 }, /Give clip_id or clip_ids/);
+await usageError("midi_clip_edit_notes", { clip_ids: [beat.id], select: { pitch_min: "Z" }, transpose: 1 },
+  /select\.pitch_min: "Z" is not a MIDI pitch/);
+assert.deepEqual(await chordPitches(), [61, 65, 67, 71, 64], "failed edits change nothing");
+assert.equal((await notesOf(beat.id)).length, 8);
+// nothing selected: nothing written, no undo step
+const untouched = await undoSteps(() => call("midi_clip_edit_notes", {
+  clip_id: chords.id, select: { pitch_min: "C-2", pitch_max: 1 }, transpose: 1 }));
+assert.deepEqual([untouched.steps, untouched.result.changed_count, untouched.result.note_count], [0, 0, 5]);
+await call("track_delete", { track_id: notesTrack.id });
 assert.equal((await tracksNow()).length, 2);
 
 // ui + commands; the status command and its menu entries are registered

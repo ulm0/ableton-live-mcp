@@ -88,7 +88,10 @@ deleting a file deletes the preset.
 - Ids stay valid until the object is deleted or moved, or another Live Set is loaded. Stale ids
   return an error telling the client to re-list. Errors in the arguments themselves (unknown
   name, index out of range, conflicting fields) come without that hint.
-- All times/positions are in **beats**; colors are `#RRGGBB`; MIDI pitches are 0–127.
+- All times/positions are in **beats**; colors are `#RRGGBB`; MIDI pitches are 0–127, or note
+  names in Live's naming (`"C3"` = 60, `"F#1"`, `"Bb2"`) wherever a pitch is taken: notes,
+  patterns, note selections, drum pads in device paths and `drum_chain_set`. Drum chains report
+  `receiving_note_name` next to `receiving_note`.
 - **Batched writes**: `track_set`, `scene_set`, `cue_point_set`, `clip_set`, `take_lane_set` and
   `mixer_set` take `items: [{<address>, ...values}]` to change many objects in one call.
   `clip_set` also takes `select: {track, scope, name_contains}` (e.g. every clip of the Drums
@@ -109,6 +112,17 @@ deleting a file deletes the preset.
   switches a device on or off and sets several of its parameters in one undo step;
   `parameter_find` searches parameter names across the set, a track or a device. Values stay in
   internal units — the API has no display values (dB, Hz, ms).
+- **MIDI shortcuts**: MIDI writes (`clip_create`, `midi_clip_set_notes`) take step `patterns`
+  (`{note: "C1", steps: "x...X...", step: 0.25}`, `X` = accent) and `repeat: {length, times?}`,
+  which copies the notes every `length` beats up to the clip's end. `midi_clip_get_notes` takes a
+  `select` filter and `format: "compact"` (`[pitch, start, duration, velocity]` tuples plus the
+  fields that differ from the result's `defaults`). `midi_clip_edit_notes` adds `set`,
+  `snap_to_scale` (the song's scale or `{root, intervals}`, ties go down), `swing`, seeded
+  `humanize`, `duration_set` / `duration_scale` / `legato` (a chord ends together), quantizing
+  to Live's grid (`grid: "song"`), selecting by `in_scale`, `every_nth` or the user's note
+  selection (`only_selected`), and `clip_ids` to edit several clips in one undo step.
+  Whether Live reports the note selection (`NoteDescription.selected`) to extensions is not
+  verified yet; when no note reports one, results carry a `warning`.
 - **Copy, move and presets** (lossy by design): Live's API cannot move, reorder or copy devices,
   so `device_copy` inserts a fresh built-in device and copies the parameter values by name (a
   Simpler also gets its sample); `move: true` then deletes the original. Automation, mappings, a
@@ -175,13 +189,13 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 ### Clips
 | Tool | Description |
 |------|-------------|
-| `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
+| `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes`, step `patterns` and `repeat` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count). |
 | `clip_set` | Name, color, mute, looping, warping, warp mode — for one clip, several (`items`), or every clip of a track (`select: {track_name, scope, name_contains}`), in one undo step. |
 | `clip_delete` | Delete a session or arrangement clip. |
-| `midi_clip_get_notes` | Read all MIDI notes. |
-| `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top). |
-| `midi_clip_edit_notes` | Server-side note transforms — transpose, time-shift, velocity scale/offset, quantize, delete — with pitch/time selection. No read-modify-write roundtrip. |
+| `midi_clip_get_notes` | Read MIDI notes: all, or those matching `select` (pitch/time range, `in_scale`, `every_nth`, `only_selected`); `format: "compact"` returns tuples. Notes carry `selected` when Live reports it. |
+| `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top); step `patterns` and `repeat` write repetitive parts in a few characters. |
+| `midi_clip_edit_notes` | Server-side note transforms — transpose, snap to scale, set fields, velocity scale/offset, time-shift, quantize (beats or Live's grid), swing, duration set/scale, legato, seeded humanize, delete — on the notes matching `select`, for one clip or several (`clip_ids`, one undo step). No read-modify-write roundtrip. |
 
 ### Devices & racks
 | Tool | Description |
@@ -192,9 +206,9 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `device_delete` / `device_duplicate` | Remove or copy devices (the duplicate lands right after the original). |
 | `device_copy` | Copy a device to another track or chain, or with `move: true` move/reorder it: inserts the built-in device by name and copies parameter values by name (Simpler: and its sample). Lossy — automation, mappings and non-parameter state are lost, ids change; racks are refused. |
 | `device_preset_save` / `device_preset_load` / `device_preset_list` | Named parameter snapshots (plus a Simpler's sample path) stored as JSON under the extension's storage directory. Load onto an existing device or insert a new one. Not Live presets. |
-| `chain_get` | Rack chain detail: devices + chain mixer. |
+| `chain_get` | Rack chain detail: devices + chain mixer; drum chains report `receiving_note` and `receiving_note_name`. |
 | `rack_insert_chain` | Add a chain to a rack. |
-| `drum_chain_set` | Set the MIDI note of a drum rack pad. |
+| `drum_chain_set` | Set the MIDI note of a drum rack pad (a number or a name like `"D1"`). |
 | `simpler_replace_sample` | Swap the sample in a Simpler. |
 
 ### Parameters & mixing

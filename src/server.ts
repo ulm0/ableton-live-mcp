@@ -50,6 +50,8 @@ import {
   gridName,
   hexToColor,
   parameterSummary,
+  parsePitch,
+  parsePitchClass,
   parameterWithValue,
   sceneSummary,
   takeLaneSummary,
@@ -130,8 +132,15 @@ const COMMAND: ToolAnnotations = {
 type ToolMeta = { title: string; annotations: ToolAnnotations };
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
+// A MIDI pitch: 0-127, or a note name in Live's naming (C3 = 60), converted
+// with parsePitch. A fresh instance per use (see deviceStep).
+const pitchSchema = (what: string) =>
+  z
+    .union([z.number().int().min(0).max(127), z.string().min(1)])
+    .describe(`${what}: 0-127, or a note name such as "C3" (= 60), "F#1" or "Bb2"`);
+
 const noteShape = {
-  pitch: z.number().int().min(0).max(127).describe("MIDI pitch, 0-127"),
+  pitch: pitchSchema("MIDI pitch"),
   start_time: z.number().describe("Start in beats, relative to clip start"),
   duration: z.number().positive().describe("Length in beats"),
   velocity: z.number().min(0).max(127).optional(),
@@ -140,19 +149,11 @@ const noteShape = {
   velocity_deviation: z.number().optional(),
   release_velocity: z.number().min(0).max(127).optional(),
 };
+type NoteInput = z.objectOutputType<typeof noteShape, z.ZodTypeAny>;
 
-function toNoteDescription(n: {
-  pitch: number;
-  start_time: number;
-  duration: number;
-  velocity?: number;
-  muted?: boolean;
-  probability?: number;
-  velocity_deviation?: number;
-  release_velocity?: number;
-}): NoteDescription {
+function toNoteDescription(n: NoteInput, what = "pitch"): NoteDescription {
   return {
-    pitch: n.pitch,
+    pitch: parsePitch(n.pitch, what),
     startTime: n.start_time,
     duration: n.duration,
     velocity: n.velocity,
@@ -160,6 +161,312 @@ function toNoteDescription(n: {
     probability: n.probability,
     velocityDeviation: n.velocity_deviation,
     releaseVelocity: n.release_velocity,
+  };
+}
+
+// MIDI write shortcuts (clip_create, midi_clip_set_notes): a step pattern
+// writes one pitch's hits from a string, `repeat` copies the notes along.
+const patternSchema = () =>
+  z.object({
+    note: pitchSchema("Pitch of every hit"),
+    steps: z
+      .string()
+      .min(1)
+      .describe(
+        'One character per step: "x" a hit, "X" an accented hit, "." or "-" a rest; spaces and "|" ' +
+          'are ignored, e.g. "x...x...|x...x.x."',
+      ),
+    step: z.number().positive().default(0.25).describe("Length of one step in beats (0.25 = 1/16)"),
+    start_time: z.number().min(0).default(0).describe("Where the first step starts, in beats"),
+    velocity: z.number().min(1).max(127).default(100).describe('Velocity of "x" hits'),
+    accent_velocity: z.number().min(1).max(127).default(127).describe('Velocity of "X" hits'),
+    duration: z.number().positive().optional().describe("Length of each hit in beats; default one step"),
+  });
+type PatternInput = z.output<ReturnType<typeof patternSchema>>;
+const repeatSchema = () =>
+  z
+    .object({
+      length: z
+        .number()
+        .positive()
+        .describe("Beats the given notes span, e.g. 4 = one 4/4 bar: copy k starts k × length later"),
+      times: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Copies in total, counting the original (written even past the clip's end); omitted = fill " +
+            "the clip: copies up to its end, without the notes that would start at or after it",
+        ),
+    })
+    .describe("Repeat the notes and patterns of this write");
+type RepeatInput = { length: number; times?: number };
+
+// Shortcuts must not flood Live with notes by a typo (a tiny repeat length).
+const MAX_EXPANDED_NOTES = 50_000;
+
+// The notes a MIDI write sends: `notes`, then the hits of `patterns`, all
+// repeated per `repeat` up to `end` (the clip's length) unless `times` is
+// given. Throws before anything is written; `copies` is set with `repeat`.
+function noteList(
+  input: { notes?: NoteInput[]; patterns?: PatternInput[]; repeat?: RepeatInput },
+  end: number,
+): { notes: NoteDescription[]; copies?: number } {
+  const base = (input.notes ?? []).map((n, i) => toNoteDescription(n, `notes[${i}].pitch`));
+  for (const [i, p] of (input.patterns ?? []).entries()) {
+    const pitch = parsePitch(p.note, `patterns[${i}].note`);
+    let k = 0; // step index: separators do not count
+    for (const c of p.steps) {
+      if (c === "|" || /\s/.test(c)) continue;
+      if (c === "x" || c === "X")
+        base.push({
+          pitch,
+          startTime: p.start_time + k * p.step,
+          duration: p.duration ?? p.step,
+          velocity: c === "X" ? p.accent_velocity : p.velocity,
+        });
+      else if (c !== "." && c !== "-")
+        throw new UsageError(
+          `patterns[${i}].steps: unexpected ${JSON.stringify(c)}; use x, X, . or - (spaces and | are ignored).`,
+        );
+      k++;
+    }
+  }
+  // filling: every copy that starts before the end (float noise aside)
+  const fillCopies = (r: RepeatInput) => Math.max(1, Math.ceil(end / r.length - 1e-9));
+  const copies = input.repeat ? (input.repeat.times ?? fillCopies(input.repeat)) : 1;
+  const total = base.length * copies;
+  if (total > MAX_EXPANDED_NOTES && total > (input.notes?.length ?? 0))
+    throw new UsageError(
+      `patterns and repeat would write ${total} notes; at most ${MAX_EXPANDED_NOTES} are allowed.`,
+    );
+  if (!input.repeat) return { notes: base };
+  if (!base.length) throw new UsageError("repeat needs notes or patterns to repeat.");
+  const { length, times } = input.repeat;
+  const out = [...base];
+  for (let k = 1; k < copies; k++)
+    for (const n of base) {
+      const startTime = n.startTime + k * length;
+      if (times === undefined && startTime >= end - 1e-9) continue;
+      out.push({ ...n, startTime });
+    }
+  return { notes: out, copies };
+}
+
+// Which notes a MIDI read or edit applies to: all given filters must match.
+const noteSelectSchema = () =>
+  z.object({
+    pitch_min: pitchSchema("Lowest pitch").optional(),
+    pitch_max: pitchSchema("Highest pitch").optional(),
+    time_min: z.number().optional().describe("Earliest start time, in beats"),
+    time_max: z.number().optional().describe("Latest start time, in beats"),
+    in_scale: z
+      .boolean()
+      .optional()
+      .describe(
+        "true: only notes in the scale, false: only notes outside it. The scale is the song's (in " +
+          "midi_clip_edit_notes: snap_to_scale's, when given)",
+      ),
+    only_selected: z
+      .boolean()
+      .optional()
+      .describe(
+        "Only the notes selected in Live's MIDI editor. Whether Live reports the selection to " +
+          "extensions is unverified: a `warning` says when it reported none",
+      ),
+    every_nth: z
+      .union([
+        z.number().int().min(1),
+        z.object({ n: z.number().int().min(1), offset: z.number().int().min(0).default(0) }),
+      ])
+      .optional()
+      .describe(
+        "Every n-th of the notes the other filters match, in time order (start, then pitch): 2 = the " +
+          "1st, 3rd, 5th, ...; {n: 2, offset: 1} = the 2nd, 4th, ...",
+      ),
+  });
+type NoteSelect = z.output<ReturnType<typeof noteSelectSchema>>;
+
+// A scale: Live's current one, or a root and semitone intervals.
+const scaleSchema = () =>
+  z.union([
+    z.literal("song"),
+    z.object({
+      root: z
+        .union([z.number().int().min(0).max(11), z.string().min(1)])
+        .describe('Root as 0-11 (C = 0) or a note name such as "D" or "F#"'),
+      intervals: z
+        .array(z.number().int())
+        .min(1)
+        .describe("Semitone offsets from the root, e.g. [0, 2, 3, 5, 7, 8, 10] (natural minor)"),
+    }),
+  ]);
+type ScaleSpec = z.output<ReturnType<typeof scaleSchema>>;
+type Scale = { root_note: number; intervals: number[]; name?: string };
+
+const pitchClass = (pitch: number, root: number) => (((pitch - root) % 12) + 12) % 12;
+const inScale = (pitch: number, s: Scale) => s.intervals.includes(pitchClass(pitch, s.root_note));
+
+// The nearest pitch in the scale, the lower one on a tie (within 0-127).
+function snapToScale(pitch: number, s: Scale): number {
+  for (let d = 0; d < 12; d++) {
+    if (pitch - d >= 0 && inScale(pitch - d, s)) return pitch - d;
+    if (pitch + d <= 127 && inScale(pitch + d, s)) return pitch + d;
+  }
+  return pitch; // unreachable: every octave holds a scale degree
+}
+
+// A grid in beats, or "song": Live's arrangement grid setting.
+const gridSchema = (what: string) =>
+  z
+    .union([z.number().positive(), z.literal("song")])
+    .describe(
+      `${what} in beats (0.25 = 1/16), or "song" for Live's grid setting (the arrangement grid, ` +
+        "not the clip editor's; bar grids assume the first scene's time signature)",
+    );
+
+// Indices of notes in time order: start, then pitch, then list position.
+const timeOrder = (notes: NoteDescription[]) =>
+  notes
+    .map((_, i) => i)
+    .sort(
+      (a, b) =>
+        num(notes[a].startTime) - num(notes[b].startTime) || num(notes[a].pitch) - num(notes[b].pitch) || a - b,
+    );
+
+// Validates a `select` and returns which of a clip's notes it matches.
+function noteFilter(sel: NoteSelect, scale?: Scale): (notes: NoteDescription[]) => boolean[] {
+  const lo = sel.pitch_min === undefined ? 0 : parsePitch(sel.pitch_min, "select.pitch_min");
+  const hi = sel.pitch_max === undefined ? 127 : parsePitch(sel.pitch_max, "select.pitch_max");
+  const nth = typeof sel.every_nth === "number" ? { n: sel.every_nth, offset: 0 } : sel.every_nth;
+  const matches = (n: NoteDescription) => {
+    const pitch = num(n.pitch);
+    const start = num(n.startTime);
+    return (
+      pitch >= lo &&
+      pitch <= hi &&
+      (sel.time_min === undefined || start >= sel.time_min) &&
+      (sel.time_max === undefined || start <= sel.time_max) &&
+      (sel.in_scale === undefined || inScale(pitch, scale!) === sel.in_scale) &&
+      (!sel.only_selected || n.selected === true)
+    );
+  };
+  return (notes) => {
+    const mask = notes.map(matches);
+    if (nth) {
+      let k = 0; // position among the matching notes
+      for (const i of timeOrder(notes)) {
+        if (!mask[i]) continue;
+        mask[i] = k >= nth.offset && (k - nth.offset) % nth.n === 0;
+        k++;
+      }
+    }
+    return mask;
+  };
+}
+
+// only_selected matched nothing because Live reports no selection: say so.
+function selectionWarning(notes: NoteDescription[]): string | undefined {
+  if (!notes.length || notes.some((n) => n.selected === true)) return undefined;
+  return notes.some((n) => typeof n.selected === "boolean")
+    ? "No note of this clip is selected in Live."
+    : "Live reported no selection state for this clip's notes, so none counts as selected.";
+}
+
+// A note as midi_clip_get_notes returns it. `selected` is the user's note
+// selection in Live, when the host reports it.
+function noteOut(n: NoteDescription) {
+  const opt = (v: number | bigint | undefined) => (v === undefined ? undefined : num(v));
+  return {
+    pitch: num(n.pitch),
+    start_time: num(n.startTime),
+    duration: num(n.duration),
+    velocity: opt(n.velocity),
+    muted: n.muted,
+    probability: opt(n.probability),
+    velocity_deviation: opt(n.velocityDeviation),
+    release_velocity: opt(n.releaseVelocity),
+    selected: n.selected,
+  };
+}
+type NoteOut = ReturnType<typeof noteOut>;
+
+// format "compact": each note is [pitch, start_time, duration, velocity], plus
+// an object of its other fields that differ from `defaults`: each field's most
+// common value in this result. A field the host leaves out counts as Live's
+// default value for it (NOTE_DEFAULTS), as it does when notes are written.
+const NOTE_DEFAULTS = {
+  muted: false,
+  probability: 1,
+  velocity_deviation: 0,
+  release_velocity: 64,
+  selected: false,
+};
+const COMPACT_EXTRAS = Object.keys(NOTE_DEFAULTS) as Array<keyof typeof NOTE_DEFAULTS>;
+function compactNotes(notes: NoteOut[]) {
+  const value = (n: NoteOut, f: (typeof COMPACT_EXTRAS)[number]) => n[f] ?? NOTE_DEFAULTS[f];
+  const defaults: Record<string, unknown> = { ...NOTE_DEFAULTS };
+  for (const f of COMPACT_EXTRAS) {
+    const counts = new Map<unknown, number>();
+    for (const n of notes) counts.set(value(n, f), (counts.get(value(n, f)) ?? 0) + 1);
+    let best = 0;
+    for (const [v, c] of counts)
+      if (c > best) {
+        best = c;
+        defaults[f] = v;
+      }
+  }
+  return {
+    format: "compact",
+    fields: ["pitch", "start_time", "duration", "velocity"],
+    defaults,
+    notes: notes.map((n) => {
+      const tuple: unknown[] = [n.pitch, n.start_time, n.duration, n.velocity ?? null];
+      const differs = COMPACT_EXTRAS.filter((f) => value(n, f) !== defaults[f]);
+      if (differs.length) tuple.push(Object.fromEntries(differs.map((f) => [f, value(n, f)])));
+      return tuple;
+    }),
+  };
+}
+
+// Swing: in each pair of grid steps the off-beat step moves amount × grid/2
+// later; the positions between move proportionally, on-beat steps stay.
+function swingTime(t: number, grid: number, amount: number): number {
+  const pair = 2 * grid;
+  const base = Math.floor(t / pair) * pair;
+  const p = t - base;
+  const off = grid * (1 + amount / 2); // where the off-beat step lands
+  return base + (p <= grid ? (p * off) / grid : off + ((p - grid) * (pair - off)) / grid);
+}
+
+// Notes starting less than this many beats apart are one chord for legato.
+const CHORD_WINDOW = 1 / 64;
+// Durations a transform shortens stay at least this long (beats).
+const MIN_NOTE_DURATION = 1 / 256;
+
+// legato: each chord (notes starting less than CHORD_WINDOW apart) lasts until
+// the next chord starts; the last chord keeps its length.
+function legato(notes: NoteDescription[]) {
+  const chords: NoteDescription[][] = [];
+  for (const t of [...notes].sort((a, b) => a.startTime - b.startTime)) {
+    const chord = chords[chords.length - 1];
+    if (chord && t.startTime - chord[0].startTime < CHORD_WINDOW) chord.push(t);
+    else chords.push([t]);
+  }
+  for (let c = 0; c + 1 < chords.length; c++)
+    for (const t of chords[c]) t.duration = Math.max(MIN_NOTE_DURATION, chords[c + 1][0].startTime - t.startTime);
+}
+
+// Seeded PRNG (mulberry32): one seed humanizes the same notes the same way.
+function seededRandom(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
@@ -217,9 +524,7 @@ type SceneAddress = { scene_id?: string; scene_index?: number; scene_name?: stri
 // Rack {pad: note} picks the chain whose devices the next step picks from.
 const chainStep = z.union([
   z.object({ chain: z.number().int().min(0).describe("0-based chain index in the rack") }).strict(),
-  z
-    .object({ pad: z.number().int().min(0).max(127).describe("Drum Rack pad: the chain's receiving MIDI note") })
-    .strict(),
+  z.object({ pad: pitchSchema("Drum Rack pad: the chain's receiving MIDI note") }).strict(),
 ]);
 // A fresh instance per use: a schema used twice in one tool becomes a JSON
 // Schema $ref, which some clients do not resolve.
@@ -239,7 +544,7 @@ const deviceAddress = {
         'path into racks, e.g. ["Drum Rack", {"pad": 36}, "Simpler"] or [0, {"chain": 1}, "Reverb"]',
     ),
 };
-type ChainStep = { chain: number } | { pad: number };
+type ChainStep = { chain: number } | { pad: number | string };
 type DeviceAddress = TrackAddress & {
   device_id?: string;
   device?: string | number | Array<string | number | ChainStep>;
@@ -715,17 +1020,18 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     }
     if (!(rack instanceof DrumRack))
       throw new UsageError(`${describeDevice(rack)} is not a Drum Rack: address its chains by {chain: index}.`);
+    const pad = parsePitch(step.pad, "pad");
     const notes = chains.map((c) => (c instanceof DrumChain ? num(c.receivingNote) : undefined));
-    const hits = notes.flatMap((n, i) => (n === step.pad ? [i] : []));
-    if (hits.length === 1) return { chain: chains[hits[0]], label: `pad ${step.pad}` };
+    const hits = notes.flatMap((n, i) => (n === pad ? [i] : []));
+    if (hits.length === 1) return { chain: chains[hits[0]], label: `pad ${pad}` };
     if (hits.length)
       throw new UsageError(
-        `Ambiguous pad ${step.pad} in ${describeDevice(rack)}: chains ${hits.join(", ")} all receive ` +
-          `note ${step.pad}. Use {chain: index}.`,
+        `Ambiguous pad ${pad} in ${describeDevice(rack)}: chains ${hits.join(", ")} all receive ` +
+          `note ${pad}. Use {chain: index}.`,
       );
     const pads = [...new Set(notes.filter((n): n is number => n !== undefined))].sort((a, b) => a - b);
     throw new UsageError(
-      `No pad receives note ${step.pad} in ${describeDevice(rack)} (pads: ${pads.join(", ") || "none"}).`,
+      `No pad receives note ${pad} in ${describeDevice(rack)} (pads: ${pads.join(", ") || "none"}).`,
     );
   }
 
@@ -1692,7 +1998,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "midi, AudioTrack for audio; requires start_time — OR the session slot of a " +
       "scene when scene_index/scene_id/scene_name is given), or a take lane id " +
       "(requires start_time). MIDI clips require duration and can be created with " +
-      "their notes inline (file_path, is_warped and loop_settings are rejected). " +
+      "their notes inline: `notes`, step `patterns` (one pitch per string, e.g. " +
+      "{note:\"C1\", steps:\"x...x...\"}) and `repeat` {length} to copy them along " +
+      "the clip (file_path, is_warped and loop_settings are rejected). " +
       "Audio clips require file_path; by default the file is first imported " +
       "into the Live project (recommended). Optional name/color apply right " +
       "after creation.",
@@ -1717,6 +2025,11 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       start_time: z.number().optional().describe("Arrangement position in beats (track/take-lane targets)"),
       duration: z.number().positive().optional().describe("Clip length in beats"),
       notes: z.array(z.object(noteShape)).optional().describe("MIDI only: initial notes"),
+      patterns: z
+        .array(patternSchema())
+        .optional()
+        .describe("MIDI only: step patterns, written with the notes, e.g. a drum line per pad"),
+      repeat: repeatSchema().optional(),
       name: z.string().optional(),
       color: z.string().optional().describe("#RRGGBB"),
       file_path: z.string().optional().describe("Audio file path (audio clips only)"),
@@ -1734,6 +2047,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         );
         if (audioOnly.length)
           throw new UsageError(`MIDI clips take no ${audioOnly.join(", ")} (audio clips only).`);
+      } else {
+        const midiOnly = (["notes", "patterns", "repeat"] as const).filter((k) => args[k] !== undefined);
+        if (midiOnly.length) throw new UsageError(`${midiOnly.join(", ")} only apply to MIDI clips.`);
       }
       let target = findTarget(args);
       if (hasSceneAddress(args)) {
@@ -1762,6 +2078,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
       if (args.type === "midi") {
         need(args.duration, "duration");
+        // every note is built (and checked) before the clip exists
+        const { notes } = noteList(args, args.duration!);
         let clip: MidiClip<"1.0.0">;
         if (target instanceof ClipSlot) {
           clip = await target.createMidiClip(args.duration!);
@@ -1773,7 +2091,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
             `MIDI clips need a ClipSlot, MidiTrack, or TakeLane target, got ${classOf(target)}.`,
           );
         }
-        if (args.notes?.length) clip.notes = args.notes.map(toNoteDescription);
+        if (notes.length) clip.notes = notes;
         return finish(clip);
       }
 
@@ -1784,7 +2102,6 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         throw new UsageError(
           `Audio clips need a ClipSlot, AudioTrack, or TakeLane target, got ${classOf(target)}.`,
         );
-      if (args.notes) throw new UsageError("notes only apply to MIDI clips.");
       if (!(target instanceof ClipSlot)) need(args.start_time, "start_time");
       if (args.loop_settings && args.is_warped === undefined)
         throw new UsageError("is_warped is required when loop_settings is set.");
@@ -1968,25 +2285,78 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  // -- MIDI notes ------------------------------------------------------------
+
+  function resolveScale(spec: ScaleSpec): Scale {
+    const classes = (intervals: number[]) =>
+      [...new Set(intervals.map((i) => pitchClass(i, 0)))].sort((a, b) => a - b);
+    if (spec !== "song")
+      return { root_note: parsePitchClass(spec.root, "snap_to_scale.root"), intervals: classes(spec.intervals) };
+    const s = song();
+    const intervals = classes(s.scaleIntervals.map(num));
+    if (!intervals.length) throw new Error("Live reported no intervals for the song's scale.");
+    return { root_note: num(s.rootNote), intervals, name: s.scaleName };
+  }
+
+  // Live's grid setting in beats. Song has no time signature, so a bar is the
+  // first scene's (4/4 without scenes).
+  const GRID_BEATS: Record<string, number> = {
+    Half: 2,
+    Quarter: 1,
+    Eighth: 0.5,
+    Sixteenth: 0.25,
+    ThirtySecond: 0.125,
+  };
+  const GRID_BARS: Record<string, number> = { EightBars: 8, FourBars: 4, TwoBars: 2, Bar: 1 };
+  function songGrid() {
+    const s = song();
+    const quantization = gridName(s.gridQuantization);
+    const isTriplet = s.gridIsTriplet;
+    const scene = s.scenes[0];
+    const bar = scene ? (num(scene.signatureNumerator) * 4) / num(scene.signatureDenominator) : 4;
+    const bars = GRID_BARS[quantization];
+    const beats = GRID_BEATS[quantization] ?? (bars === undefined ? undefined : bars * bar);
+    if (beats === undefined)
+      throw new UsageError(
+        `Live's grid is ${quantization === "NoGrid" ? "off" : quote(String(quantization))}: ` +
+          'give the grid in beats instead of "song".',
+      );
+    return { beats: isTriplet ? (beats * 2) / 3 : beats, quantization, is_triplet: isTriplet };
+  }
+
   tool(
     "midi_clip_get_notes",
     { title: "Get MIDI notes", annotations: READ },
-    "Get all MIDI notes of a clip. Times/durations in beats relative to clip start.",
-    { clip_id: z.string() },
-    ({ clip_id }) => {
-      const notes = resolve(clip_id, MidiClip).notes;
+    "Get the MIDI notes of a clip. Times/durations in beats relative to clip start. " +
+      "`select` returns only the matching notes (pitch range, also as note names like " +
+      "\"C1\"; start time range; in_scale against the song's scale; every_nth; " +
+      "only_selected: the notes the user selected in Live, when Live reports them — " +
+      "unverified, a `warning` says when it reported no selection). Notes carry " +
+      "`selected` when Live reports it. format \"compact\" returns each note as " +
+      "[pitch, start_time, duration, velocity], plus an object of its other fields " +
+      "that differ from `defaults`: several times smaller for dense clips.",
+    {
+      clip_id: z.string(),
+      select: noteSelectSchema().optional().describe("Only the notes matching every given filter"),
+      only_selected: z.boolean().optional().describe("Same as select.only_selected"),
+      format: z
+        .enum(["full", "compact"])
+        .default("full")
+        .describe("full: one object per note; compact: one tuple per note"),
+    },
+    ({ clip_id, select, only_selected, format }) => {
+      const sel: NoteSelect = { ...select, only_selected: only_selected || select?.only_selected };
+      const scale = sel.in_scale !== undefined ? resolveScale("song") : undefined;
+      const matches = noteFilter(sel, scale);
+      const all = resolve(clip_id, MidiClip).notes;
+      const mask = matches(all);
+      const notes = all.filter((_, i) => mask[i]).map(noteOut);
       return {
         note_count: notes.length,
-        notes: notes.map((n) => ({
-          pitch: num(n.pitch),
-          start_time: num(n.startTime),
-          duration: num(n.duration),
-          velocity: n.velocity === undefined ? undefined : num(n.velocity),
-          muted: n.muted,
-          probability: n.probability === undefined ? undefined : num(n.probability),
-          velocity_deviation: n.velocityDeviation === undefined ? undefined : num(n.velocityDeviation),
-          release_velocity: n.releaseVelocity === undefined ? undefined : num(n.releaseVelocity),
-        })),
+        total_note_count: select !== undefined || only_selected ? all.length : undefined,
+        scale,
+        warning: sel.only_selected ? selectionWarning(all) : undefined,
+        ...(format === "compact" ? compactNotes(notes) : { notes }),
       };
     },
   );
@@ -1996,86 +2366,215 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     { title: "Write MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
     "Write notes to a MIDI clip. mode 'replace' (default) replaces ALL notes; " +
       "mode 'merge' adds the given notes on top of the existing ones (layering " +
-      "without re-sending the current content). For mechanical edits of existing " +
-      "notes (transpose, shift, quantize, ...) prefer midi_clip_edit_notes.",
+      "without re-sending the current content). Pitches are 0-127 or note names " +
+      "(C3 = 60). Shortcuts: `patterns` writes one pitch per string, e.g. " +
+      "{note:\"F#1\", steps:\"x.x.x.x.\", step:0.25} (\"X\" = accent), and `repeat` " +
+      "{length, times?} copies the notes and patterns every `length` beats, filling " +
+      "the clip (to its loop end when looping) when times is omitted. For mechanical " +
+      "edits of existing notes (transpose, shift, quantize, ...) prefer midi_clip_edit_notes.",
     {
       clip_id: z.string(),
-      notes: z.array(z.object(noteShape)),
+      notes: z
+        .array(z.object(noteShape))
+        .optional()
+        .describe("Notes to write; [] in mode replace clears the clip"),
+      patterns: z.array(patternSchema()).optional().describe("Step patterns, written with the notes"),
+      repeat: repeatSchema().optional(),
       mode: z.enum(["replace", "merge"]).default("replace"),
     },
-    ({ clip_id, notes, mode }) => {
-      const clip = resolve(clip_id, MidiClip);
-      const incoming = notes.map(toNoteDescription);
-      clip.notes = mode === "merge" ? [...clip.notes, ...incoming] : incoming;
-      return { note_count: mode === "merge" ? undefined : notes.length, added: mode === "merge" ? notes.length : undefined };
+    (args) => {
+      if (args.notes === undefined && args.patterns === undefined)
+        throw new UsageError("Give notes and/or patterns (notes: [] with mode replace clears the clip).");
+      const clip = resolve(args.clip_id, MidiClip);
+      // Filling needs the clip's end, in the same clip beats as note times.
+      const fill = args.repeat !== undefined && args.repeat.times === undefined;
+      const end = fill ? num(clip.looping ? clip.loopEnd : clip.endMarker) : Infinity;
+      const { notes, copies } = noteList(args, end);
+      const merge = args.mode === "merge";
+      clip.notes = merge ? [...clip.notes, ...notes] : notes;
+      return {
+        note_count: merge ? undefined : notes.length,
+        added: merge ? notes.length : undefined,
+        copies,
+      };
     },
   );
 
   tool(
     "midi_clip_edit_notes",
     { title: "Edit MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
-    "Transform existing notes of a MIDI clip server-side — no need to read and " +
-      "rewrite the note list. Optional `select` restricts which notes are " +
-      "affected (by pitch/time range); others pass through untouched. Transforms " +
-      "(applied in this order): transpose (semitones), time_shift (beats), " +
-      "velocity_scale, velocity_offset, quantize (snap start times to a beat " +
-      "grid, strength 0-1), or delete=true to remove the selected notes. " +
-      "Results are clamped to valid MIDI ranges.",
+    "Transform the existing notes of a MIDI clip (clip_id), or of several clips alike " +
+      "(clip_ids), server-side — no need to read and rewrite the note list. Optional " +
+      "`select` restricts which notes are affected (pitch/time range, in_scale, " +
+      "every_nth, only_selected = the user's note selection in Live, when Live reports " +
+      "it: unverified); others pass through untouched. Transforms, applied in this " +
+      "order: transpose (semitones), snap_to_scale (\"song\" or {root, intervals}: notes " +
+      "outside the scale move to the nearest scale note, ties go down), set (velocity, " +
+      "probability, velocity_deviation, release_velocity, muted), velocity_scale, " +
+      "velocity_offset, time_shift (beats), quantize (start times to a grid in beats or " +
+      "Live's \"song\" grid, strength 0-1), swing, duration_set or duration_scale, " +
+      "legato (each note lasts until the next later start among the selected notes; " +
+      "notes starting together are a chord and end together; the last ones keep their " +
+      "length), humanize (random ±timing beats and ±velocity, reproducible with `seed`; " +
+      "the seed used is returned) — or delete=true to remove the selected notes. " +
+      "Results are clamped to valid MIDI ranges. Each clip gets one notes write, all " +
+      "clips together form one undo step, and nothing is written if an argument or a " +
+      "clip is invalid.",
     {
-      clip_id: z.string(),
-      select: z
-        .object({
-          pitch_min: z.number().int().min(0).max(127).optional(),
-          pitch_max: z.number().int().min(0).max(127).optional(),
-          time_min: z.number().optional(),
-          time_max: z.number().optional(),
-        })
-        .optional(),
+      clip_id: z.string().optional().describe("The MIDI clip (or give clip_ids)"),
+      clip_ids: z
+        .array(z.string())
+        .min(1)
+        .optional()
+        .describe("Several MIDI clips, edited alike; returns {items}"),
+      select: noteSelectSchema().optional().describe("Only transform the notes matching every given filter"),
       transpose: z.number().int().optional().describe("Semitones, negative = down"),
+      snap_to_scale: scaleSchema()
+        .optional()
+        .describe('Move notes outside the scale to the nearest scale note; "song" = Live\'s current scale'),
+      set: z
+        .object({
+          velocity: z.number().min(0).max(127).optional(),
+          probability: z.number().min(0).max(1).optional(),
+          velocity_deviation: z.number().optional(),
+          release_velocity: z.number().min(0).max(127).optional(),
+          muted: z.boolean().optional(),
+        })
+        .optional()
+        .describe("Set these fields on every selected note"),
       time_shift: z.number().optional().describe("Beats, negative = earlier"),
       velocity_scale: z.number().min(0).optional(),
       velocity_offset: z.number().optional(),
       quantize: z
-        .object({ grid: z.number().positive().describe("Grid in beats, e.g. 0.25 = 1/16"), strength: z.number().min(0).max(1).default(1) })
+        .object({ grid: gridSchema("Grid"), strength: z.number().min(0).max(1).default(1) })
+        .optional(),
+      swing: z
+        .object({
+          amount: z
+            .number()
+            .min(0)
+            .max(1)
+            .describe("0 = straight, about 0.67 = triplet feel, 1 = dotted: the off-beat moves amount × grid/2"),
+          grid: gridSchema("Swing grid").default(0.25),
+        })
+        .optional()
+        .describe("Delay every second grid step; positions in between move proportionally"),
+      duration_set: z.number().positive().optional().describe("New length of every selected note, in beats"),
+      duration_scale: z.number().positive().optional().describe("Multiply lengths, e.g. 0.5 = shorter"),
+      legato: z
+        .boolean()
+        .optional()
+        .describe(
+          "Lengthen or cut each selected note to the next later start among the selected notes; notes " +
+            "starting less than 1/64 beat apart are a chord and end together; the last ones keep their length",
+        ),
+      humanize: z
+        .object({
+          timing: z.number().min(0).default(0).describe("Largest random start shift, ± beats (e.g. 0.02)"),
+          velocity: z.number().min(0).default(0).describe("Largest random velocity change, ± (whole steps)"),
+          seed: z
+            .number()
+            .int()
+            .optional()
+            .describe(
+              "Same seed, clips and notes: same result; omitted = a random seed, returned as humanize_seed",
+            ),
+        })
         .optional(),
       delete: z.boolean().optional().describe("Delete the selected notes instead of transforming"),
     },
     (args) => {
-      const clip = resolve(args.clip_id, MidiClip);
+      if ((args.clip_id === undefined) === (args.clip_ids === undefined))
+        throw new UsageError("Give clip_id or clip_ids (one of them).");
+      if (args.duration_set !== undefined && args.duration_scale !== undefined)
+        throw new UsageError("Give duration_set or duration_scale, not both.");
+      const hz = args.humanize;
+      if (hz && !hz.timing && !hz.velocity) throw new UsageError("humanize: give timing and/or velocity.");
       const sel = args.select ?? {};
+      const scale =
+        args.snap_to_scale !== undefined || sel.in_scale !== undefined
+          ? resolveScale(args.snap_to_scale ?? "song")
+          : undefined;
+      const matches = noteFilter(sel, scale);
+      const grid = args.quantize?.grid === "song" || args.swing?.grid === "song" ? songGrid() : undefined;
+      const gridBeats = (g: number | "song") => (g === "song" ? grid!.beats : g);
+      const seed = hz ? (hz.seed ?? Math.floor(Math.random() * 2 ** 31)) : undefined;
+      const random = seed === undefined ? undefined : seededRandom(seed);
+      // Every clip is resolved before the first write.
+      const ids = args.clip_ids ?? [args.clip_id!];
+      const clips = ids.map((id, i) =>
+        at(args.clip_ids ? `clip_ids[${i}]` : undefined, () => resolve(id, MidiClip)),
+      );
+      clips.forEach((clip, i) => {
+        const first = clips.findIndex((c) => c.handle.id === clip.handle.id);
+        if (first !== i)
+          throw new UsageError(`clip_ids[${i}]: clip ${ids[i]} is listed twice, also as clip_ids[${first}].`);
+      });
       const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-      const selected = (n: NoteDescription) =>
-        (sel.pitch_min === undefined || num(n.pitch) >= sel.pitch_min) &&
-        (sel.pitch_max === undefined || num(n.pitch) <= sel.pitch_max) &&
-        (sel.time_min === undefined || num(n.startTime) >= sel.time_min) &&
-        (sel.time_max === undefined || num(n.startTime) <= sel.time_max);
-      let changed = 0;
-      const out: NoteDescription[] = [];
-      for (const n of clip.notes) {
-        if (!selected(n)) {
-          out.push(n);
-          continue;
+      const edits = clips.map((clip) => {
+        const notes = clip.notes;
+        const mask = matches(notes);
+        const changed = mask.filter(Boolean).length;
+        const warning = sel.only_selected ? selectionWarning(notes) : undefined;
+        if (args.delete) return { clip, out: notes.filter((_, i) => !mask[i]), changed, warning };
+        const out = notes.slice();
+        const edited: NoteDescription[] = []; // the selected notes, transformed, in time order
+        for (const i of timeOrder(notes)) {
+          if (!mask[i]) continue;
+          const n = notes[i];
+          const t = { ...n, pitch: num(n.pitch), startTime: num(n.startTime), duration: num(n.duration) };
+          if (args.transpose) t.pitch = clamp(t.pitch + args.transpose, 0, 127);
+          if (args.snap_to_scale !== undefined) t.pitch = snapToScale(t.pitch, scale!);
+          const set = args.set;
+          if (set?.velocity !== undefined) t.velocity = set.velocity;
+          if (set?.probability !== undefined) t.probability = set.probability;
+          if (set?.velocity_deviation !== undefined) t.velocityDeviation = set.velocity_deviation;
+          if (set?.release_velocity !== undefined) t.releaseVelocity = set.release_velocity;
+          if (set?.muted !== undefined) t.muted = set.muted;
+          if (args.velocity_scale !== undefined || args.velocity_offset !== undefined) {
+            const v = num(t.velocity ?? 100) * (args.velocity_scale ?? 1) + (args.velocity_offset ?? 0);
+            t.velocity = clamp(v, 1, 127);
+          }
+          if (args.time_shift) t.startTime = Math.max(0, t.startTime + args.time_shift);
+          if (args.quantize) {
+            const g = gridBeats(args.quantize.grid);
+            const snapped = Math.round(t.startTime / g) * g;
+            t.startTime = t.startTime + (snapped - t.startTime) * args.quantize.strength;
+          }
+          if (args.swing) t.startTime = swingTime(t.startTime, gridBeats(args.swing.grid), args.swing.amount);
+          if (args.duration_set !== undefined) t.duration = args.duration_set;
+          if (args.duration_scale !== undefined)
+            t.duration = Math.max(MIN_NOTE_DURATION, t.duration * args.duration_scale);
+          out[i] = t;
+          edited.push(t);
         }
-        if (args.delete) {
-          changed++;
-          continue;
-        }
-        const t = { ...n, pitch: num(n.pitch), startTime: num(n.startTime) };
-        if (args.transpose) t.pitch = clamp(t.pitch + args.transpose, 0, 127);
-        if (args.time_shift) t.startTime = Math.max(0, t.startTime + args.time_shift);
-        if (args.velocity_scale !== undefined || args.velocity_offset !== undefined) {
-          const v = num(t.velocity ?? 100) * (args.velocity_scale ?? 1) + (args.velocity_offset ?? 0);
-          t.velocity = clamp(v, 1, 127);
-        }
-        if (args.quantize) {
-          const snapped = Math.round(t.startTime / args.quantize.grid) * args.quantize.grid;
-          t.startTime = t.startTime + (snapped - t.startTime) * args.quantize.strength;
-        }
-        changed++;
-        out.push(t);
-      }
-      clip.notes = out;
-      return { note_count: out.length, changed_count: changed };
+        if (args.legato) legato(edited);
+        // Two draws per note, in time order (clip by clip), whether timing,
+        // velocity or both are used: a seed always gives a note the same draws.
+        if (random && hz)
+          for (const t of edited) {
+            const dt = random() * 2 - 1;
+            const dv = random() * 2 - 1;
+            if (hz.timing) t.startTime = Math.max(0, t.startTime + dt * hz.timing);
+            if (hz.velocity) t.velocity = clamp(num(t.velocity ?? 100) + Math.round(dv * hz.velocity), 1, 127);
+          }
+        return { clip, out, changed, warning };
+      });
+      // One notes write per clip (none where nothing is selected), all in one undo step.
+      const writes = edits.filter((e) => e.changed > 0);
+      if (writes.length)
+        context.withinTransaction(() => {
+          for (const e of writes) e.clip.notes = e.out;
+        });
+      const summary = (e: (typeof edits)[number]) => ({
+        note_count: e.out.length,
+        changed_count: e.changed,
+        warning: e.warning,
+      });
+      const extra = { humanize_seed: seed, song_grid: grid, scale };
+      return args.clip_ids
+        ? { items: edits.map((e) => ({ clip_id: remember(e.clip), ...summary(e) })), ...extra }
+        : { ...summary(edits[0]), ...extra };
     },
   );
 
@@ -2678,14 +3177,15 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
   tool(
     "drum_chain_set",
     { title: "Set drum pad note", annotations: SET },
-    "Set the MIDI note a drum rack chain (pad) responds to.",
+    "Set the MIDI note a drum rack chain (pad) responds to: 0-127 or a note name (C1 = 36).",
     {
       drum_chain_id: z.string(),
-      receiving_note: z.number().int().min(0).max(127),
+      receiving_note: pitchSchema("The MIDI note the pad plays on"),
     },
     ({ drum_chain_id, receiving_note }) => {
+      const note = parsePitch(receiving_note, "receiving_note");
       const chain = resolve(drum_chain_id, DrumChain);
-      chain.receivingNote = receiving_note;
+      chain.receivingNote = note;
       return chainSummary(chain);
     },
   );

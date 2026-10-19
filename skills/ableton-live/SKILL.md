@@ -51,6 +51,8 @@ or the port was changed in the extension's `config.json` (default 8722).
 - All times, positions, durations are **beats** (quarter notes), not seconds or bars.
   At 4/4, one bar = 4 beats. Seconds → beats: `seconds * tempo / 60`.
 - MIDI pitch: 0–127, C3 = 60 in Live's naming (C-2 = 0). Kick drum pad usually C1 = 36.
+  Wherever a pitch is taken (notes, patterns, `select` ranges, drum pads, `drum_chain_set`) a
+  note name works too: `"C1"`, `"F#1"`, `"Bb2"` (sharps `#`, flats `b`).
 - Colors: `"#RRGGBB"` strings.
 - Velocity 0–127, probability 0–1.
 - Device parameters use internal units within each parameter's `min`/`max` (no dB/Hz/ms
@@ -70,11 +72,45 @@ or the port was changed in the extension's `config.json` (default 8722).
   - Arrangement: `clip_create {type:"midi", target_id:<midi_track_id>, start_time, duration, notes:[...]}`
   - Take lane: `clip_create {type:"midi", target_id:<take_lane_id>, start_time, duration, ...}`
   - MIDI clips reject the audio-only `file_path`, `is_warped` and `loop_settings`.
+- Drum lines and other repetitive parts: step `patterns` instead of one note per hit — one
+  pitch per string, `"x"` a hit, `"X"` an accent (`accent_velocity`, default 127), `"."` or `"-"`
+  a rest, spaces and `|` ignored; `step` is the beats per character (default 0.25 = 1/16).
+  `repeat {length}` copies the notes and patterns every `length` beats up to the clip's end
+  (`times` for an exact count). A two-bar beat in one call:
+  `clip_create {type:"midi", track_name:"Drums", scene_index:0, duration:8, repeat:{length:4},
+  patterns:[{note:"C1", steps:"x...x...x...x..."}, {note:"D1", steps:"....X.......X..."},
+  {note:"F#1", steps:"x.x.x.x.x.x.x.x.", velocity:80}]}`. `midi_clip_set_notes` takes the
+  same `patterns` and `repeat`.
 - Layer more notes: `midi_clip_set_notes {mode:"merge", notes:[...]}` (default mode `replace`
   wipes the clip — only use it when rewriting everything).
-- Mechanical edits (transpose, shift, quantize, velocity, delete a range): use
-  `midi_clip_edit_notes` with an optional pitch/time `select` — server-side, no need to read
-  and resend the note list. Note times are relative to the clip start.
+- Reading notes: `midi_clip_get_notes {select?, format?}`. `select` filters like the edit's
+  (below); `format:"compact"` returns `[pitch, start_time, duration, velocity]` tuples plus an
+  object of the fields that differ from the result's `defaults` — use it for dense clips.
+- Mechanical edits: `midi_clip_edit_notes` — server-side, no need to read and resend the note
+  list. Note times are relative to the clip start.
+  - `select` (all filters must match): `pitch_min`/`pitch_max` (numbers or names),
+    `time_min`/`time_max` (start, beats), `in_scale` (true/false against the song's scale, or
+    `snap_to_scale`'s), `every_nth` (`2` = 1st, 3rd, ... in time order; `{n:2, offset:1}` = 2nd,
+    4th, ...), `only_selected` (the notes the user selected in Live's editor).
+  - Transforms, in this order: `transpose`; `snap_to_scale` (`"song"` or `{root:"D",
+    intervals:[0,2,3,5,7,9,10]}`; out-of-key notes move to the nearest scale note, ties go
+    down); `set {velocity, probability, velocity_deviation, release_velocity, muted}`;
+    `velocity_scale`, `velocity_offset`; `time_shift`; `quantize {grid, strength}`; `swing
+    {amount, grid}` (0 = straight, ~0.67 = triplet feel, 1 = dotted); `duration_set` or
+    `duration_scale`; `legato` (each note runs to the next start; notes starting together are
+    a chord and end together; the last keep their length); `humanize {timing, velocity, seed}`.
+    Or `delete:true`.
+  - A grid of `"song"` (quantize, swing) uses Live's grid setting — the arrangement grid, not
+    the clip editor's; bar grids assume the first scene's time signature, "No Grid" fails.
+  - `humanize` is reproducible: pass `seed`, or reuse the returned `humanize_seed`.
+  - `clip_ids:[...]` edits several clips alike in one undo step (one notes write per clip):
+    "humanize these 8 drum clips" is one call.
+  - "Fix the out-of-key notes" = `{clip_id, snap_to_scale:"song"}`; "mute every second hi-hat"
+    = `{select:{pitch_min:"F#1", pitch_max:"F#1", every_nth:{n:2, offset:1}}, set:{muted:true}}`.
+- The user's note selection: `only_selected` (and each note's `selected` in reads) comes from
+  `NoteDescription.selected`. Whether Live fills it in for extensions is unverified: when no
+  note reports a selection, results carry a `warning` — then ask the user which notes they
+  mean instead of guessing.
 - Respect the song scale from `song_get` (`scale.root_note`, `scale.intervals`) when composing.
 
 ## Devices & sound design
@@ -112,8 +148,10 @@ or the port was changed in the extension's `config.json` (default 8722).
 - dB, Hz and ms are not available: values are internal units only. Read `min`/`max` and the
   current value first, and say that any unit conversion is approximate.
 - Drum racks: `device_get {include_chain_devices:true}` maps the whole kit (pad → note →
-  sample) in one call; `drum_chain_set` maps a pad to a MIDI note; `simpler_replace_sample`
-  swaps samples.
+  sample) in one call; drum chains report `receiving_note` and `receiving_note_name` (`"C1"`).
+  `drum_chain_set` maps a pad to a MIDI note (`receiving_note: 38` or `"D1"`), and pads in
+  device paths take names too (`["Drum Rack", {pad:"C1"}, "Simpler"]`);
+  `simpler_replace_sample` swaps samples.
 
 ## Copying, moving and presets (lossy)
 

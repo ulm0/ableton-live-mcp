@@ -92,6 +92,21 @@ await eventually(async () => {
 });
 step("merge + midi_clip_edit_notes (transpose selected) verified");
 
+// MIDI shortcuts: a step pattern repeated to fill the 4-beat clip, read back compact
+await call("midi_clip_set_notes", { clip_id: clip.id, patterns: [{ note: "C1", steps: "x...x..." }], repeat: { length: 2 } });
+await eventually(async () => {
+  const r = await call("midi_clip_get_notes", { clip_id: clip.id, format: "compact" });
+  assert.deepEqual(r.notes.map((n) => [n[0], n[1]]).sort((a, b) => a[1] - b[1]), [[36, 0], [36, 1], [36, 2], [36, 3]]);
+});
+step("patterns + repeat fill the clip; compact read");
+// Whether Live reports NoteDescription.selected to extensions is not documented:
+// report it (select some notes in the clip first to see them counted).
+const reportsSelection = (await call("midi_clip_get_notes", { clip_id: clip.id })).notes
+  .some((n) => typeof n.selected === "boolean");
+const selection = await call("midi_clip_get_notes", { clip_id: clip.id, only_selected: true });
+step(`NoteDescription.selected ${reportsSelection ? "is" : "is NOT"} reported; ` +
+  `${selection.warning ?? `${selection.note_count} selected note(s)`}`);
+
 // track addressing by name
 const byName = await call("track_get", { track_name: "MCP Smoke", include: ["devices"] });
 assert.equal(byName.devices.length, 1);

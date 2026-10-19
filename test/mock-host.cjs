@@ -357,8 +357,10 @@ const dataModel = {
   clipSetColor: (h, v) => { get(h).color = v; },
   clipGetMuted: (h) => get(h).muted,
   clipSetMuted: (h, v) => { get(h).muted = v; },
-  midiclipGetNotes: (h) => get(h).notes,
-  midiclipSetNotes: (h, notes) => { get(h).notes = notes; },
+  // Notes cross the host boundary as copies: changing a note object the
+  // extension read changes nothing until it writes the notes back.
+  midiclipGetNotes: (h) => get(h).notes.map((n) => ({ ...n })),
+  midiclipSetNotes: (h, notes) => { get(h).notes = notes.map((n) => ({ ...n })); },
   audioclipGetFilePath: (h) => get(h).filePath,
   audioclipGetWarping: (h) => get(h).warping,
   audioclipSetWarping: (h, v) => { get(h).warping = v; },
@@ -518,6 +520,23 @@ const fixtures = {
   refuseWrites: (name) => { refusedWrites.clear(); if (name) refusedWrites.add(name); },
   // Make Simpler.replaceSample fail (e.g. an unreadable file).
   refuseSamples: (on) => { refuseSamples = on; },
+  // The user's note selection in a clip's editor: NoteDescription.selected
+  // is true for the given pitches and false for the others; null removes the
+  // field (a host that reports no selection state).
+  selectNotes: (clipId, pitches) => {
+    for (const n of objects.get(clipId).notes) {
+      if (pitches === null) delete n.selected;
+      else n.selected = pitches.includes(Number(n.pitch));
+    }
+  },
+  // Live's arrangement grid (a GridQuantization value) and scale, which the
+  // API can only read.
+  setGrid: (quantization, triplet = false) => { songObj.grid = quantization; songObj.gridTriplet = triplet; },
+  setScale: ({ root, name, intervals }) => {
+    songObj.rootNote = BigInt(root);
+    songObj.scaleName = name;
+    songObj.scaleIntervals = intervals.map(BigInt);
+  },
 };
 
 module.exports = { makeActivation, calls, fixtures, ids: {
