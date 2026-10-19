@@ -2,8 +2,15 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z, type ZodRawShape } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import {
+  ErrorCode,
+  type ServerNotification,
+  type ServerRequest,
+  type ToolAnnotations,
+} from "@modelcontextprotocol/sdk/types.js";
 import {
   AudioClip,
   AudioTrack,
@@ -20,20 +27,44 @@ import {
   MidiClip,
   MidiTrack,
   RackDevice,
+  Sample,
   Scene,
   Simpler,
   TakeLane,
   Track,
   TrackMixer,
   WarpMode,
+  type ClipLoopSettings,
   type ExtensionContext,
   type NoteDescription,
+  type WarpMarker,
 } from "@ableton-extensions/sdk";
+import {
+  DIALOG_BRIDGE,
+  DIALOG_RESULT_TTL_MS,
+  DialogStore,
+  checkDialogUrl,
+  dialogOutcome,
+  escapeHtml,
+  formAnswer,
+  formChoices,
+  formHtml,
+  type DialogRecord,
+} from "./dialogs.js";
+import { bearerMatches, configFilePath, lock, readConfig, type Config } from "./config.js";
+import { UsageError } from "./errors.js";
+import INSTRUCTIONS from "./instructions.md";
+import SKILL from "../skills/ableton-live/SKILL.md";
+import { PROMPTS, renderPrompt, type PromptEnv } from "./prompts.js";
+import { renderNotes, sessionClipLength, sessionLoopMismatch, type Region } from "./region.js";
+import { AUDIO_EXTENSIONS, configRoots, libraryRoots, searchSamples } from "./samples.js";
+import { SelectionStore, registerSelectionMenus, type Selection } from "./selection.js";
 import { remember, resolve } from "./store.js";
 import {
   chainSummary,
   classOf,
   num,
+  clipBrief,
   clipSlotSummary,
   clipSummary,
   colorToHex,
@@ -41,44 +72,157 @@ import {
   deviceSummary,
   gridName,
   hexToColor,
+  noteName,
   parameterSummary,
+  parsePitch,
+  parsePitchClass,
   parameterWithValue,
   sceneSummary,
   takeLaneSummary,
   trackSummary,
 } from "./serialize.js";
+import { analyzeWav, ENVELOPE_BUCKETS, SILENCE_DBFS } from "./wav.js";
 
 type Ctx = ExtensionContext<"1.0.0">;
 
 declare const __EXT_VERSION__: string | undefined;
 
-const DEFAULT_PORT = 8722;
 const SERVER_INFO = {
   name: "ableton-live",
   version: typeof __EXT_VERSION__ !== "undefined" ? __EXT_VERSION__ : "dev",
 };
+
+// live://guide: the skill without its front matter.
+const GUIDE = SKILL.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n+/, "");
 
 const WARP_MODES = ["Beats", "Tones", "Texture", "Repitch", "Complex", "ComplexPro"] as const;
 
 // ---------------------------------------------------------------------------
 // helpers
 
+const toJson = (data: unknown) => JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+
 function json(data: unknown) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
-      },
-    ],
-  };
+  return { content: [{ type: "text" as const, text: toJson(data) }] };
 }
+
+// An error a resource or prompt handler throws to answer with this JSON-RPC
+// code (the SDK sends a thrown error's numeric `code` and `message`; McpError
+// would put "MCP error <code>:" into the message twice).
+const rpcError = (code: ErrorCode, message: string) => Object.assign(new Error(message), { code });
 
 const STALE_HINT =
   "If this object was deleted or moved, or the Live Set changed, its id is stale — re-fetch ids via song_get / track_get.";
 
+// Tool annotation presets. The MCP defaults (destructiveHint:true,
+// openWorldHint:true) would make every tool, song_get included, look like a
+// destructive write to the outside world, so every hint is spelled out.
+const READ: ToolAnnotations = { readOnlyHint: true, openWorldHint: false };
+// Sets properties to the given values: repeating the call changes nothing more.
+const SET: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// Sets values, or with `delta` adds to them (parameter_set, device_set): a
+// repeated call with a delta moves the value again, so it is not idempotent.
+const SET_RELATIVE: ToolAnnotations = { ...SET, idempotentHint: false };
+// Adds objects (tracks, clips, devices, ...); each call adds another one.
+const CREATE: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+// Removes or overwrites content. Repeating the call (same ids) has no further effect.
+const DESTRUCTIVE: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// Destructive and cumulative: a repeated merge or transform applies again.
+const DESTRUCTIVE_CUMULATIVE: ToolAnnotations = { ...DESTRUCTIVE, idempotentHint: false };
+// show_dialog: blocks Live's UI with a modal whose HTML may load https: content.
+const DIALOG: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+// execute_command: runs arbitrary commands, including other extensions' ones.
+const COMMAND: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+type ToolMeta = { title: string; annotations: ToolAnnotations };
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+// Tools whose calls can run long: they wait for the user, render audio or run
+// many steps. A tools/call of one of them that carries a progressToken is
+// answered as an SSE stream, so that its notifications/progress reach the
+// client (see the HTTP handler); every other request keeps a JSON response.
+const PROGRESS_TOOLS: ReadonlySet<string> = new Set([
+  "show_dialog",
+  "dialog_result",
+  "selection_wait",
+  "render_track_audio",
+  "audio_track_consolidate",
+  "batch",
+  "batch_read",
+]);
+const PROGRESS_INTERVAL_MS = 10_000;
+
+// While `work` runs, a call whose client asked for progress (a progressToken)
+// sends notifications/progress: one at once, then one every
+// PROGRESS_INTERVAL_MS, so that a client resetting its timeout on progress
+// keeps waiting. `progress` counts the notifications (it must increase);
+// `message` says what the call is doing after that many seconds. Without a
+// token nothing is sent, and on a JSON response the transport drops them.
+async function withHeartbeat<T>(
+  extra: ToolExtra,
+  message: (seconds: number) => string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return work();
+  const started = Date.now();
+  let progress = 0;
+  const beat = () => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress: ++progress, message: message(seconds) },
+      })
+      .catch(() => {}); // the client went away: the call ends on its own
+  };
+  beat();
+  const timer = setInterval(beat, PROGRESS_INTERVAL_MS);
+  // a host call that never settles must not keep a timer for a client that is gone
+  const stop = () => clearInterval(timer);
+  extra.signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await work();
+  } finally {
+    stop();
+    extra.signal.removeEventListener("abort", stop);
+  }
+}
+
+// A MIDI pitch: 0-127, or a note name in Live's naming (C3 = 60), converted
+// with parsePitch. A fresh instance per use (see deviceStep).
+const pitchSchema = (what: string) =>
+  z
+    .union([z.number().int().min(0).max(127), z.string().min(1)])
+    .describe(`${what}: 0-127, or a note name such as "C3" (= 60), "F#1" or "Bb2"`);
+
 const noteShape = {
-  pitch: z.number().int().min(0).max(127).describe("MIDI pitch, 0-127"),
+  pitch: pitchSchema("MIDI pitch"),
   start_time: z.number().describe("Start in beats, relative to clip start"),
   duration: z.number().positive().describe("Length in beats"),
   velocity: z.number().min(0).max(127).optional(),
@@ -87,19 +231,11 @@ const noteShape = {
   velocity_deviation: z.number().optional(),
   release_velocity: z.number().min(0).max(127).optional(),
 };
+type NoteInput = z.objectOutputType<typeof noteShape, z.ZodTypeAny>;
 
-function toNoteDescription(n: {
-  pitch: number;
-  start_time: number;
-  duration: number;
-  velocity?: number;
-  muted?: boolean;
-  probability?: number;
-  velocity_deviation?: number;
-  release_velocity?: number;
-}): NoteDescription {
+function toNoteDescription(n: NoteInput, what = "pitch"): NoteDescription {
   return {
-    pitch: n.pitch,
+    pitch: parsePitch(n.pitch, what),
     startTime: n.start_time,
     duration: n.duration,
     velocity: n.velocity,
@@ -107,6 +243,312 @@ function toNoteDescription(n: {
     probability: n.probability,
     velocityDeviation: n.velocity_deviation,
     releaseVelocity: n.release_velocity,
+  };
+}
+
+// MIDI write shortcuts (clip_create, midi_clip_set_notes): a step pattern
+// writes one pitch's hits from a string, `repeat` copies the notes along.
+const patternSchema = () =>
+  z.object({
+    note: pitchSchema("Pitch of every hit"),
+    steps: z
+      .string()
+      .min(1)
+      .describe(
+        'One character per step: "x" a hit, "X" an accented hit, "." or "-" a rest; spaces and "|" ' +
+          'are ignored, e.g. "x...x...|x...x.x."',
+      ),
+    step: z.number().positive().default(0.25).describe("Length of one step in beats (0.25 = 1/16)"),
+    start_time: z.number().min(0).default(0).describe("Where the first step starts, in beats"),
+    velocity: z.number().min(1).max(127).default(100).describe('Velocity of "x" hits'),
+    accent_velocity: z.number().min(1).max(127).default(127).describe('Velocity of "X" hits'),
+    duration: z.number().positive().optional().describe("Length of each hit in beats; default one step"),
+  });
+type PatternInput = z.output<ReturnType<typeof patternSchema>>;
+const repeatSchema = () =>
+  z
+    .object({
+      length: z
+        .number()
+        .positive()
+        .describe("Beats the given notes span, e.g. 4 = one 4/4 bar: copy k starts k × length later"),
+      times: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe(
+          "Copies in total, counting the original (written even past the clip's end); omitted = fill " +
+            "the clip: copies up to its end, without the notes that would start at or after it",
+        ),
+    })
+    .describe("Repeat the notes and patterns of this write");
+type RepeatInput = { length: number; times?: number };
+
+// Shortcuts must not flood Live with notes by a typo (a tiny repeat length).
+const MAX_EXPANDED_NOTES = 50_000;
+
+// The notes a MIDI write sends: `notes`, then the hits of `patterns`, all
+// repeated per `repeat` up to `end` (the clip's length) unless `times` is
+// given. Throws before anything is written; `copies` is set with `repeat`.
+function noteList(
+  input: { notes?: NoteInput[]; patterns?: PatternInput[]; repeat?: RepeatInput },
+  end: number,
+): { notes: NoteDescription[]; copies?: number } {
+  const base = (input.notes ?? []).map((n, i) => toNoteDescription(n, `notes[${i}].pitch`));
+  for (const [i, p] of (input.patterns ?? []).entries()) {
+    const pitch = parsePitch(p.note, `patterns[${i}].note`);
+    let k = 0; // step index: separators do not count
+    for (const c of p.steps) {
+      if (c === "|" || /\s/.test(c)) continue;
+      if (c === "x" || c === "X")
+        base.push({
+          pitch,
+          startTime: p.start_time + k * p.step,
+          duration: p.duration ?? p.step,
+          velocity: c === "X" ? p.accent_velocity : p.velocity,
+        });
+      else if (c !== "." && c !== "-")
+        throw new UsageError(
+          `patterns[${i}].steps: unexpected ${JSON.stringify(c)}; use x, X, . or - (spaces and | are ignored).`,
+        );
+      k++;
+    }
+  }
+  // filling: every copy that starts before the end (float noise aside)
+  const fillCopies = (r: RepeatInput) => Math.max(1, Math.ceil(end / r.length - 1e-9));
+  const copies = input.repeat ? (input.repeat.times ?? fillCopies(input.repeat)) : 1;
+  const total = base.length * copies;
+  if (total > MAX_EXPANDED_NOTES && total > (input.notes?.length ?? 0))
+    throw new UsageError(
+      `patterns and repeat would write ${total} notes; at most ${MAX_EXPANDED_NOTES} are allowed.`,
+    );
+  if (!input.repeat) return { notes: base };
+  if (!base.length) throw new UsageError("repeat needs notes or patterns to repeat.");
+  const { length, times } = input.repeat;
+  const out = [...base];
+  for (let k = 1; k < copies; k++)
+    for (const n of base) {
+      const startTime = n.startTime + k * length;
+      if (times === undefined && startTime >= end - 1e-9) continue;
+      out.push({ ...n, startTime });
+    }
+  return { notes: out, copies };
+}
+
+// Which notes a MIDI read or edit applies to: all given filters must match.
+const noteSelectSchema = () =>
+  z.object({
+    pitch_min: pitchSchema("Lowest pitch").optional(),
+    pitch_max: pitchSchema("Highest pitch").optional(),
+    time_min: z.number().optional().describe("Earliest start time, in beats"),
+    time_max: z.number().optional().describe("Latest start time, in beats"),
+    in_scale: z
+      .boolean()
+      .optional()
+      .describe(
+        "true: only notes in the scale, false: only notes outside it. The scale is the song's (in " +
+          "midi_clip_edit_notes: snap_to_scale's, when given)",
+      ),
+    only_selected: z
+      .boolean()
+      .optional()
+      .describe(
+        "Only the notes selected in Live's MIDI editor. Whether Live reports the selection to " +
+          "extensions is unverified: a `warning` says when it reported none",
+      ),
+    every_nth: z
+      .union([
+        z.number().int().min(1),
+        z.object({ n: z.number().int().min(1), offset: z.number().int().min(0).default(0) }),
+      ])
+      .optional()
+      .describe(
+        "Every n-th of the notes the other filters match, in time order (start, then pitch): 2 = the " +
+          "1st, 3rd, 5th, ...; {n: 2, offset: 1} = the 2nd, 4th, ...",
+      ),
+  });
+type NoteSelect = z.output<ReturnType<typeof noteSelectSchema>>;
+
+// A scale: Live's current one, or a root and semitone intervals.
+const scaleSchema = () =>
+  z.union([
+    z.literal("song"),
+    z.object({
+      root: z
+        .union([z.number().int().min(0).max(11), z.string().min(1)])
+        .describe('Root as 0-11 (C = 0) or a note name such as "D" or "F#"'),
+      intervals: z
+        .array(z.number().int())
+        .min(1)
+        .describe("Semitone offsets from the root, e.g. [0, 2, 3, 5, 7, 8, 10] (natural minor)"),
+    }),
+  ]);
+type ScaleSpec = z.output<ReturnType<typeof scaleSchema>>;
+type Scale = { root_note: number; intervals: number[]; name?: string };
+
+const pitchClass = (pitch: number, root: number) => (((pitch - root) % 12) + 12) % 12;
+const inScale = (pitch: number, s: Scale) => s.intervals.includes(pitchClass(pitch, s.root_note));
+
+// The nearest pitch in the scale, the lower one on a tie (within 0-127).
+function snapToScale(pitch: number, s: Scale): number {
+  for (let d = 0; d < 12; d++) {
+    if (pitch - d >= 0 && inScale(pitch - d, s)) return pitch - d;
+    if (pitch + d <= 127 && inScale(pitch + d, s)) return pitch + d;
+  }
+  return pitch; // unreachable: every octave holds a scale degree
+}
+
+// A grid in beats, or "song": Live's arrangement grid setting.
+const gridSchema = (what: string) =>
+  z
+    .union([z.number().positive(), z.literal("song")])
+    .describe(
+      `${what} in beats (0.25 = 1/16), or "song" for Live's grid setting (the arrangement grid, ` +
+        "not the clip editor's; bar grids assume the first scene's time signature)",
+    );
+
+// Indices of notes in time order: start, then pitch, then list position.
+const timeOrder = (notes: NoteDescription[]) =>
+  notes
+    .map((_, i) => i)
+    .sort(
+      (a, b) =>
+        num(notes[a].startTime) - num(notes[b].startTime) || num(notes[a].pitch) - num(notes[b].pitch) || a - b,
+    );
+
+// Validates a `select` and returns which of a clip's notes it matches.
+function noteFilter(sel: NoteSelect, scale?: Scale): (notes: NoteDescription[]) => boolean[] {
+  const lo = sel.pitch_min === undefined ? 0 : parsePitch(sel.pitch_min, "select.pitch_min");
+  const hi = sel.pitch_max === undefined ? 127 : parsePitch(sel.pitch_max, "select.pitch_max");
+  const nth = typeof sel.every_nth === "number" ? { n: sel.every_nth, offset: 0 } : sel.every_nth;
+  const matches = (n: NoteDescription) => {
+    const pitch = num(n.pitch);
+    const start = num(n.startTime);
+    return (
+      pitch >= lo &&
+      pitch <= hi &&
+      (sel.time_min === undefined || start >= sel.time_min) &&
+      (sel.time_max === undefined || start <= sel.time_max) &&
+      (sel.in_scale === undefined || inScale(pitch, scale!) === sel.in_scale) &&
+      (!sel.only_selected || n.selected === true)
+    );
+  };
+  return (notes) => {
+    const mask = notes.map(matches);
+    if (nth) {
+      let k = 0; // position among the matching notes
+      for (const i of timeOrder(notes)) {
+        if (!mask[i]) continue;
+        mask[i] = k >= nth.offset && (k - nth.offset) % nth.n === 0;
+        k++;
+      }
+    }
+    return mask;
+  };
+}
+
+// only_selected matched nothing because Live reports no selection: say so.
+function selectionWarning(notes: NoteDescription[]): string | undefined {
+  if (!notes.length || notes.some((n) => n.selected === true)) return undefined;
+  return notes.some((n) => typeof n.selected === "boolean")
+    ? "No note of this clip is selected in Live."
+    : "Live reported no selection state for this clip's notes, so none counts as selected.";
+}
+
+// A note as midi_clip_get_notes returns it. `selected` is the user's note
+// selection in Live, when the host reports it.
+function noteOut(n: NoteDescription) {
+  const opt = (v: number | bigint | undefined) => (v === undefined ? undefined : num(v));
+  return {
+    pitch: num(n.pitch),
+    start_time: num(n.startTime),
+    duration: num(n.duration),
+    velocity: opt(n.velocity),
+    muted: n.muted,
+    probability: opt(n.probability),
+    velocity_deviation: opt(n.velocityDeviation),
+    release_velocity: opt(n.releaseVelocity),
+    selected: n.selected,
+  };
+}
+type NoteOut = ReturnType<typeof noteOut>;
+
+// format "compact": each note is [pitch, start_time, duration, velocity], plus
+// an object of its other fields that differ from `defaults`: each field's most
+// common value in this result. A field the host leaves out counts as Live's
+// default value for it (NOTE_DEFAULTS), as it does when notes are written.
+const NOTE_DEFAULTS = {
+  muted: false,
+  probability: 1,
+  velocity_deviation: 0,
+  release_velocity: 64,
+  selected: false,
+};
+const COMPACT_EXTRAS = Object.keys(NOTE_DEFAULTS) as Array<keyof typeof NOTE_DEFAULTS>;
+function compactNotes(notes: NoteOut[]) {
+  const value = (n: NoteOut, f: (typeof COMPACT_EXTRAS)[number]) => n[f] ?? NOTE_DEFAULTS[f];
+  const defaults: Record<string, unknown> = { ...NOTE_DEFAULTS };
+  for (const f of COMPACT_EXTRAS) {
+    const counts = new Map<unknown, number>();
+    for (const n of notes) counts.set(value(n, f), (counts.get(value(n, f)) ?? 0) + 1);
+    let best = 0;
+    for (const [v, c] of counts)
+      if (c > best) {
+        best = c;
+        defaults[f] = v;
+      }
+  }
+  return {
+    format: "compact",
+    fields: ["pitch", "start_time", "duration", "velocity"],
+    defaults,
+    notes: notes.map((n) => {
+      const tuple: unknown[] = [n.pitch, n.start_time, n.duration, n.velocity ?? null];
+      const differs = COMPACT_EXTRAS.filter((f) => value(n, f) !== defaults[f]);
+      if (differs.length) tuple.push(Object.fromEntries(differs.map((f) => [f, value(n, f)])));
+      return tuple;
+    }),
+  };
+}
+
+// Swing: in each pair of grid steps the off-beat step moves amount × grid/2
+// later; the positions between move proportionally, on-beat steps stay.
+function swingTime(t: number, grid: number, amount: number): number {
+  const pair = 2 * grid;
+  const base = Math.floor(t / pair) * pair;
+  const p = t - base;
+  const off = grid * (1 + amount / 2); // where the off-beat step lands
+  return base + (p <= grid ? (p * off) / grid : off + ((p - grid) * (pair - off)) / grid);
+}
+
+// Notes starting less than this many beats apart are one chord for legato.
+const CHORD_WINDOW = 1 / 64;
+// Durations a transform shortens stay at least this long (beats).
+const MIN_NOTE_DURATION = 1 / 256;
+
+// legato: each chord (notes starting less than CHORD_WINDOW apart) lasts until
+// the next chord starts; the last chord keeps its length.
+function legato(notes: NoteDescription[]) {
+  const chords: NoteDescription[][] = [];
+  for (const t of [...notes].sort((a, b) => a.startTime - b.startTime)) {
+    const chord = chords[chords.length - 1];
+    if (chord && t.startTime - chord[0].startTime < CHORD_WINDOW) chord.push(t);
+    else chords.push([t]);
+  }
+  for (let c = 0; c + 1 < chords.length; c++)
+    for (const t of chords[c]) t.duration = Math.max(MIN_NOTE_DURATION, chords[c + 1][0].startTime - t.startTime);
+}
+
+// Seeded PRNG (mulberry32): one seed humanizes the same notes the same way.
+function seededRandom(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
@@ -124,62 +566,430 @@ const loopSettingsShape = z
       "Unwarped clips require looping=false and non-negative positions.",
   );
 
+// The host rejects most async operations with no error value at all — surface
+// something actionable instead of "undefined".
+function errorMessage(e: unknown): string {
+  return e instanceof Error
+    ? e.message
+    : e === undefined
+      ? "the Live host rejected the operation without details — check argument " +
+        "values (device name spelling, index ranges, file paths, clip overlaps)."
+      : String(e);
+}
+
+// Shared addressing: a tool that acts on one track takes any of track_id,
+// track_index and track_name, a scene tool any of scene_id, scene_index and
+// scene_name. When several are given they must name the same object.
+// Shapes used more than once in a tool (top level and in `items`) are factories:
+// a reused zod instance is emitted as a JSON Schema $ref in tools/list.
+const trackAddress = () => ({
+  track_id: z.string().optional().describe("Track id"),
+  track_index: z.number().int().min(0).optional().describe("0-based index among the regular tracks"),
+  track_name: z
+    .string()
+    .optional()
+    .describe("Track name, exact match first, then case-insensitive (regular, return and main tracks)"),
+});
+const sceneAddress = () => ({
+  scene_id: z.string().optional().describe("Scene id"),
+  scene_index: z.number().int().min(0).optional().describe("0-based scene index"),
+  scene_name: z.string().optional().describe("Scene name, exact match first, then case-insensitive"),
+});
+// Destructive tools match names exactly: a case-insensitive guess must not delete.
+const exactTrackName = z.string().optional().describe("Exact track name (case-sensitive)");
+const exactSceneName = z.string().optional().describe("Exact scene name (case-sensitive)");
+
+type TrackAddress = { track_id?: string; track_index?: number; track_name?: string };
+type SceneAddress = { scene_id?: string; scene_index?: number; scene_name?: string };
+
+// Device addressing: device_id, or the device's track plus `device`, a device
+// name or index on the track or a path into racks. In a path, a name or index
+// picks from the current device list; after a rack, {chain: index} or a Drum
+// Rack {pad: note} picks the chain whose devices the next step picks from.
+const chainStep = z.union([
+  z.object({ chain: z.number().int().min(0).describe("0-based chain index in the rack") }).strict(),
+  z.object({ pad: pitchSchema("Drum Rack pad: the chain's receiving MIDI note") }).strict(),
+]);
+// A fresh instance per use: a schema used twice in one tool becomes a JSON
+// Schema $ref, which some clients do not resolve.
+const deviceStep = () =>
+  z.union([
+    z.string().min(1).describe("Device name, exact match first, then case-insensitive"),
+    z.number().int().min(0).describe("0-based position in the device list"),
+  ]);
+const deviceAddress = {
+  device_id: z.string().optional().describe("Device id"),
+  ...trackAddress(),
+  device: z
+    .union([deviceStep(), z.array(z.union([deviceStep(), chainStep])).min(1)])
+    .optional()
+    .describe(
+      "With a track instead of device_id: the device's name or 0-based index on the track, or a " +
+        'path into racks, e.g. ["Drum Rack", {"pad": 36}, "Simpler"] or [0, {"chain": 1}, "Reverb"]',
+    ),
+};
+type ChainStep = { chain: number } | { pad: number | string };
+type DeviceAddress = TrackAddress & {
+  device_id?: string;
+  device?: string | number | Array<string | number | ChainStep>;
+};
+
+// A parameter by id, or by its device and name.
+const parameterAddress = {
+  parameter_id: z.string().optional().describe("Parameter id (from device_get, mixer_get, parameter_find, ...)"),
+  ...deviceAddress,
+  parameter: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Instead of parameter_id: the parameter's name on the device (device_id, or track + device); " +
+        "exact match first, then case-insensitive, then unique substring",
+    ),
+};
+type ParameterAddress = DeviceAddress & { parameter_id?: string; parameter?: string };
+
+// One parameter write: exactly one of value, value_item, reset and delta.
+// Values are internal units: the API has no display values (dB, Hz, ms).
+const parameterWrite = {
+  value: z
+    .number()
+    .optional()
+    .describe("Internal units within [min, max]; a quantized parameter takes its value_items index"),
+  value_item: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Quantized parameters: the choice by value_items name or short name (exact, then " +
+        'case-insensitive, then unique substring), e.g. "Saw"',
+    ),
+  reset: z.boolean().optional().describe("true: set the parameter to its default value"),
+  delta: z
+    .number()
+    .optional()
+    .describe("Add this to the current value, clamped to [min, max] (whole steps for quantized parameters)"),
+};
+type ParameterWrite = { value?: number; value_item?: string; reset?: boolean; delta?: number };
+const parameterName = z
+  .string()
+  .min(1)
+  .describe("Parameter name: exact match first, then case-insensitive, then unique substring");
+// Initial values of a device that is being inserted (track_create, device_insert).
+const initialParameter = z.object({ name: parameterName, ...parameterWrite });
+
+const given = (o: object, keys: readonly string[]) =>
+  keys.some((k) => (o as Record<string, unknown>)[k] !== undefined);
+const hasTrackAddress = (a: TrackAddress) => given(a, ["track_id", "track_index", "track_name"]);
+const hasSceneAddress = (a: SceneAddress) => given(a, ["scene_id", "scene_index", "scene_name"]);
+
+// Batch form of the *_set and create tools: `items`, one entry per object with
+// the same fields as the single form. Returns the entries to apply and whether
+// the call was a batch (batch results are wrapped in {items}).
+function entries<T extends object>(
+  args: T,
+  items: T[] | undefined,
+  fields: readonly string[],
+): { list: T[]; batch: boolean } {
+  if (items === undefined) return { list: [args], batch: false };
+  const top = fields.filter((k) => given(args, [k]));
+  if (top.length)
+    throw new UsageError(`Give either items or ${top.join(", ")} at the top level, not both.`);
+  return { list: items, batch: true };
+}
+
+const itemLabel = (batch: boolean, i: number) => (batch ? `items[${i}]` : undefined);
+
+// Runs one entry's validation and prefixes its errors with the entry's label
+// (a function when building it costs host calls). The error keeps its class,
+// so a UsageError stays one.
+function at<R>(label: string | (() => string) | undefined, fn: () => R): R {
+  try {
+    return fn();
+  } catch (e) {
+    if (label && e instanceof Error)
+      e.message = `${typeof label === "function" ? label() : label}: ${e.message}`;
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// device presets: this server's own JSON files in <storageDirectory>/presets
+
+const PRESET_FORMAT = "ableton-live-mcp/device-preset";
+const presetSchema = z.object({
+  format: z.literal(PRESET_FORMAT),
+  version: z.literal(1),
+  name: z.string(),
+  device_name: z.string().min(1),
+  device_class: z.string().optional(),
+  saved_at: z.string().optional(),
+  parameters: z.array(z.object({ name: z.string(), value: z.number() })),
+  sample: z.object({ file_path: z.string().min(1) }).nullable().optional(),
+});
+type Preset = z.infer<typeof presetSchema>;
+
+// A preset name is also its file name, so it must be one safe path component
+// on every OS: letters (with combining marks), digits, spaces and a few
+// punctuation marks, starting with a letter or digit (so never ".", ".." or a
+// hidden file), not ending in a dot (Windows drops those), and not a Windows
+// device name: COM and LPT also take the superscript digits ¹ ² ³, which \p{N}
+// lets through, and Windows ignores spaces before the extension ("NUL .x").
+// Path separators, ":" and control characters can never pass.
+const PRESET_NAME = /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _\-.,()'+&#]*$/u;
+const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]) *(\..*)?$/i;
+
+function presetBaseName(raw: string): string {
+  const name = raw.normalize("NFC").trim();
+  if (!name || name.length > 64) throw new UsageError("Preset names are 1-64 characters long.");
+  if (!PRESET_NAME.test(name) || /[. ]$/.test(name) || WINDOWS_DEVICE_NAME.test(name))
+    throw new UsageError(
+      `Invalid preset name ${JSON.stringify(raw)}: use letters, digits, spaces and - _ . , ( ) ' + & #, ` +
+        "starting with a letter or digit and not ending with a dot.",
+    );
+  return name;
+}
+
+function readPresetFile(file: string): Preset {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile()) throw new Error(`${file} is not a regular file.`);
+  if (stat.size > 4_000_000) throw new Error(`${file} is too large for a preset.`);
+  let data: unknown;
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Error(`${file} is not valid JSON: ${errorMessage(e)}`);
+  }
+  const parsed = presetSchema.safeParse(data);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const where = issue.path.join(".") || "file";
+    throw new Error(`${file} is not a device preset of this server (${where}: ${issue.message}).`);
+  }
+  return parsed.data;
+}
+
+function presetStore(storageDirectory: string | undefined) {
+  if (!storageDirectory)
+    throw new Error("Live provides no storage directory for this extension, so presets cannot be stored.");
+  const dir = path.join(storageDirectory, "presets");
+  // Every path stays a direct child of dir (names are checked, this is the backstop).
+  const inside = (file: string) => {
+    const full = path.resolve(dir, file);
+    if (path.dirname(full) !== path.resolve(dir)) throw new Error(`Refusing a preset path outside ${dir}.`);
+    return full;
+  };
+  // Regular *.json files only: a symlink is never followed out of dir, and
+  // temporary files (dot names) are not presets.
+  const files = (): string[] => {
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw e;
+    }
+    return names
+      .filter((f) => {
+        if (!f.endsWith(".json") || f.startsWith(".")) return false;
+        try {
+          return fs.lstatSync(inside(f)).isFile();
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  };
+  // The name a file is loaded by: its base name (NFC, as names are compared).
+  const nameOf = (file: string) => path.basename(file, ".json").normalize("NFC");
+  // A name's file: exact first, then case-insensitive (macOS and Windows
+  // file systems treat "Bass" and "bass" as one file anyway).
+  const fileOf = (base: string) => {
+    const all = files();
+    const hit =
+      all.find((f) => nameOf(f) === base) ?? all.find((f) => nameOf(f).toLowerCase() === base.toLowerCase());
+    return hit === undefined ? undefined : inside(hit);
+  };
+  return {
+    dir,
+    find: fileOf,
+    list() {
+      const presets: Array<{ name: string; preset: Preset }> = [];
+      const unreadable: Array<{ file: string; error: string }> = [];
+      for (const f of files()) {
+        try {
+          presets.push({ name: nameOf(f), preset: readPresetFile(inside(f)) });
+        } catch (e) {
+          unreadable.push({ file: f, error: errorMessage(e) });
+        }
+      }
+      return { presets, unreadable };
+    },
+    // Returns the name the preset is stored (and loaded) under.
+    write(base: string, preset: Preset, overwrite: boolean): { name: string; replaced: boolean } {
+      const existing = fileOf(base);
+      if (existing && !overwrite)
+        throw new UsageError(
+          `A preset named ${JSON.stringify(nameOf(existing))} already exists. ` +
+            "Pass overwrite:true to replace it.",
+        );
+      fs.mkdirSync(dir, { recursive: true });
+      // an overwrite keeps the existing file, and so its name's case
+      const name = existing ? nameOf(existing) : base;
+      const data = `${JSON.stringify({ ...preset, name }, null, 2)}\n`;
+      if (!existing) {
+        // "wx": fails instead of replacing a file (or symlink) created meanwhile
+        fs.writeFileSync(inside(`${base}.json`), data, { flag: "wx" });
+        return { name, replaced: false };
+      }
+      // Replace atomically: rename swaps the directory entry, so it never
+      // writes through a symlink.
+      const tmp = inside(`.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+      fs.writeFileSync(tmp, data, { flag: "wx" });
+      try {
+        fs.renameSync(tmp, existing);
+      } catch (e) {
+        fs.rmSync(tmp, { force: true });
+        throw e;
+      }
+      return { name, replaced: true };
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // tool registration
 
-function buildServer(context: Ctx, hostApiVersion: string, port: number): McpServer {
-  const server = new McpServer(SERVER_INFO);
+// Which tools the servers expose: decided once at startup from config.json's
+// read_only and disabled_tools (see startServer). Without `allowed`, every
+// tool; `note` is added to the instructions.
+type Exposure = { allowed?: ReadonlySet<string>; note?: string };
+
+// A tool as registered: batch and batch_read validate each step with its
+// tool's shape and call its handler directly.
+type Registered = {
+  meta: ToolMeta;
+  shape: ZodRawShape;
+  handler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<unknown> | unknown;
+};
+
+function buildServer(
+  context: Ctx,
+  hostApiVersion: string,
+  port: number,
+  selections: SelectionStore,
+  dialogs: DialogStore,
+  exposure: Exposure = {},
+): { server: McpServer; tools: ReadonlyMap<string, Registered> } {
+  const server = new McpServer(SERVER_INFO, {
+    instructions: exposure.note ? `${INSTRUCTIONS.trimEnd()}\n${exposure.note}\n` : INSTRUCTIONS,
+  });
   const song = () => context.application.song;
+  // Transport-level failures (unparsable bodies, bad headers) are answered to
+  // the client by the SDK; log them so they leave a trace in ExtensionHost.txt.
+  server.server.onerror = (e) => console.error("[ableton-live-mcp] MCP error:", e.message);
+
+  // The tools this server exposes, and the names of all of them (also those
+  // config.json switches off, which are not registered at all).
+  const registry = new Map<string, Registered>();
+  const known = new Set<string>();
 
   function tool<S extends ZodRawShape>(
     name: string,
+    meta: ToolMeta,
     description: string,
     shape: S,
-    handler: (args: z.objectOutputType<S, z.ZodTypeAny>) => Promise<unknown> | unknown,
+    handler: (
+      args: z.objectOutputType<S, z.ZodTypeAny>,
+      extra: ToolExtra,
+    ) => Promise<unknown> | unknown,
   ) {
-    // Spec-legal tools/call may omit `arguments` entirely; a bare z.object(shape)
-    // rejects undefined. Preprocess coerces undefined -> {}, and gluing `shape`
-    // back on keeps the SDK's tools/list schema generation intact.
-    const schema = Object.assign(z.preprocess((v) => v ?? {}, z.object(shape)), { shape });
-    server.registerTool(name, { description, inputSchema: schema as never }, (async (args: never) => {
+    known.add(name);
+    if (exposure.allowed && !exposure.allowed.has(name)) return;
+    registry.set(name, { meta, shape, handler: handler as Registered["handler"] });
+    // A tools/call without `arguments` is validated as `{}` by the SDK, so the
+    // plain shape works; `?? {}` only guards the handler contract.
+    const config = { ...meta, description, inputSchema: shape as never };
+    server.registerTool(name, config, (async (args: never, extra: ToolExtra) => {
+      const started = Date.now();
       try {
-        return json(await handler(args ?? ({} as never)));
+        return json(await handler(args ?? ({} as never), extra));
       } catch (e) {
-        // The host rejects most async operations with no error value at all —
-        // surface something actionable instead of "undefined".
-        const msg =
-          e instanceof Error
-            ? e.message
-            : e === undefined
-              ? "the Live host rejected the operation without details — check argument " +
-                "values (device name spelling, index ranges, file paths, clip overlaps)."
-              : String(e);
-        return {
-          content: [{ type: "text" as const, text: `Error: ${msg}\n${STALE_HINT}` }],
-          isError: true,
-        };
+        const msg = errorMessage(e);
+        // Never log the arguments: they can carry the user's content.
+        console.error(`[ableton-live-mcp] ${name} failed after ${Date.now() - started} ms: ${msg}`);
+        // Argument errors the server detects itself have nothing to do with stale ids.
+        const text = e instanceof UsageError ? `Error: ${msg}` : `Error: ${msg}\n${STALE_HINT}`;
+        return { content: [{ type: "text" as const, text }], isError: true };
       }
     }) as never);
   }
 
   // -- song ------------------------------------------------------------------
 
+  // song_get sections: the default ones, and the deep ones that are only
+  // included when asked for. The deep ones add to every track entry.
+  const SONG_SECTIONS = ["tracks", "scenes", "cue_points", "environment"] as const;
+  const DEEP_SECTIONS = ["devices", "mixer", "clips"] as const;
+  // Deep sections stop at this many devices / clips (payload size).
+  const MAX_SONG_DEVICES = 500;
+  const MAX_SONG_CLIPS = 500;
+  // Racks inside racks are followed this deep (song_get, song_audit).
+  const MAX_RACK_DEPTH = 8;
+
   tool(
     "song_get",
+    { title: "Get Live Set", annotations: READ },
     "Get the state of the current Live Set: tempo, scale, grid, all tracks " +
-      "(with ids), return tracks, main track, scenes, cue points, and extension " +
-      "environment info. This is the entry point — object ids returned here are " +
-      "used by every other tool. Times are in beats throughout the API. Use " +
-      "`include` to fetch only some sections (tempo/grid/scale always included).",
+      "(with ids, `index`, and the group hierarchy: `depth`, `group_track_id`, " +
+      "`is_group`, and `child_track_ids` for group tracks — whose `type` is 'other'), " +
+      "return tracks (with " +
+      "`send_index`), main track, scenes, cue points, and extension environment " +
+      "info. This is the entry point — object ids returned here are used by every " +
+      "other tool. Times are in beats throughout the API. Use `include` to fetch " +
+      "only some sections (tempo/grid/scale always included). Deep sections, only " +
+      "included when listed, add to every track entry (and imply the tracks): " +
+      "`devices` (each track's device tree through racks: chains with their devices; " +
+      "every device with its on-state `enabled`), `mixer` (volume, panning and sends " +
+      "with values and return track names; mixer_get has the parameter ids), " +
+      "`clips` (regular tracks: session clips with their scene_index and arrangement " +
+      "clips with their position, in brief — clip_get has the detail). Deep sections " +
+      `stop at ${MAX_SONG_DEVICES} devices and ${MAX_SONG_CLIPS} clips: from the track ` +
+      "that does not fit on, tracks lack that section and `truncated` says so " +
+      "(use track_get / device_get for them).",
     {
       include: z
-        .array(z.enum(["tracks", "scenes", "cue_points", "environment"]))
+        .array(z.enum([...SONG_SECTIONS, ...DEEP_SECTIONS]))
         .optional()
-        .describe("Sections to include; omit for everything"),
+        .describe(
+          "Sections to include; omit for tracks, scenes, cue_points and environment. " +
+            "devices, mixer and clips are only included when listed",
+        ),
     },
-    ({ include }) => {
+    async ({ include }) => {
       const s = song();
-      const want = (k: string) => !include || include.includes(k as never);
+      const want = (k: string) =>
+        include ? include.includes(k as never) : (SONG_SECTIONS as readonly string[]).includes(k);
+      const deep = DEEP_SECTIONS.filter(want);
+      const withTracks = want("tracks") || deep.length > 0;
+      let tracks: Record<string, unknown>[] | undefined;
+      let returnTracks: Record<string, unknown>[] | undefined;
+      let mainTrack: Record<string, unknown> | undefined;
+      let truncated: Record<string, string> | undefined;
+      if (withTracks) {
+        const regular = s.tracks;
+        const returns = s.returnTracks;
+        tracks = groupHierarchy(regular.map((t, index) => ({ ...summarizeTrack(t, regular), index })));
+        returnTracks = returns.map((t, i) => ({ ...trackSummary(t, "return"), send_index: i }));
+        mainTrack = trackSummary(s.mainTrack, "main");
+        if (deep.length)
+          truncated = await addDeepSections(
+            [...regular, ...returns, s.mainTrack],
+            [...tracks, ...returnTracks, mainTrack],
+            regular.length,
+            deep,
+          );
+      }
       return {
         tempo: num(s.tempo),
         grid: { quantization: gridName(s.gridQuantization), is_triplet: s.gridIsTriplet },
@@ -189,9 +999,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           mode_enabled: s.scaleMode,
           intervals: s.scaleIntervals.map(num),
         },
-        tracks: want("tracks") ? s.tracks.map((t) => trackSummary(t)) : undefined,
-        return_tracks: want("tracks") ? s.returnTracks.map((t) => trackSummary(t, "return")) : undefined,
-        main_track: want("tracks") ? trackSummary(s.mainTrack, "main") : undefined,
+        tracks,
+        return_tracks: returnTracks,
+        main_track: mainTrack,
         scenes: want("scenes") ? s.scenes.map(sceneSummary) : undefined,
         cue_points: want("cue_points") ? s.cuePoints.map(cuePointSummary) : undefined,
         environment: want("environment")
@@ -200,15 +1010,145 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
               temp_directory: context.environment.tempDirectory,
               language: context.environment.language,
               host_api_version: hostApiVersion,
+              server_version: SERVER_INFO.version,
               mcp_port: port,
             }
           : undefined,
+        truncated,
       };
     },
   );
 
+  // The group hierarchy of song_get's track entries, from their group_track_id:
+  // `depth` (0 = top level) on every track, `child_track_ids` (direct children,
+  // in track order) on group tracks.
+  function groupHierarchy<T extends { id: string; is_group: boolean; group_track_id: string | null }>(rows: T[]) {
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const children = new Map<string, string[]>();
+    for (const r of rows)
+      if (r.group_track_id !== null) children.set(r.group_track_id, [...(children.get(r.group_track_id) ?? []), r.id]);
+    return rows.map((r) => {
+      let depth = 0;
+      for (let g = r.group_track_id; g !== null && depth < 64; g = byId.get(g)?.group_track_id ?? null) depth++;
+      return { ...r, depth, child_track_ids: r.is_group ? (children.get(r.id) ?? []) : undefined };
+    });
+  }
+
+  // song_get's deep sections, added to the track entries (rows[i] belongs to
+  // tracks[i]; the first `regularCount` are the regular tracks). All parameter
+  // values (on-states, mixers) are read in one batch. Returns what was cut.
+  async function addDeepSections(
+    tracks: Track<"1.0.0">[],
+    rows: Record<string, unknown>[],
+    regularCount: number,
+    deep: ReadonlyArray<(typeof DEEP_SECTIONS)[number]>,
+  ): Promise<Record<string, string> | undefined> {
+    const truncated: Record<string, string> = {};
+    const cut = (what: string, limit: number, track: Track<"1.0.0">, instead: string) =>
+      `Only ${limit} ${what} are listed: ${describeTrack(track)} and the tracks after it have no ` +
+      `\`${what}\`. Use ${instead} for them.`;
+    const states: OnState[] = [];
+    if (deep.includes("devices")) {
+      const budget = { left: MAX_SONG_DEVICES };
+      for (const [i, track] of tracks.entries()) {
+        const own: OnState[] = [];
+        const tree = deviceTree(track.devices, budget, own);
+        if (!tree) {
+          truncated.devices = cut("devices", MAX_SONG_DEVICES, track, "track_get or device_get {include_chain_devices}");
+          break;
+        }
+        rows[i].devices = tree;
+        states.push(...own);
+      }
+    }
+    const returnNames = song().returnTracks.map((t) => t.name);
+    const [onValues, mixers] = await Promise.all([
+      Promise.all(states.map((st) => st.param.getValue().then(num, () => undefined))),
+      deep.includes("mixer") ? Promise.all(tracks.map((t) => mixerSnapshot(t.mixer, returnNames))) : undefined,
+    ]);
+    states.forEach((st, i) => {
+      if (onValues[i] !== undefined) st.node.enabled = onValues[i] !== st.off;
+    });
+    mixers?.forEach((m, i) => (rows[i].mixer = m));
+    if (deep.includes("clips")) {
+      let left = MAX_SONG_CLIPS;
+      for (const [i, track] of tracks.slice(0, regularCount).entries()) {
+        const slots = track.clipSlots.map((slot) => ({ slot, clip: slot.clip }));
+        const arrangement = track.arrangementClips;
+        const count = slots.filter((x) => x.clip).length + arrangement.length;
+        if (count > left) {
+          truncated.clips = cut("clips", MAX_SONG_CLIPS, track, "track_get or session_grid / arrangement_get");
+          break;
+        }
+        left -= count;
+        rows[i].clips = {
+          session: slots.flatMap(({ slot, clip }, scene_index) =>
+            clip ? [{ scene_index, slot_id: remember(slot), ...clipBrief(clip) }] : [],
+          ),
+          arrangement: arrangement.map((c) => clipBrief(c, true)),
+        };
+      }
+    }
+    return Object.keys(truncated).length ? truncated : undefined;
+  }
+
+  // A device on/off switch whose value song_get reads in its batch.
+  type OnState = { node: Record<string, unknown>; param: DeviceParameter<"1.0.0">; off: number };
+
+  // song_get devices: a device list as a tree through racks, or null when the
+  // budget runs out. On-states to read are collected in `states`.
+  function deviceTree(
+    devices: Device<"1.0.0">[],
+    budget: { left: number },
+    states: OnState[],
+    depth = 0,
+  ): Record<string, unknown>[] | null {
+    const nodes: Record<string, unknown>[] = [];
+    for (const device of devices) {
+      if (budget.left <= 0) return null;
+      budget.left--;
+      const node = deviceSummary(device);
+      node.enabled = undefined; // filled in once the values are read (keeps the key order)
+      try {
+        const onOff = onOffParameter(device);
+        states.push({ node, param: onOff.param, off: onOff.off });
+        // not "Device On": say which parameter tells the on-state
+        if (onOff.fallback) node.on_parameter = onOff.param.name;
+      } catch {
+        // no on/off switch: no `enabled`
+      }
+      if (device instanceof RackDevice && depth < MAX_RACK_DEPTH) {
+        const chains: Record<string, unknown>[] = [];
+        for (const chain of device.chains) {
+          const inner = deviceTree(chain.devices, budget, states, depth + 1);
+          if (!inner) return null;
+          chains.push({ ...chainSummary(chain), devices: inner });
+        }
+        delete node.chain_ids; // `chains` carries them
+        node.chains = chains;
+      }
+      nodes.push(node);
+    }
+    return nodes;
+  }
+
+  // song_get mixer: values only (mixer_get has the parameter ids and ranges).
+  async function mixerSnapshot(mixer: TrackMixer<"1.0.0">, returnNames: string[]) {
+    const sends = mixer.sends;
+    const [volume, panning, ...sendValues] = await Promise.all(
+      [mixer.volume, mixer.panning, ...sends].map((p) => p.getValue()),
+    );
+    return {
+      id: remember(mixer),
+      volume: num(volume),
+      panning: num(panning),
+      sends: sendValues.map((v, index) => ({ index, return_track: returnNames[index], value: num(v) })),
+    };
+  }
+
   tool(
     "song_set",
+    { title: "Set song properties", annotations: SET },
     "Set song-level properties of the Live Set.",
     { tempo: z.number().min(20).max(999).optional().describe("Tempo in BPM") },
     ({ tempo }) => {
@@ -217,39 +1157,933 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  // -- tracks ----------------------------------------------------------------
+  const AUDIT_CHECKS = ["missing_media", "empty_simplers", "empty_drum_chains", "duplicate_track_names"] as const;
+  type AuditCheck = (typeof AUDIT_CHECKS)[number];
+  const MAX_AUDIT_ENTRIES = 100; // listed per check; `counts` has them all
+  const MAX_AUDIT_DEVICES = 5000;
+  const MAX_AUDIT_CLIPS = 10_000;
 
-  // Track addressing without a prior song_get: by index or (case-insensitive)
-  // name across regular, return, and main tracks.
-  function findTrack(args: { track_id?: string; track_index?: number; track_name?: string }) {
-    if (args.track_id !== undefined) return resolve(args.track_id, Track);
-    const s = song();
-    if (args.track_index !== undefined) {
-      const t = s.tracks[args.track_index];
-      if (!t) throw new Error(`track_index ${args.track_index} out of range (0-${s.tracks.length - 1}).`);
-      return t;
+  // Why a media file a clip or sample refers to is unusable, or undefined if
+  // it is a readable file. The paths are assumed to be absolute paths on this
+  // computer (the SDK only calls them file paths).
+  function mediaProblem(file: string): string | undefined {
+    if (!file) return "no file path";
+    if (!path.isAbsolute(file)) return "not an absolute path, so it could not be checked";
+    try {
+      return fs.statSync(file).isFile() ? undefined : "not a file";
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ENOTDIR" ? "file not found" : `cannot be read (${code ?? errorMessage(e)})`;
     }
-    if (args.track_name !== undefined) {
+  }
+
+  tool(
+    "song_audit",
+    { title: "Audit Live Set", annotations: READ },
+    "Check the Live Set for common problems without changing anything: " +
+      "`missing_media` (audio clips — session, arrangement and take lanes — and " +
+      "Simpler samples whose file is not found on this computer, or that have no " +
+      "file path), `empty_simplers` (Simplers without a sample), `empty_drum_chains` " +
+      "(Drum Rack pads without devices) and `duplicate_track_names` (track names " +
+      "that are equal ignoring case, which makes track_name ambiguous). Searches " +
+      "regular, return and main tracks, through racks. Every entry has the ids to act " +
+      "on and a `location` (track, path through racks, or a clip's slot or lane); at " +
+      `most ${MAX_AUDIT_ENTRIES} entries are listed per check, \`counts\` has the totals. ` +
+      "`checks` runs only some of them.",
+    {
+      checks: z
+        .array(z.enum(AUDIT_CHECKS))
+        .min(1)
+        .optional()
+        .describe("Checks to run; omit for all four"),
+    },
+    ({ checks }) => {
+      const run = (c: AuditCheck) => !checks || checks.includes(c);
+      const ran = AUDIT_CHECKS.filter(run);
+      const s = song();
+      const regular = s.tracks;
+      const all = [...regular, ...s.returnTracks, s.mainTrack];
+      const counts = Object.fromEntries(ran.map((c) => [c, 0])) as Record<AuditCheck, number>;
+      const lists = Object.fromEntries(ran.map((c) => [c, [] as unknown[]])) as Record<AuditCheck, unknown[]>;
+      const add = (check: AuditCheck, entry: () => unknown) => {
+        counts[check]++;
+        if (lists[check].length < MAX_AUDIT_ENTRIES) lists[check].push(entry());
+      };
+      const refs = new Map<bigint, ReturnType<typeof trackRef>>();
+      const ref = (track: Track<"1.0.0">) => {
+        if (!refs.has(track.handle.id)) refs.set(track.handle.id, trackRef(track, regular));
+        return refs.get(track.handle.id)!;
+      };
+      const files = new Map<string, string | undefined>();
+      const fileProblem = (file: string) => {
+        if (!files.has(file)) files.set(file, mediaProblem(file));
+        return files.get(file);
+      };
+      const incomplete: string[] = [];
+      let devicesSearched = 0;
+      let devicesStopped = false;
+      let clipsSearched = 0;
+
+      // devices: Simplers and their samples, Drum Rack pads
+      if (run("missing_media") || run("empty_simplers") || run("empty_drum_chains")) {
+        const walk = (devices: Device<"1.0.0">[], track: Track<"1.0.0">, labels: string[], depth: number) => {
+          for (const device of devices) {
+            if (devicesSearched >= MAX_AUDIT_DEVICES) {
+              devicesStopped = true;
+              return;
+            }
+            devicesSearched++;
+            const here = [...labels, device.name];
+            const location = () => ({ ...ref(track), path: here.join(" > ") });
+            if (device instanceof Simpler) {
+              const sample = device.sample;
+              if (!sample) {
+                if (run("empty_simplers")) add("empty_simplers", () => ({ device_id: remember(device), location: location() }));
+              } else if (run("missing_media")) {
+                const filePath = sample.filePath;
+                const problem = fileProblem(filePath);
+                if (problem)
+                  add("missing_media", () => ({
+                    kind: "simpler_sample",
+                    device_id: remember(device),
+                    sample_id: remember(sample),
+                    file_path: filePath,
+                    problem,
+                    location: location(),
+                  }));
+              }
+            }
+            if (device instanceof RackDevice && depth < MAX_RACK_DEPTH)
+              device.chains.forEach((chain, i) => {
+                const label = chainLabel(chain, i);
+                const inner = chain.devices;
+                if (chain instanceof DrumChain && !inner.length && run("empty_drum_chains"))
+                  add("empty_drum_chains", () => ({
+                    ...chainSummary(chain),
+                    rack_device_id: remember(device),
+                    location: { ...ref(track), path: [...here, label].join(" > ") },
+                  }));
+                walk(inner, track, [...here, label], depth + 1);
+              });
+          }
+        };
+        for (const track of all) walk(track.devices, track, [track.name], 0);
+        if (devicesStopped)
+          incomplete.push(`Stopped after ${MAX_AUDIT_DEVICES} devices: later devices were not checked.`);
+      }
+
+      // audio clips' files
+      if (run("missing_media")) {
+        clips: for (const track of regular)
+          for (const clip of clipsOf(track, "all")) {
+            if (clipsSearched >= MAX_AUDIT_CLIPS) {
+              incomplete.push(`Stopped after ${MAX_AUDIT_CLIPS} clips: later clips were not checked.`);
+              break clips;
+            }
+            clipsSearched++;
+            if (!(clip instanceof AudioClip)) continue;
+            const filePath = clip.filePath;
+            const problem = fileProblem(filePath);
+            if (problem)
+              add("missing_media", () => ({
+                kind: "audio_clip",
+                clip_id: remember(clip),
+                clip_name: clip.name,
+                file_path: filePath,
+                problem,
+                location: clipLocation(clip),
+              }));
+          }
+      }
+
+      // names that make track_name ambiguous
+      if (run("duplicate_track_names")) {
+        const byName = new Map<string, Track<"1.0.0">[]>();
+        for (const track of all) {
+          const key = track.name.toLowerCase();
+          byName.set(key, [...(byName.get(key) ?? []), track]);
+        }
+        for (const same of byName.values())
+          if (same.length > 1)
+            add("duplicate_track_names", () => ({
+              name: same[0].name,
+              case_differs: same.some((t) => t.name !== same[0].name) || undefined,
+              tracks: same.map(ref),
+            }));
+      }
+
+      const issues = ran.reduce((n, c) => n + counts[c], 0);
+      return {
+        issue_count: issues,
+        counts,
+        ...lists,
+        truncated: ran.some((c) => counts[c] > lists[c].length)
+          ? `At most ${MAX_AUDIT_ENTRIES} entries are listed per check; counts has the totals.`
+          : undefined,
+        searched: { tracks: all.length, devices: devicesSearched, clips: clipsSearched, files: files.size },
+        incomplete: incomplete.length ? incomplete : undefined,
+      };
+    },
+  );
+
+  // -- addressing ------------------------------------------------------------
+
+  const outOfRange = (what: string, i: number, n: number) =>
+    new UsageError(`${what} ${i} out of range (${n ? `0-${n - 1}` : "there are none"}).`);
+
+  // Name lookup: exact match first, then case-insensitive unless `exact`. An
+  // ambiguous name lists only the candidates it matched, then `hint`.
+  function byName<T>(
+    what: string,
+    name: string,
+    all: T[],
+    nameOf: (x: T) => string,
+    describe: (x: T) => string,
+    { exact = false, hint = "" }: { exact?: boolean; hint?: string } = {},
+  ): T {
+    const exactHits = all.filter((x) => nameOf(x) === name);
+    const ciHits = all.filter((x) => nameOf(x).toLowerCase() === name.toLowerCase());
+    const hits = exactHits.length || exact ? exactHits : ciHits;
+    if (hits.length === 1) return hits[0];
+    const quoted = JSON.stringify(name);
+    if (hits.length)
+      throw new UsageError(
+        `Ambiguous ${what} name ${quoted}: it matches ${hits.map(describe).join(", ")}.${hint && ` ${hint}`}`,
+      );
+    if (exact && ciHits.length)
+      throw new UsageError(
+        `No ${what} named exactly ${quoted} (this tool needs the exact name). ` +
+          `Did you mean ${ciHits.map(describe).join(", ")}?`,
+      );
+    const names = all.map((x) => JSON.stringify(nameOf(x)));
+    const more = names.length > 50 ? `, ... (${names.length - 50} more)` : "";
+    throw new UsageError(
+      `No ${what} named ${quoted}. Available: ${names.slice(0, 50).join(", ") || "none"}${more}.`,
+    );
+  }
+
+  // `"Drums" (track_index 2, id 15)`: enough for the caller to pick one.
+  function describeTrack(t: Track<"1.0.0">): string {
+    const s = song();
+    const i = s.tracks.findIndex((x) => x.handle.id === t.handle.id);
+    const where =
+      i >= 0 ? `track_index ${i}` : t.handle.id === s.mainTrack.handle.id ? "main track" : "return track";
+    return `${JSON.stringify(t.name)} (${where}, id ${remember(t)})`;
+  }
+
+  // Track addressing without a prior song_get: by id, by index (regular tracks)
+  // or by name across regular, return and main tracks. Several fields must
+  // agree, so a stale id cannot silently win over the name the caller meant.
+  function findTrack(a: TrackAddress, opts: { exactName?: boolean } = {}): Track<"1.0.0"> {
+    const s = song();
+    const found: Track<"1.0.0">[] = [];
+    if (a.track_id !== undefined) found.push(resolve(a.track_id, Track));
+    if (a.track_index !== undefined) {
+      const t = s.tracks[a.track_index];
+      if (!t) throw outOfRange("track_index", a.track_index, s.tracks.length);
+      found.push(t);
+    }
+    if (a.track_name !== undefined) {
       const all = [...s.tracks, ...s.returnTracks, s.mainTrack];
-      const exact = all.filter((t) => t.name === args.track_name);
-      const ci = exact.length
-        ? exact
-        : all.filter((t) => t.name.toLowerCase() === args.track_name!.toLowerCase());
-      if (ci.length === 1) return ci[0];
-      throw new Error(
-        (ci.length ? `Ambiguous track name` : `No track named`) +
-          ` "${args.track_name}". Tracks: ${all.map((t) => JSON.stringify(t.name)).join(", ")}.`,
+      found.push(
+        byName("track", a.track_name, all, (t) => t.name, describeTrack, {
+          exact: opts.exactName,
+          hint: "Use track_id or track_index.",
+        }),
       );
     }
-    throw new Error("Provide track_id, track_index, or track_name.");
+    if (!found.length) throw new UsageError("Provide track_id, track_index, or track_name.");
+    if (found.some((t) => t.handle.id !== found[0].handle.id))
+      throw new UsageError(
+        `track_id, track_index and track_name name different tracks: ${found.map(describeTrack).join(" vs ")}.`,
+      );
+    return found[0];
   }
+
+  const describeScene = (scene: Scene<"1.0.0">, index: number) =>
+    `${JSON.stringify(scene.name)} (scene_index ${index}, id ${remember(scene)})`;
+
+  // Scenes by id, index or name; returns the scene and its index.
+  function findScene(a: SceneAddress, opts: { exactName?: boolean } = {}) {
+    const scenes = song().scenes;
+    const found: number[] = [];
+    if (a.scene_id !== undefined) {
+      const scene = resolve(a.scene_id, Scene);
+      const i = scenes.findIndex((x) => x.handle.id === scene.handle.id);
+      // not a UsageError: a deleted scene's id is stale
+      if (i < 0) throw new Error(`Scene "${a.scene_id}" is no longer in the Live Set.`);
+      found.push(i);
+    }
+    if (a.scene_index !== undefined) {
+      if (a.scene_index >= scenes.length) throw outOfRange("scene_index", a.scene_index, scenes.length);
+      found.push(a.scene_index);
+    }
+    if (a.scene_name !== undefined) {
+      const indexed = scenes.map((scene, index) => ({ scene, index }));
+      const describe = (x: (typeof indexed)[number]) => describeScene(x.scene, x.index);
+      const options = { exact: opts.exactName, hint: "Use scene_id or scene_index." };
+      found.push(byName("scene", a.scene_name, indexed, (x) => x.scene.name, describe, options).index);
+    }
+    if (!found.length) throw new UsageError("Provide scene_id, scene_index, or scene_name.");
+    if (found.some((i) => i !== found[0]))
+      throw new UsageError(
+        `scene_id, scene_index and scene_name name different scenes: ` +
+          `${found.map((i) => describeScene(scenes[i], i)).join(" vs ")}.`,
+      );
+    return { scene: scenes[found[0]], index: found[0] };
+  }
+
+  // Tools that take a target_id (track, chain, slot, ...) accept a track
+  // address in its place.
+  function findTarget(a: { target_id?: string } & TrackAddress): DataModelObject<"1.0.0"> {
+    if (a.target_id === undefined) {
+      if (!hasTrackAddress(a))
+        throw new UsageError("Provide target_id, or a track via track_id, track_index or track_name.");
+      return findTrack(a);
+    }
+    if (hasTrackAddress(a))
+      throw new UsageError("Give target_id or track_id/track_index/track_name, not both.");
+    return resolve(a.target_id, DataModelObject);
+  }
+
+  function findMixer(a: { target_id?: string } & TrackAddress) {
+    const owner = findTarget(a);
+    const mixer =
+      owner instanceof Track || owner instanceof Chain
+        ? owner.mixer
+        : owner instanceof TrackMixer || owner instanceof ChainMixer
+          ? owner
+          : null;
+    if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(owner)}.`);
+    return { mixer, owner };
+  }
+
+  // -- track kinds and object locations ---------------------------------------
+
+  const indexIn = (list: DataModelObject<"1.0.0">[], obj: DataModelObject<"1.0.0">) =>
+    list.findIndex((x) => x.handle.id === obj.handle.id);
+
+  // The API has no group-track class: a regular track that is neither an audio
+  // nor a MIDI track is a group track. `regular` is song().tracks, passed in
+  // by callers that already hold it.
+  const isGroupTrack = (track: Track<"1.0.0">, regular = song().tracks) =>
+    !(track instanceof AudioTrack) && !(track instanceof MidiTrack) && indexIn(regular, track) >= 0;
+
+  // audio, midi, group, return or main.
+  function trackKind(track: Track<"1.0.0">, regular = song().tracks): string {
+    if (track instanceof AudioTrack) return "audio";
+    if (track instanceof MidiTrack) return "midi";
+    if (indexIn(regular, track) >= 0) return "group";
+    const s = song();
+    if (indexIn(s.returnTracks, track) >= 0) return "return";
+    return track.handle.id === s.mainTrack.handle.id ? "main" : "other";
+  }
+
+  // trackSummary plus `is_group`. A group track's `type` stays "other", as it
+  // was before `is_group` existed (return and main tracks are "other" too
+  // here; song_get labels them by section).
+  const summarizeTrack = (track: Track<"1.0.0">, regular = song().tracks) => ({
+    ...trackSummary(track),
+    is_group: isGroupTrack(track, regular),
+  });
+
+  // A track as locations name it: track_index only for regular tracks.
+  function trackRef(track: Track<"1.0.0">, regular = song().tracks) {
+    const i = indexIn(regular, track);
+    return {
+      track_id: remember(track),
+      track_name: track.name,
+      track_index: i >= 0 ? i : undefined,
+      track_type: trackKind(track, regular),
+    };
+  }
+
+  // Locations are derived from DataModelObject.parent, which the SDK only
+  // documents as the "canonical parent". Assumed, as in Live's object model:
+  // a clip slot's parent is its track; a clip's its slot, track (arrangement)
+  // or take lane; a take lane's its track; a device's its track or chain; a
+  // chain's its rack; a sample's its Simpler. A parent that is not what is
+  // expected makes the location say less, never fail the call.
+  function parentOf(obj: DataModelObject<"1.0.0">): DataModelObject<"1.0.0"> | null {
+    try {
+      return obj.parent;
+    } catch {
+      return null; // e.g. a parent of a class the SDK does not know
+    }
+  }
+
+  // Session: the track and scene of a clip slot. When the slot's parent is not
+  // its track, the tracks' slot lists are searched instead.
+  function slotLocation(slot: ClipSlot<"1.0.0">) {
+    const regular = song().tracks;
+    let track = parentOf(slot);
+    let index = track instanceof Track ? indexIn(track.clipSlots, slot) : -1;
+    for (let t = 0; index < 0 && t < regular.length; t++) {
+      index = indexIn(regular[t].clipSlots, slot);
+      if (index >= 0) track = regular[t];
+    }
+    if (!(track instanceof Track) || index < 0) return { view: "session", clip_slot_id: remember(slot) };
+    const scene = song().scenes[index];
+    return {
+      view: "session",
+      ...trackRef(track, regular),
+      scene_index: index,
+      scene_id: scene ? remember(scene) : undefined,
+      scene_name: scene?.name,
+      clip_slot_id: remember(slot),
+    };
+  }
+
+  function laneLocation(lane: TakeLane<"1.0.0">) {
+    let track = parentOf(lane);
+    if (!(track instanceof Track)) track = song().tracks.find((t) => indexIn(t.takeLanes, lane) >= 0) ?? null;
+    const own = { take_lane_id: remember(lane), take_lane_name: lane.name };
+    if (!(track instanceof Track)) return { view: "take_lane", ...own };
+    return { view: "take_lane", ...trackRef(track), ...own, take_lane_index: indexIn(track.takeLanes, lane) };
+  }
+
+  function clipLocation(clip: Clip<"1.0.0">) {
+    const parent = parentOf(clip);
+    if (parent instanceof ClipSlot) return slotLocation(parent);
+    if (parent instanceof TakeLane) return laneLocation(parent);
+    if (parent instanceof Track) return { view: "arrangement", ...trackRef(parent) };
+    return null;
+  }
+
+  // The track a device is on, and the labels from there down to it: racks and
+  // their chains (as chainLabel names them), then the device.
+  function devicePath(device: Device<"1.0.0">): { track?: Track<"1.0.0">; labels: string[] } {
+    const labels = [device.name];
+    let up = parentOf(device);
+    for (let depth = 0; up && depth < 16; depth++) {
+      if (up instanceof Track) return { track: up, labels };
+      const chain = up;
+      const rack = chain instanceof Chain ? parentOf(chain) : null;
+      if (!(chain instanceof Chain) || !(rack instanceof RackDevice)) break;
+      labels.unshift(rack.name, chainLabel(chain, indexIn(rack.chains, chain)));
+      up = parentOf(rack);
+    }
+    return { labels };
+  }
+  // "Kit > Drum Rack > pad 36 > Simpler", as parameter_find shows paths.
+  const pathText = (track: Track<"1.0.0"> | undefined, labels: string[]) =>
+    (track ? [track.name, ...labels] : labels).join(" > ");
+
+  function deviceLocation(device: Device<"1.0.0">) {
+    const holder = parentOf(device);
+    const rack = holder instanceof Chain ? parentOf(holder) : null;
+    const { track, labels } = devicePath(device);
+    return {
+      ...(track ? trackRef(track) : {}),
+      path: pathText(track, labels),
+      device_index: holder instanceof Track || holder instanceof Chain ? indexIn(holder.devices, device) : undefined,
+      chain_id: holder instanceof Chain ? remember(holder) : undefined,
+      rack_device_id: rack instanceof RackDevice ? remember(rack) : undefined,
+    };
+  }
+
+  function chainLocation(chain: Chain<"1.0.0">) {
+    const rack = parentOf(chain);
+    if (!(rack instanceof RackDevice)) return null;
+    const index = indexIn(rack.chains, chain);
+    const { track, labels } = devicePath(rack);
+    return {
+      ...(track ? trackRef(track) : {}),
+      path: pathText(track, [...labels, chainLabel(chain, index)]),
+      rack_device_id: remember(rack),
+      chain_index: index,
+    };
+  }
+
+  // Where an object sits (clip_get, device_get, chain_get, selection_get), or
+  // null when that cannot be told.
+  function locate(obj: DataModelObject<"1.0.0">): object | null {
+    try {
+      if (obj instanceof Clip) return clipLocation(obj);
+      if (obj instanceof ClipSlot) return slotLocation(obj);
+      if (obj instanceof TakeLane) return laneLocation(obj);
+      if (obj instanceof Device) return deviceLocation(obj);
+      if (obj instanceof Chain) return chainLocation(obj);
+      if (obj instanceof Track) return trackRef(obj);
+      if (obj instanceof Scene) {
+        const index = indexIn(song().scenes, obj);
+        return index >= 0 ? { scene_index: index } : null;
+      }
+      if (obj instanceof Sample) {
+        const simpler = parentOf(obj);
+        return simpler instanceof Simpler ? { simpler_device_id: remember(simpler), ...deviceLocation(simpler) } : null;
+      }
+    } catch {
+      // a location is extra information: never fail the call over it
+    }
+    return null;
+  }
+
+  // Whether a clip spanning [start, end) overlaps the range [from, to); an
+  // empty range (from = to) is a point in time, covered from a clip's start.
+  const overlapsRange = (start: number, end: number, from: number, to: number) =>
+    to > from ? start < to && end > from : start <= from && end > from;
+  // The clips overlapping [from, to), by start time.
+  function clipsInRange(clips: Clip<"1.0.0">[], from: number, to: number) {
+    return clips
+      .map((clip) => ({ clip, start: num(clip.startTime), end: num(clip.endTime) }))
+      .filter((c) => overlapsRange(c.start, c.end, from, to))
+      .sort((a, b) => a.start - b.start)
+      .map((c) => c.clip);
+  }
+
+  // Overviews (session_grid, arrangement_get): the given tracks, in that order
+  // and each once, or every regular track. Every address is checked first.
+  function trackSelection(list: TrackAddress[] | undefined, regular: Track<"1.0.0">[]) {
+    if (!list) return regular;
+    const picked = list.map((a, i) => at(`tracks[${i}]`, () => findTrack(a)));
+    return picked.filter((t, i) => indexIn(picked, t) === i);
+  }
+  // A track as an overview row.
+  const trackRow = (track: Track<"1.0.0">, regular: Track<"1.0.0">[]) => {
+    const index = indexIn(regular, track);
+    return {
+      id: remember(track),
+      name: track.name,
+      index: index >= 0 ? index : undefined,
+      type: trackKind(track, regular),
+    };
+  };
+
+  // -- devices and parameters by name ----------------------------------------
+
+  const quote = (s: string) => JSON.stringify(s);
+  const describeDevice = (d: Device<"1.0.0">) => `${quote(d.name)} (id ${remember(d)})`;
+  // Chains have no names: drum pads are called by their note, others by index.
+  const chainLabel = (c: Chain<"1.0.0">, i: number) =>
+    c instanceof DrumChain ? `pad ${num(c.receivingNote)}` : `chain ${i}`;
+
+  // A rack's chain by {chain: index} or, in a Drum Rack, {pad: receiving note}.
+  function findChain(rack: RackDevice<"1.0.0">, step: ChainStep) {
+    const chains = rack.chains;
+    if ("chain" in step) {
+      const chain = chains[step.chain];
+      if (!chain)
+        throw new UsageError(
+          `chain ${step.chain} out of range in ${describeDevice(rack)} ` +
+            `(${chains.length ? `0-${chains.length - 1}` : "it has no chains"}).`,
+        );
+      return { chain, label: chainLabel(chain, step.chain) };
+    }
+    if (!(rack instanceof DrumRack))
+      throw new UsageError(`${describeDevice(rack)} is not a Drum Rack: address its chains by {chain: index}.`);
+    const pad = parsePitch(step.pad, "pad");
+    const notes = chains.map((c) => (c instanceof DrumChain ? num(c.receivingNote) : undefined));
+    const hits = notes.flatMap((n, i) => (n === pad ? [i] : []));
+    if (hits.length === 1) return { chain: chains[hits[0]], label: `pad ${pad}` };
+    if (hits.length)
+      throw new UsageError(
+        `Ambiguous pad ${pad} in ${describeDevice(rack)}: chains ${hits.join(", ")} all receive ` +
+          `note ${pad}. Use {chain: index}.`,
+      );
+    const pads = [...new Set(notes.filter((n): n is number => n !== undefined))].sort((a, b) => a - b);
+    throw new UsageError(
+      `No pad receives note ${pad} in ${describeDevice(rack)} (pads: ${pads.join(", ") || "none"}).`,
+    );
+  }
+
+  // A device by device_id, or by its track and `device` (see deviceAddress).
+  // Also returns where it sits: the track (when addressed through one) and
+  // the readable path down to it, e.g. ["Drums", "Drum Rack", "pad 36", "Simpler"].
+  function locateDevice(a: DeviceAddress): {
+    device: Device<"1.0.0">;
+    track?: Track<"1.0.0">;
+    path: string[];
+  } {
+    if (a.device_id !== undefined) {
+      if (a.device !== undefined || hasTrackAddress(a))
+        throw new UsageError("Give device_id, or a track and device, not both.");
+      const device = resolve(a.device_id, Device);
+      return { device, path: [device.name] };
+    }
+    if (a.device === undefined)
+      throw new UsageError("Provide device_id, or a track (track_id, track_index or track_name) and device.");
+    if (!hasTrackAddress(a))
+      throw new UsageError("device needs its track: give track_id, track_index or track_name (or use device_id).");
+    const track = findTrack(a);
+    const steps = Array.isArray(a.device) ? a.device : [a.device];
+    const path = [track.name];
+    let list: Device<"1.0.0">[] | null = track.devices; // what the next name or index picks from
+    let where = `track ${describeTrack(track)}`;
+    let current: Device<"1.0.0"> | null = null;
+    for (const [i, step] of steps.entries()) {
+      const label = Array.isArray(a.device) ? `device[${i}]` : "device";
+      if (typeof step === "object") {
+        if (!current) throw new UsageError(`${label}: a {chain} or {pad} step must follow a rack device.`);
+        const rack = current;
+        if (!(rack instanceof RackDevice))
+          throw new UsageError(
+            `${label}: ${describeDevice(rack)} is not a rack, so the path cannot go into a chain.`,
+          );
+        const { chain, label: name } = at(label, () => findChain(rack, step));
+        path.push(name);
+        list = chain.devices;
+        where = `${name} of ${describeDevice(rack)}`;
+        current = null;
+        continue;
+      }
+      if (!list) {
+        const prev = current!;
+        throw new UsageError(
+          prev instanceof RackDevice
+            ? `${label}: pick a chain of ${describeDevice(prev)} first, with {chain: index} or {pad: note}.`
+            : `${label}: ${describeDevice(prev)} is not a rack, so the path cannot continue.`,
+        );
+      }
+      const devices: Device<"1.0.0">[] = list;
+      if (typeof step === "number") {
+        if (!devices[step])
+          throw new UsageError(
+            `${label}: device index ${step} out of range on ${where} ` +
+              `(${devices.length ? `0-${devices.length - 1}` : "it has no devices"}).`,
+          );
+        current = devices[step];
+      } else {
+        const indexed = devices.map((device, index) => ({ device, index }));
+        const describe = (x: (typeof indexed)[number]) =>
+          `${quote(x.device.name)} (index ${x.index}, id ${remember(x.device)})`;
+        current = at(`${label} on ${where}`, () =>
+          byName("device", step, indexed, (x) => x.device.name, describe, {
+            hint: "Use the device index or device_id.",
+          }),
+        ).device;
+      }
+      path.push(current.name);
+      list = null;
+    }
+    if (!current)
+      throw new UsageError("device: the path ends at a chain; add the device in it (a name or index).");
+    return { device: current, track, path };
+  }
+  const findDevice = (a: DeviceAddress) => locateDevice(a).device;
+
+  // Name matching for parameters and value items: exact, then case-insensitive,
+  // then case-insensitive substring. The first tier with a hit decides; more
+  // than one hit there is ambiguous.
+  function tieredMatch<T>(all: T[], namesOf: (x: T) => string[], query: string): T[] {
+    const lower = query.toLowerCase();
+    const tiers: Array<(n: string) => boolean> = [
+      (n) => n === query,
+      (n) => n.toLowerCase() === lower,
+      (n) => n.toLowerCase().includes(lower),
+    ];
+    for (const test of tiers) {
+      const hits = all.filter((x) => namesOf(x).some(test));
+      if (hits.length) return hits;
+    }
+    return [];
+  }
+
+  // A device's parameter by name (tieredMatch). Live devices can repeat a
+  // name: that is ambiguous, and the candidates' ids are listed.
+  function findParameter(device: Device<"1.0.0">, name: string): DeviceParameter<"1.0.0"> {
+    const params = device.parameters.map((p, index) => ({ p, index, name: p.name }));
+    const hits = tieredMatch(params, (x) => [x.name], name);
+    if (hits.length === 1) return hits[0].p;
+    if (!hits.length)
+      throw new UsageError(
+        `No parameter named ${quote(name)} (or containing it) on ${describeDevice(device)}. ` +
+          "Find names with parameter_find or device_get {parameter_filter}.",
+      );
+    const shown = hits.slice(0, 20).map((x) => `${quote(x.name)} (index ${x.index}, id ${remember(x.p)})`);
+    const more = hits.length > 20 ? `, ... (${hits.length - 20} more)` : "";
+    throw new UsageError(
+      `Ambiguous parameter ${quote(name)} on ${describeDevice(device)}: it matches ` +
+        `${shown.join(", ")}${more}. Use the exact name or the parameter_id.`,
+    );
+  }
+
+  // A quantized parameter's value_items index, by item name or short name.
+  function valueItemIndex(param: DeviceParameter<"1.0.0">, item: string): number {
+    const items = param.valueItems.map((v, index) => ({
+      index,
+      label: `${quote(v.name)} (${index})`,
+      names: [v.name, v.shortName].filter((n): n is string => typeof n === "string"),
+    }));
+    const hits = tieredMatch(items, (x) => x.names, item);
+    if (hits.length === 1) return hits[0].index;
+    const list = (xs: typeof items) => xs.map((x) => x.label).join(", ");
+    throw new UsageError(
+      hits.length
+        ? `Ambiguous value_item ${quote(item)} for ${quote(param.name)}: it matches ${list(hits)}.`
+        : `No value item ${quote(item)} for ${quote(param.name)}. Items: ${list(items) || "none"}.`,
+    );
+  }
+
+  const WRITE_KINDS = ["value", "value_item", "reset", "delta"] as const;
+  function writeKind(w: ParameterWrite): (typeof WRITE_KINDS)[number] {
+    const kinds = WRITE_KINDS.filter((k) => (k === "reset" ? w.reset === true : w[k] !== undefined));
+    if (kinds.length === 1) return kinds[0];
+    throw new UsageError(
+      kinds.length
+        ? `give only one of value, value_item, reset and delta, got ${kinds.join(" + ")}.`
+        : "give one of value, value_item, reset (true) or delta.",
+    );
+  }
+
+  // A validated write. `target` maps the current value (read only when
+  // `relative`, i.e. for delta) to the value to set.
+  type PlannedWrite = {
+    param: DeviceParameter<"1.0.0">;
+    relative: boolean;
+    target: (current: number) => number;
+  };
+
+  function planWrite(param: DeviceParameter<"1.0.0">, w: ParameterWrite): PlannedWrite {
+    const kind = writeKind(w);
+    const min = num(param.min);
+    const max = num(param.max);
+    const quantized = param.isQuantized;
+    const name = quote(param.name);
+    const fixed = (v: number, what: string): PlannedWrite => {
+      // tolerate float noise at the edges, then send an in-range value
+      const slack = 1e-9 * Math.max(1, Math.abs(max - min));
+      if (!(v >= min - slack && v <= max + slack))
+        throw new UsageError(`${what} ${v} is out of range for ${name} (${min} to ${max}).`);
+      if (quantized && !Number.isInteger(v))
+        throw new UsageError(
+          `${name} is quantized: give a whole value_items index or a value_item, not ${v}.`,
+        );
+      const value = Math.min(max, Math.max(min, v));
+      return { param, relative: false, target: () => value };
+    };
+    switch (kind) {
+      case "value":
+        return fixed(w.value!, "value");
+      case "value_item":
+        if (!quantized)
+          throw new UsageError(
+            `${name} is not quantized: give a value from ${min} to ${max}, not a value_item.`,
+          );
+        return fixed(valueItemIndex(param, w.value_item!), "value_items index");
+      case "reset": {
+        const value = num(param.defaultValue);
+        return { param, relative: false, target: () => value };
+      }
+      case "delta": {
+        const delta = w.delta!;
+        if (quantized && !Number.isInteger(delta))
+          throw new UsageError(
+            `${name} is quantized: delta must be a whole number of steps, not ${delta}.`,
+          );
+        return { param, relative: true, target: (current) => Math.min(max, Math.max(min, current + delta)) };
+      }
+    }
+  }
+
+  // Applies validated writes as one undo step. The current values a delta
+  // needs are read first: the transaction callback must be synchronous, so
+  // it only starts the setValue calls. labels[i] names entry i in errors.
+  // Returns the values written.
+  async function applyWrites(
+    plan: PlannedWrite[],
+    labels: Array<string | undefined> = [],
+  ): Promise<number[]> {
+    plan.forEach((w, i) => {
+      const first = plan.findIndex((o) => o.param.handle.id === w.param.handle.id);
+      if (first !== i)
+        throw new UsageError(
+          `${labels[i] ? `${labels[i]}: ` : ""}parameter ${quote(w.param.name)} (id ${remember(w.param)}) ` +
+            `is set twice${labels[first] ? `, also by ${labels[first]}` : ""}.`,
+        );
+    });
+    const current = await Promise.all(plan.map((w) => (w.relative ? w.param.getValue().then(num) : 0)));
+    const values = plan.map((w, i) => w.target(current[i]));
+    if (plan.length)
+      await context.withinTransaction(() =>
+        Promise.all(
+          plan.map((w, i) =>
+            w.param.setValue(values[i]).catch((e: unknown) => {
+              const where = labels[i] ? `${labels[i]}: ` : "";
+              throw new Error(`${where}could not set ${quote(w.param.name)} to ${values[i]}: ${errorMessage(e)}`);
+            }),
+          ),
+        ),
+      );
+    return values;
+  }
+
+  // parameter_get / parameter_set entries: parameter_id, or device + name.
+  function findParameterEntry(a: ParameterAddress) {
+    if (a.parameter_id !== undefined) {
+      if (a.parameter !== undefined || given(a, ["device_id", "device"]) || hasTrackAddress(a))
+        throw new UsageError("give parameter_id, or a device and parameter, not both.");
+      return { param: resolve(a.parameter_id, DeviceParameter), device: undefined };
+    }
+    if (a.parameter === undefined)
+      throw new UsageError("give parameter_id, or parameter with device_id or a track and device.");
+    const device = findDevice(a);
+    return { param: findParameter(device, a.parameter), device };
+  }
+  // parameter_get / parameter_set results: entries found by device name their device.
+  const withValue = async ({ param, device }: { param: DeviceParameter<"1.0.0">; device?: Device<"1.0.0"> }) => ({
+    ...(await parameterWithValue(param)),
+    ...(device ? { device_id: remember(device), device_name: device.name } : {}),
+  });
+
+  // Initial values for a device that was just inserted: every name first,
+  // then the values as one undo step. The device already exists, so a failure
+  // (which sets none of them) is returned instead of thrown.
+  async function setInitialParameters(
+    device: Device<"1.0.0">,
+    parameters: Array<{ name: string } & ParameterWrite>,
+  ): Promise<{ parameters?: Array<{ id: string; name: string; value: number }>; error?: string }> {
+    try {
+      const plan = parameters.map((p) => planWrite(findParameter(device, p.name), p));
+      const values = await applyWrites(plan);
+      return {
+        parameters: plan.map((w, i) => ({ id: remember(w.param), name: w.param.name, value: values[i] })),
+      };
+    } catch (e) {
+      return { error: `parameters: ${errorMessage(e)}` };
+    }
+  }
+
+  // The parameter that switches a device on and off. "Device On" is Live's
+  // naming convention, not an SDK field: without it, a first parameter that is
+  // a two-state switch is used instead (`fallback`). On and off are its
+  // "On"/"Off" items when it has both, else its max and min.
+  function onOffParameter(device: Device<"1.0.0">) {
+    const params = device.parameters;
+    let param = params.find((p) => p.name === "Device On");
+    const fallback = !param;
+    if (!param && params[0]?.isQuantized && params[0].valueItems.length === 2) param = params[0];
+    if (!param)
+      throw new UsageError(
+        `${describeDevice(device)} has no "Device On" parameter (and its first parameter is not a ` +
+          "two-state switch), so it cannot be switched on or off.",
+      );
+    const items = param.isQuantized ? param.valueItems.map((v) => v.name.toLowerCase()) : [];
+    const [on, off] = [items.indexOf("on"), items.indexOf("off")];
+    const named = on >= 0 && off >= 0;
+    return { param, fallback, on: named ? on : num(param.max), off: named ? off : num(param.min) };
+  }
+
+  // Parameter values by name, as device_copy and the presets carry them.
+  type SavedValue = { name: string; value: number };
+  async function readValues(device: Device<"1.0.0">): Promise<SavedValue[]> {
+    const params = device.parameters;
+    const values = await Promise.all(params.map((p) => p.getValue()));
+    return params.map((p, i) => ({ name: p.name, value: num(values[i]) }));
+  }
+
+  // Writes saved values onto a device by exact name, as one undo step. The
+  // k-th value of a name goes to the device's k-th parameter of that name, so
+  // repeated names line up. Values the device already has are not written.
+  // Lenient: what cannot be applied is listed in `skipped`, never thrown.
+  async function applySavedValues(device: Device<"1.0.0">, saved: SavedValue[]) {
+    const byParamName = new Map<string, DeviceParameter<"1.0.0">[]>();
+    for (const p of device.parameters) byParamName.set(p.name, [...(byParamName.get(p.name) ?? []), p]);
+    const seen = new Map<string, number>();
+    const skipped: Array<{ name: string; reason: string }> = [];
+    const writes: Array<{ param: DeviceParameter<"1.0.0">; value: number }> = [];
+    for (const { name, value } of saved) {
+      const k = seen.get(name) ?? 0;
+      seen.set(name, k + 1);
+      const param = byParamName.get(name)?.[k];
+      if (!param) {
+        const reason = k
+          ? `${describeDevice(device)} has only ${k} parameter${k > 1 ? "s" : ""} of that name`
+          : `${describeDevice(device)} has no parameter of that name`;
+        skipped.push({ name, reason });
+        continue;
+      }
+      try {
+        writes.push({ param, value: planWrite(param, { value }).target(value) });
+      } catch (e) {
+        skipped.push({ name, reason: errorMessage(e) });
+      }
+    }
+    const current = await Promise.all(writes.map((w) => w.param.getValue().then(num)));
+    const changed = writes.filter((w, i) => current[i] !== w.value);
+    const settled = changed.length
+      ? await context.withinTransaction(() =>
+          Promise.allSettled(changed.map((w) => w.param.setValue(w.value))),
+        )
+      : [];
+    let refused = 0;
+    settled.forEach((r, i) => {
+      if (r.status === "fulfilled") return;
+      refused++;
+      const { param, value } = changed[i];
+      skipped.push({ name: param.name, reason: `Live refused ${value}: ${errorMessage(r.reason)}` });
+    });
+    return { applied: writes.length - refused, skipped };
+  }
+
+  // Racks rebuild nothing by name: their chains and devices are not parameters.
+  function rejectRack(device: Device<"1.0.0">, what: string) {
+    if (device instanceof RackDevice)
+      throw new UsageError(
+        `${describeDevice(device)} is a rack: its chains and their devices are not parameters, so ` +
+          `it cannot be ${what}. device_duplicate copies a rack in place.`,
+      );
+  }
+
+  // Inserts a built-in device for device_copy / device_preset_load.
+  type DeviceHolder = Track<"1.0.0"> | Chain<"1.0.0">;
+  async function insertBuiltIn(target: DeviceHolder, name: string, index: number, renamedHint: boolean) {
+    try {
+      return await target.insertDevice(name, index);
+    } catch (e) {
+      const hint = renamedHint ? " If the device was renamed in Live, pass its built-in name as device_name." : "";
+      throw new Error(`Could not insert ${quote(name)}: ${errorMessage(e)}${hint} Nothing was changed.`);
+    }
+  }
+
+  // Undoes insertBuiltIn after a later step failed, then reports that failure.
+  async function removeInserted(target: DeviceHolder, device: Device<"1.0.0">, why: string): Promise<never> {
+    try {
+      await target.deleteDevice(device);
+    } catch (e) {
+      throw new Error(`${why} The new device ${remember(device)} could not be removed again: ${errorMessage(e)}.`);
+    }
+    throw new Error(`${why} The new device was removed again; nothing else was changed.`);
+  }
+
+  // device_copy / device_preset_load: a Simpler's sample first (loading one
+  // may reset sample-dependent parameters), then the values. A sample that
+  // cannot be loaded fails the call; a device inserted for it is removed again.
+  async function restoreDevice(
+    device: Device<"1.0.0">,
+    saved: SavedValue[],
+    samplePath: string | undefined,
+    insertedInto?: DeviceHolder,
+  ) {
+    const skipped: Array<{ name: string; reason: string }> = [];
+    let sample: { file_path: string } | undefined;
+    if (samplePath !== undefined) {
+      if (!(device instanceof Simpler)) {
+        skipped.push({ name: "sample", reason: `${describeDevice(device)} is not a Simpler` });
+      } else {
+        try {
+          sample = { file_path: (await device.replaceSample(samplePath)).filePath };
+        } catch (e) {
+          const why = `Could not load the sample ${samplePath}: ${errorMessage(e)}.`;
+          if (insertedInto) await removeInserted(insertedInto, device, why);
+          throw new Error(`${why} Nothing was changed.`);
+        }
+      }
+    }
+    const values = await applySavedValues(device, saved);
+    return { sample, applied: values.applied, skipped: [...skipped, ...values.skipped] };
+  }
+
+  const presets = () => presetStore(context.environment.storageDirectory);
+
+  // -- tracks ----------------------------------------------------------------
 
   async function mixerDetail(mixer: TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">) {
     const returnNames = mixer instanceof TrackMixer ? song().returnTracks.map((t) => t.name) : [];
     const [volume, panning, sends] = await Promise.all([
       parameterWithValue(mixer.volume),
       parameterWithValue(mixer.panning),
-      Promise.all(mixer.sends.map(parameterWithValue)),
+      Promise.all(mixer.sends.map((p) => parameterWithValue(p))),
     ]);
     return {
       id: remember(mixer),
@@ -261,15 +2095,16 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "track_get",
+    { title: "Get track", annotations: READ },
     "Get detail for one track: properties, clip slots (session view, with " +
       "clips), take lanes, arrangement clips, devices, and mixer (volume/pan/sends " +
-      "with current values). Works for regular, return, and main tracks. Address " +
+      "with current values). Works for regular, return, and main tracks; group " +
+      "tracks have `is_group: true` (their `type`, like return and main tracks', is " +
+      "'other'). Address " +
       "by track_id, track_index (0-based, regular tracks only), or track_name. " +
       "Use `include` to fetch only some sections.",
     {
-      track_id: z.string().optional(),
-      track_index: z.number().int().min(0).optional(),
-      track_name: z.string().optional(),
+      ...trackAddress(),
       include: z
         .array(z.enum(["clip_slots", "take_lanes", "arrangement_clips", "devices", "mixer"]))
         .optional()
@@ -279,7 +2114,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       const track = findTrack(args);
       const want = (k: string) => !args.include || args.include.includes(k as never);
       return {
-        ...trackSummary(track),
+        ...summarizeTrack(track),
         clip_slots: want("clip_slots") ? track.clipSlots.map(clipSlotSummary) : undefined,
         take_lanes: want("take_lanes") ? track.takeLanes.map(takeLaneSummary) : undefined,
         arrangement_clips: want("arrangement_clips")
@@ -291,137 +2126,616 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  const trackProps = () => ({
+    name: z.string().optional(),
+    mute: z.boolean().optional(),
+    solo: z.boolean().optional(),
+    arm: z.boolean().optional(),
+  });
+  const TRACK_PROPS = Object.keys(trackProps());
+
   tool(
     "track_set",
-    "Set track properties (name, mute, solo, arm).",
+    { title: "Set track properties", annotations: SET },
+    "Set track properties (name, mute, solo, arm). Address the track by track_id, " +
+      "track_index or track_name, or pass `items` (one entry per track, same " +
+      "fields) to change many tracks at once, e.g. mute all but the vocals. All " +
+      "changes form one undo step; nothing is changed if any entry is invalid.",
     {
-      track_id: z.string(),
-      name: z.string().optional(),
-      mute: z.boolean().optional(),
-      solo: z.boolean().optional(),
-      arm: z.boolean().optional(),
+      ...trackAddress(),
+      ...trackProps(),
+      items: z
+        .array(z.object({ ...trackAddress(), ...trackProps() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per track; returns {items}"),
     },
-    ({ track_id, name, mute, solo, arm }) => {
-      const track = resolve(track_id, Track);
-      if (name !== undefined) track.name = name;
-      if (mute !== undefined) track.mute = mute;
-      if (solo !== undefined) track.solo = solo;
-      if (arm !== undefined) track.arm = arm;
-      return trackSummary(track);
+    (args) => {
+      const { list, batch } = entries(args, args.items, [...Object.keys(trackAddress()), ...TRACK_PROPS]);
+      // Validate every entry before the first setter runs.
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          const track = findTrack(it);
+          if (batch && !given(it, TRACK_PROPS))
+            throw new UsageError("nothing to set — give name, mute, solo and/or arm.");
+          return { track, it };
+        }),
+      );
+      if (plan.some(({ it }) => given(it, TRACK_PROPS)))
+        context.withinTransaction(() => {
+          for (const { track, it } of plan) {
+            if (it.name !== undefined) track.name = it.name;
+            if (it.mute !== undefined) track.mute = it.mute;
+            if (it.solo !== undefined) track.solo = it.solo;
+            if (it.arm !== undefined) track.arm = it.arm;
+          }
+        });
+      const regular = song().tracks;
+      const out = plan.map(({ track }) => summarizeTrack(track, regular));
+      return batch ? { items: out } : out[0];
     },
   );
 
   tool(
     "track_create",
-    "Create a new audio or MIDI track. Inserted after the last selected track, " +
-      "or appended if none is selected.",
-    { type: z.enum(["audio", "midi"]) },
-    async ({ type }) => {
+    { title: "Create track", annotations: CREATE },
+    "Create a new audio or MIDI track, optionally named and with built-in devices " +
+      "inserted in order (each a name, or {name, parameters:[{name, value | " +
+      "value_item | reset | delta}]} to set initial parameter values: internal " +
+      "units, or a quantized parameter's choice by name). The track is inserted after " +
+      "the last selected track in Live, or appended if none is selected, so the " +
+      "result carries its `index`. Once the track exists, a failing name or device " +
+      "does not fail the call: it is reported in `errors` (and on its `devices` " +
+      "entry) while the rest is still applied.",
+    {
+      type: z.enum(["audio", "midi"]),
+      name: z.string().optional(),
+      devices: z
+        .array(
+          z.union([
+            z.string().min(1).describe("Built-in device name, e.g. 'Operator', 'Reverb'"),
+            z.object({
+              name: z.string().min(1).describe("Built-in device name"),
+              parameters: z.array(initialParameter).optional(),
+            }),
+          ]),
+        )
+        .optional()
+        .describe("Devices to insert, in chain order"),
+    },
+    async ({ type, name, devices }) => {
+      // Each initial value gives exactly one kind of write: checked before the track exists.
+      for (const [i, spec] of (devices ?? []).entries())
+        if (typeof spec !== "string")
+          spec.parameters?.forEach((p, k) => at(`devices[${i}].parameters[${k}]`, () => writeKind(p)));
       const track =
         type === "audio" ? await song().createAudioTrack() : await song().createMidiTrack();
-      return trackSummary(track);
+      // From here on the track exists: report failures instead of throwing.
+      const errors: string[] = [];
+      if (name !== undefined) {
+        try {
+          track.name = name;
+        } catch (e) {
+          errors.push(`name: ${errorMessage(e)}`);
+        }
+      }
+      const inserted: Record<string, unknown>[] = [];
+      for (const [i, spec] of (devices ?? []).entries()) {
+        const { name: deviceName, parameters } =
+          typeof spec === "string" ? { name: spec, parameters: [] } : spec;
+        let device: Device<"1.0.0">;
+        try {
+          device = await track.insertDevice(deviceName, track.devices.length);
+        } catch (e) {
+          const msg = errorMessage(e);
+          errors.push(`devices[${i}] (${deviceName}): ${msg}`);
+          inserted.push({ requested: deviceName, error: msg });
+          continue;
+        }
+        const entry: Record<string, unknown> = { requested: deviceName, ...deviceSummary(device) };
+        if (parameters?.length) {
+          const result = await setInitialParameters(device, parameters);
+          entry.parameters = result.parameters;
+          if (result.error) {
+            errors.push(`devices[${i}] (${deviceName}): ${result.error}`);
+            entry.error = result.error;
+          }
+        }
+        inserted.push(entry);
+      }
+      return {
+        ...trackSummary(track),
+        index: song().tracks.findIndex((t) => t.handle.id === track.handle.id),
+        devices: devices ? inserted : undefined,
+        errors: errors.length ? errors : undefined,
+      };
     },
   );
 
-  tool("track_delete", "Delete a track.", { track_id: z.string() }, async ({ track_id }) => {
-    await song().deleteTrack(resolve(track_id, Track));
-    return { deleted: track_id };
-  });
+  tool(
+    "track_delete",
+    { title: "Delete track", annotations: DESTRUCTIVE },
+    "Delete a track, addressed by track_id, track_index or its exact track_name.",
+    { ...trackAddress(), track_name: exactTrackName },
+    async (args) => {
+      const track = findTrack(args, { exactName: true });
+      const deleted = { deleted: remember(track), name: track.name };
+      await song().deleteTrack(track);
+      return deleted;
+    },
+  );
 
   tool(
     "track_duplicate",
+    { title: "Duplicate track", annotations: CREATE },
     "Duplicate a track. The copy is inserted right after the original.",
-    { track_id: z.string() },
-    async ({ track_id }) => trackSummary(await song().duplicateTrack(resolve(track_id, Track))),
+    { ...trackAddress() },
+    async (args) => summarizeTrack(await song().duplicateTrack(findTrack(args))),
   );
 
   tool(
     "track_clear_clips_in_range",
+    { title: "Clear arrangement clips in range", annotations: DESTRUCTIVE },
     "Delete all arrangement clips of a track within a beat range. Clips " +
       "overlapping a boundary are truncated to the range edge.",
-    { track_id: z.string(), start_time: z.number(), end_time: z.number() },
-    async ({ track_id, start_time, end_time }) => {
-      await resolve(track_id, Track).clearClipsInRange(start_time, end_time);
+    { ...trackAddress(), start_time: z.number(), end_time: z.number() },
+    async ({ start_time, end_time, ...address }) => {
+      await findTrack(address).clearClipsInRange(start_time, end_time);
       return { cleared: [start_time, end_time] };
     },
   );
 
   tool(
     "take_lane_create",
+    { title: "Create take lane", annotations: CREATE },
     "Create a new take lane on a track (appended after existing lanes).",
-    { track_id: z.string() },
-    async ({ track_id }) => takeLaneSummary(await resolve(track_id, Track).createTakeLane()),
+    { ...trackAddress() },
+    async (args) => takeLaneSummary(await findTrack(args).createTakeLane()),
   );
 
   tool(
     "take_lane_set",
-    "Rename a take lane.",
-    { take_lane_id: z.string(), name: z.string() },
-    ({ take_lane_id, name }) => {
-      const lane = resolve(take_lane_id, TakeLane);
-      lane.name = name;
-      return takeLaneSummary(lane);
+    { title: "Rename take lane", annotations: SET },
+    "Rename a take lane, or several with `items` (one undo step).",
+    {
+      take_lane_id: z.string().optional(),
+      name: z.string().optional(),
+      items: z
+        .array(z.object({ take_lane_id: z.string(), name: z.string() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per take lane; returns {items}"),
+    },
+    (args) => {
+      const { list, batch } = entries(args, args.items, ["take_lane_id", "name"]);
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.take_lane_id === undefined || it.name === undefined)
+            throw new UsageError("take_lane_id and name are required.");
+          return { lane: resolve(it.take_lane_id, TakeLane), name: it.name };
+        }),
+      );
+      context.withinTransaction(() => {
+        for (const { lane, name } of plan) lane.name = name;
+      });
+      const out = plan.map(({ lane }) => takeLaneSummary(lane));
+      return batch ? { items: out } : out[0];
     },
   );
 
   // -- scenes / cue points ---------------------------------------------------
 
+  const sceneIndexOf = (scene: Scene<"1.0.0">) =>
+    song().scenes.findIndex((s) => s.handle.id === scene.handle.id);
+
+  // Batch creation (scene_create / cue_point_create items): every create in one
+  // undo step, then every name in one more. Once something exists, failures
+  // are reported per entry instead of thrown.
+  async function createBatch<T extends Scene<"1.0.0"> | CuePoint<"1.0.0">>(
+    list: { name?: string }[],
+    create: (i: number) => Promise<T>,
+  ): Promise<Array<{ created: T; error?: string } | { created?: undefined; error: string }>> {
+    const settled = await context.withinTransaction(() =>
+      Promise.allSettled(list.map((_, i) => create(i))),
+    );
+    if (settled.every((r) => r.status === "rejected"))
+      throw new Error(`Nothing was created: ${errorMessage((settled[0] as PromiseRejectedResult).reason)}`);
+    const nameErrors: Array<string | undefined> = [];
+    if (list.some((it) => it.name !== undefined)) {
+      context.withinTransaction(() =>
+        settled.forEach((r, i) => {
+          const name = list[i].name;
+          if (r.status !== "fulfilled" || name === undefined) return;
+          try {
+            r.value.name = name;
+          } catch (e) {
+            nameErrors[i] = `name: ${errorMessage(e)}`;
+          }
+        }),
+      );
+    }
+    return settled.map((r, i) =>
+      r.status === "fulfilled"
+        ? { created: r.value, error: nameErrors[i] }
+        : { error: errorMessage(r.reason) },
+    );
+  }
+
+  const sceneCreateItem = () => ({
+    index: z
+      .number()
+      .int()
+      .min(-1)
+      .optional()
+      .describe("0-based insert position; -1 or omitted = append at the end"),
+    name: z.string().optional(),
+  });
+
   tool(
     "scene_create",
-    "Create a scene at the given index (0-based). Pass -1 to append at the end.",
-    { index: z.number().int().min(-1) },
-    async ({ index }) => {
-      const scene = await song().createScene(index);
-      return sceneSummary(scene, song().scenes.findIndex((s) => s.handle.id === scene.handle.id));
+    { title: "Create scene", annotations: CREATE },
+    "Create a scene at the given index (0-based; -1 or omitted appends at the end), " +
+      "optionally named. `items` creates several scenes in one call, in order: each " +
+      "entry's index refers to the scene list after the previous entries were " +
+      "inserted. A batch takes two undo steps (creates, then names) and reports a " +
+      "failed entry as {error} instead of failing the call.",
+    {
+      ...sceneCreateItem(),
+      items: z
+        .array(z.object(sceneCreateItem()))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per new scene; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["index", "name"]);
+      const count = song().scenes.length;
+      list.forEach((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.index !== undefined && it.index > count + i)
+            throw new UsageError(`index ${it.index} out of range (0-${count + i}, or -1 to append).`);
+        }),
+      );
+      if (!batch) {
+        const scene = await song().createScene(args.index ?? -1);
+        if (args.name !== undefined) scene.name = args.name;
+        return sceneSummary(scene, sceneIndexOf(scene));
+      }
+      // The host is expected to apply the creates in call order, which is what
+      // gives each index its "after the previous entries" meaning.
+      const results = await createBatch(list, (i) => song().createScene(list[i].index ?? -1));
+      return {
+        items: results.map((r) =>
+          r.created ? { ...sceneSummary(r.created, sceneIndexOf(r.created)), error: r.error } : r,
+        ),
+      };
     },
   );
 
   tool(
     "scene_set",
-    "Rename a scene.",
-    { scene_id: z.string(), name: z.string() },
-    ({ scene_id, name }) => {
-      const scene = resolve(scene_id, Scene);
-      scene.name = name;
-      return { id: scene_id, name: scene.name };
+    { title: "Rename scene", annotations: SET },
+    "Rename a scene, addressed by scene_id, scene_index or scene_name; or rename " +
+      "several with `items` (one entry per scene). All renames form one undo step.",
+    {
+      ...sceneAddress(),
+      name: z.string().optional().describe("New name (required unless items is given)"),
+      items: z
+        .array(z.object({ ...sceneAddress(), name: z.string() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per scene; returns {items}"),
+    },
+    (args) => {
+      const { list, batch } = entries(args, args.items, [...Object.keys(sceneAddress()), "name"]);
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.name === undefined) throw new UsageError("name is required.");
+          return { ...findScene(it), name: it.name };
+        }),
+      );
+      context.withinTransaction(() => {
+        for (const { scene, name } of plan) scene.name = name;
+      });
+      const out = plan.map(({ scene, index }) => sceneSummary(scene, index));
+      return batch ? { items: out } : out[0];
     },
   );
 
-  tool("scene_delete", "Delete a scene.", { scene_id: z.string() }, async ({ scene_id }) => {
-    await song().deleteScene(resolve(scene_id, Scene));
-    return { deleted: scene_id };
-  });
+  tool(
+    "scene_delete",
+    { title: "Delete scene", annotations: DESTRUCTIVE },
+    "Delete a scene, addressed by scene_id, scene_index or its exact scene_name.",
+    { ...sceneAddress(), scene_name: exactSceneName },
+    async (args) => {
+      const { scene } = findScene(args, { exactName: true });
+      const deleted = { deleted: remember(scene), name: scene.name };
+      await song().deleteScene(scene);
+      return deleted;
+    },
+  );
 
   tool(
     "scene_duplicate",
+    { title: "Duplicate scene", annotations: CREATE },
     "Duplicate a scene. The copy is inserted right after the original.",
-    { scene_id: z.string() },
-    async ({ scene_id }) => {
-      const scene = await song().duplicateScene(resolve(scene_id, Scene));
-      return sceneSummary(scene, song().scenes.findIndex((s) => s.handle.id === scene.handle.id));
+    { ...sceneAddress() },
+    async (args) => {
+      const scene = await song().duplicateScene(findScene(args).scene);
+      return sceneSummary(scene, sceneIndexOf(scene));
+    },
+  );
+
+  tool(
+    "scene_get",
+    { title: "Get scene", annotations: READ },
+    "Get one session row: a scene (scene_id, scene_index or scene_name) and, for " +
+      "every regular track in order, its clip slot in that scene with the clip in it " +
+      "(clip summary, or null for an empty slot; group tracks' slots hold no clips). " +
+      "only_clips leaves out the empty slots. For the whole session at a glance use " +
+      "session_grid.",
+    {
+      ...sceneAddress(),
+      only_clips: z.boolean().default(false).describe("Leave out the tracks whose slot in this scene is empty"),
+    },
+    ({ only_clips, ...address }) => {
+      const { scene, index } = findScene(address);
+      const regular = song().tracks;
+      const slots = regular.map((track, i) => {
+        // group tracks may not have a slot per scene: tolerate a missing one
+        const slot = track.clipSlots[index];
+        const clip = slot?.clip ?? null;
+        return {
+          track_index: i,
+          track_id: remember(track),
+          track_name: track.name,
+          track_type: trackKind(track, regular),
+          slot_id: slot ? remember(slot) : null,
+          clip: clip ? clipSummary(clip) : null,
+        };
+      });
+      return {
+        ...sceneSummary(scene, index),
+        clip_count: slots.filter((x) => x.clip).length,
+        slots: only_clips ? slots.filter((x) => x.clip) : slots,
+      };
+    },
+  );
+
+  const MAX_GRID_CELLS = 10_000;
+
+  tool(
+    "session_grid",
+    { title: "Get session grid", annotations: READ },
+    "The Session View at a glance, as a track × scene matrix: `scenes` are the " +
+      "columns (index, id, name); each entry of `tracks` (id, name, index, type, " +
+      "group_track_id) has one cell per column — null for an empty slot, or the clip " +
+      "in brief {id, class, name, duration, muted, looping} (clip_get has the " +
+      "detail). Narrow it with `tracks` (in that order) and scene_index_min / " +
+      `scene_index_max (inclusive); at most ${MAX_GRID_CELLS} cells per call. For ` +
+      "one scene with full clip summaries use scene_get.",
+    {
+      tracks: z
+        .array(z.object(trackAddress()))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
+      scene_index_min: z.number().int().min(0).optional().describe("First scene (0-based); default 0"),
+      scene_index_max: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Last scene, inclusive; default (and at most) the last scene"),
+    },
+    ({ tracks: list, scene_index_min, scene_index_max }) => {
+      const scenes = song().scenes;
+      const first = scene_index_min ?? 0;
+      if (scene_index_max !== undefined && scene_index_max < first)
+        throw new UsageError(`scene_index_max ${scene_index_max} is before scene_index_min ${first}.`);
+      if (first > 0 && first >= scenes.length) throw outOfRange("scene_index_min", first, scenes.length);
+      const last = Math.min(scene_index_max ?? scenes.length - 1, scenes.length - 1);
+      const columns = scenes.slice(first, last + 1).map((scene, k) => ({
+        index: first + k,
+        id: remember(scene),
+        name: scene.name,
+      }));
+      const regular = song().tracks;
+      const tracks = trackSelection(list, regular);
+      const cells = tracks.length * columns.length;
+      if (cells > MAX_GRID_CELLS)
+        throw new UsageError(
+          `${tracks.length} tracks × ${columns.length} scenes = ${cells} cells, at most ${MAX_GRID_CELLS} ` +
+            "per call: narrow it with tracks or scene_index_min / scene_index_max.",
+        );
+      let clipCount = 0;
+      const rows = tracks.map((track) => {
+        const slots = track.clipSlots;
+        const group = track.groupTrack;
+        return {
+          ...trackRow(track, regular),
+          group_track_id: group ? remember(group) : null,
+          cells: columns.map(({ index }) => {
+            const clip = slots[index]?.clip;
+            if (!clip) return null;
+            clipCount++;
+            return clipBrief(clip);
+          }),
+        };
+      });
+      return { scenes: columns, tracks: rows, clip_count: clipCount };
     },
   );
 
   tool(
     "cue_point_create",
-    "Create an arrangement cue point (locator) at a beat position.",
-    { time: z.number().describe("Position in the arrangement in beats") },
-    async ({ time }) => cuePointSummary(await song().createCuePoint(time)),
+    { title: "Create cue point", annotations: CREATE },
+    "Create an arrangement cue point (locator) at a beat position, optionally " +
+      "named. `items` creates several in one call (two undo steps: creates, then " +
+      "names) and reports a failed entry as {error} instead of failing the call.",
+    {
+      time: z
+        .number()
+        .optional()
+        .describe("Position in the arrangement in beats (required unless items is given)"),
+      name: z.string().optional(),
+      items: z
+        .array(
+          z.object({
+            time: z.number().describe("Position in the arrangement in beats"),
+            name: z.string().optional(),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per cue point; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["time", "name"]);
+      const times = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.time === undefined) throw new UsageError("time is required.");
+          if (list.findIndex((o) => o.time === it.time) !== i)
+            throw new UsageError(`time ${it.time} is given twice.`);
+          return it.time;
+        }),
+      );
+      if (!batch) {
+        const cue = await song().createCuePoint(times[0]);
+        if (args.name !== undefined) cue.name = args.name;
+        return cuePointSummary(cue);
+      }
+      const results = await createBatch(list, (i) => song().createCuePoint(times[i]));
+      return {
+        items: results.map((r) => (r.created ? { ...cuePointSummary(r.created), error: r.error } : r)),
+      };
+    },
   );
 
   tool(
     "cue_point_set",
-    "Rename a cue point.",
-    { cue_point_id: z.string(), name: z.string() },
-    ({ cue_point_id, name }) => {
-      const cue = resolve(cue_point_id, CuePoint);
-      cue.name = name;
-      return cuePointSummary(cue);
+    { title: "Rename or move cue point", annotations: SET },
+    "Rename and/or move a cue point (locator), or several with `items`. Live " +
+      "cannot change a cue point's time, so a move creates a cue point at `time` " +
+      "with the same (or the given) name, then deletes the old one: the result " +
+      "carries the new id and `replaced_id` (the old id is gone). A move onto a " +
+      "beat where another cue point sits is refused. Renames form one undo step; " +
+      "moves take up to three (creates, names, deletes). If no replacement can be " +
+      "created, nothing is changed; if an old cue point cannot be deleted, its " +
+      "entry reports `error` next to the new cue point.",
+    {
+      cue_point_id: z.string().optional(),
+      name: z.string().optional(),
+      time: z.number().optional().describe("Move to this arrangement position in beats"),
+      items: z
+        .array(
+          z.object({
+            cue_point_id: z.string(),
+            name: z.string().optional(),
+            time: z.number().optional().describe("Move to this arrangement position in beats"),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per cue point; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["cue_point_id", "name", "time"]);
+      const existing = song().cuePoints.map((c) => ({ id: remember(c), time: num(c.time) }));
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.cue_point_id === undefined) throw new UsageError("cue_point_id is required.");
+          if (it.name === undefined && it.time === undefined)
+            throw new UsageError("nothing to set — give name and/or time.");
+          if (list.findIndex((o) => o.cue_point_id === it.cue_point_id) !== i)
+            throw new UsageError(`cue point ${it.cue_point_id} is given twice.`);
+          const cue = resolve(it.cue_point_id, CuePoint);
+          const moveTo = it.time !== undefined && it.time !== num(cue.time) ? it.time : undefined;
+          if (moveTo !== undefined) {
+            const taken = existing.find((c) => c.time === moveTo);
+            if (taken) throw new UsageError(`cue point ${taken.id} is already at beat ${moveTo}.`);
+            if (list.slice(0, i).some((o) => o.time === moveTo))
+              throw new UsageError(`time ${moveTo} is given twice.`);
+          }
+          return { id: it.cue_point_id, cue, name: it.name, oldName: cue.name, moveTo, i };
+        }),
+      );
+      const moves = plan.filter((p) => p.moveTo !== undefined);
+
+      // 1. Create the replacements in one undo step. If one fails, remove the
+      //    others again so the call changes nothing.
+      const replacement = new Map<(typeof plan)[number], CuePoint<"1.0.0">>();
+      if (moves.length) {
+        const known = new Set(existing.map((c) => c.id));
+        const settled = await context.withinTransaction(() =>
+          Promise.allSettled(moves.map((m) => song().createCuePoint(m.moveTo!))),
+        );
+        // A create that hands back an existing cue point did not create one;
+        // never rename or roll back (delete) the user's cue point for it.
+        const fresh = settled.map((r) =>
+          r.status === "fulfilled" && !known.has(remember(r.value)) ? r.value : null,
+        );
+        const bad = fresh.findIndex((c) => !c);
+        if (bad >= 0) {
+          const made = fresh.filter((c): c is CuePoint<"1.0.0"> => c !== null);
+          const undone = made.length
+            ? await context.withinTransaction(() =>
+                Promise.allSettled(made.map((c) => song().deleteCuePoint(c))),
+              )
+            : [];
+          const left = made.filter((_, k) => undone[k].status === "rejected").map((c) => remember(c));
+          const r = settled[bad];
+          const why =
+            r.status === "rejected"
+              ? errorMessage(r.reason)
+              : `Live returned the existing cue point ${remember(r.value)} instead of a new one`;
+          const where = itemLabel(batch, moves[bad].i);
+          throw new Error(
+            `${where ? `${where}: ` : ""}could not create a cue point at beat ${moves[bad].moveTo}: ${why}. ` +
+              (left.length
+                ? `The replacement cue points ${left.join(", ")} could not be removed again; ` +
+                  "nothing else was changed."
+                : "Nothing was changed."),
+          );
+        }
+        moves.forEach((m, k) => replacement.set(m, fresh[k]!));
+      }
+
+      // 2. Names: renames, and the moved cue points' names (one undo step).
+      const names = plan.flatMap((p) => {
+        const name = p.name ?? (p.moveTo !== undefined ? p.oldName : undefined);
+        return name === undefined ? [] : [{ target: replacement.get(p) ?? p.cue, name }];
+      });
+      if (names.length)
+        context.withinTransaction(() => {
+          for (const { target, name } of names) target.name = name;
+        });
+
+      // 3. Delete the moved originals (one undo step).
+      const deleted = moves.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(moves.map((m) => song().deleteCuePoint(m.cue))),
+          )
+        : [];
+      const out = plan.map((p) => {
+        const k = moves.indexOf(p);
+        if (k < 0) return cuePointSummary(p.cue);
+        const summary = cuePointSummary(replacement.get(p)!);
+        const r = deleted[k];
+        return r.status === "fulfilled"
+          ? { ...summary, replaced_id: p.id }
+          : {
+              ...summary,
+              error: `moved, but the old cue point ${p.id} could not be deleted: ${errorMessage(r.reason)}`,
+            };
+      });
+      return batch ? { items: out } : out[0];
     },
   );
 
   tool(
     "cue_point_delete",
+    { title: "Delete cue point", annotations: DESTRUCTIVE },
     "Delete a cue point.",
     { cue_point_id: z.string() },
     async ({ cue_point_id }) => {
@@ -430,29 +2744,172 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  const MAX_ARRANGEMENT_CLIPS = 500;
+
+  tool(
+    "arrangement_get",
+    { title: "Get arrangement range", annotations: READ },
+    "What happens in the arrangement between start_time and end_time (beats; " +
+      "default: from 0 to the end of the song): the cue points in the range, and for " +
+      "every regular track (or only `tracks`) the arrangement clips that overlap it — " +
+      "clip summaries by start time, a clip overlaps when it starts before end_time " +
+      "and ends after start_time — plus, with include_take_lanes, each take lane's " +
+      "overlapping clips. `song_end` is derived: the latest end of any arrangement " +
+      "clip on a regular track (Live's API has no song length; take lanes and cue " +
+      "points do not count). At 4/4, bar n starts at beat (n - 1) × 4. At most " +
+      `${MAX_ARRANGEMENT_CLIPS} clips are listed: \`clip_count\` counts them all and ` +
+      "`truncated` says when some were left out.",
+    {
+      start_time: z.number().optional().describe("Range start in beats; default 0"),
+      end_time: z
+        .number()
+        .optional()
+        .describe("Range end in beats (exclusive); default: everything after start_time"),
+      tracks: z
+        .array(z.object(trackAddress()))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
+      include_take_lanes: z.boolean().default(false).describe("Also list each take lane's clips in the range"),
+    },
+    ({ start_time, end_time, tracks: list, include_take_lanes }) => {
+      const from = start_time ?? 0;
+      if (end_time !== undefined && end_time <= from)
+        throw new UsageError(`end_time ${end_time} must be after start_time ${from}.`);
+      const to = end_time ?? Infinity;
+      const regular = song().tracks;
+      const tracks = trackSelection(list, regular);
+      let songEnd = 0;
+      for (const track of regular) for (const clip of track.arrangementClips) songEnd = Math.max(songEnd, num(clip.endTime));
+      let listed = 0;
+      let total = 0;
+      const pick = (clips: Clip<"1.0.0">[]) => {
+        const hits = clipsInRange(clips, from, to);
+        const room = Math.max(0, MAX_ARRANGEMENT_CLIPS - listed);
+        total += hits.length;
+        listed += Math.min(room, hits.length);
+        return hits.slice(0, room).map((c) => clipSummary(c));
+      };
+      const rows = tracks.map((track) => ({
+        ...trackRow(track, regular),
+        clips: pick(track.arrangementClips),
+        take_lanes: include_take_lanes
+          ? track.takeLanes.map((lane, index) => ({
+              id: remember(lane),
+              name: lane.name,
+              index,
+              clips: pick(lane.clips),
+            }))
+          : undefined,
+      }));
+      const cuePoints = song()
+        .cuePoints.map(cuePointSummary)
+        .filter((c) => c.time >= from && c.time < to)
+        .sort((a, b) => a.time - b.time);
+      return {
+        start_time: from,
+        end_time: end_time ?? Math.max(songEnd, from),
+        song_end: songEnd,
+        cue_points: cuePoints,
+        tracks: rows,
+        clip_count: total,
+        truncated:
+          total > listed
+            ? `Only the first ${MAX_ARRANGEMENT_CLIPS} of ${total} clips are listed (tracks in order): ` +
+              "narrow the range or the tracks."
+            : undefined,
+      };
+    },
+  );
+
   // -- clips -----------------------------------------------------------------
+
+  // clip_create / clip_copy targets: a clip slot, a track (its arrangement, or
+  // with a scene address that scene's slot of the track), or a take lane.
+  function clipTarget(args: { target_id?: string } & TrackAddress & SceneAddress): DataModelObject<"1.0.0"> {
+    const target = findTarget(args);
+    if (!hasSceneAddress(args)) return target;
+    if (!(target instanceof Track))
+      throw new UsageError(`scene_index/scene_id/scene_name require a Track target, got ${classOf(target)}.`);
+    const { index } = findScene(args);
+    const slot = target.clipSlots[index];
+    if (!slot)
+      throw new UsageError(`scene_index ${index} out of range (track has ${target.clipSlots.length} slots).`);
+    return slot;
+  }
+
+  // The track a clip slot or take lane belongs to: its parent, or the track
+  // whose slots or lanes hold it; null when neither tells.
+  function holderTrack(obj: ClipSlot<"1.0.0"> | TakeLane<"1.0.0">): Track<"1.0.0"> | null {
+    const up = parentOf(obj);
+    if (up instanceof Track) return up;
+    const list = (t: Track<"1.0.0">) => (obj instanceof ClipSlot ? t.clipSlots : t.takeLanes);
+    return song().tracks.find((t) => indexIn(list(t), obj) >= 0) ?? null;
+  }
+
+  // A clip's markers and loop, in its own beats.
+  const regionOf = (clip: Clip<"1.0.0">): Region => ({
+    looping: clip.looping,
+    startMarker: num(clip.startMarker),
+    endMarker: num(clip.endMarker),
+    loopStart: num(clip.loopStart),
+    loopEnd: num(clip.loopEnd),
+  });
+
+  // Deletes a clip the way its parent allows (clip_delete, clip_copy move).
+  async function removeClip(clip: Clip<"1.0.0">) {
+    const parent = clip.parent;
+    if (parent instanceof ClipSlot) {
+      await parent.deleteClip();
+    } else if (parent instanceof Track) {
+      await parent.deleteClip(clip);
+    } else if (parent instanceof TakeLane && parent.parent instanceof Track) {
+      await (parent.parent as Track<"1.0.0">).deleteClip(clip);
+    } else {
+      throw new Error(`Cannot determine how to delete clip with parent ${parent ? classOf(parent) : "null"}.`);
+    }
+  }
 
   tool(
     "clip_create",
+    { title: "Create clip", annotations: CREATE },
     "Create a MIDI or audio clip. Target: a clip slot id (session view), a track " +
-      "id (arrangement — MidiTrack for midi, AudioTrack for audio; requires " +
-      "start_time — OR session view when scene_index is given), or a take lane id " +
+      "(target_id, or track_id/track_index/track_name; arrangement — MidiTrack for " +
+      "midi, AudioTrack for audio; requires start_time — OR the session slot of a " +
+      "scene when scene_index/scene_id/scene_name is given), or a take lane id " +
       "(requires start_time). MIDI clips require duration and can be created with " +
-      "their notes inline. Audio clips require file_path; by default the file is " +
-      "first imported into the Live project (recommended). Optional name/color " +
-      "apply right after creation.",
+      "their notes inline: `notes`, step `patterns` (one pitch per string, e.g. " +
+      "{note:\"C1\", steps:\"x...x...\"}) and `repeat` {length} to copy them along " +
+      "the clip (file_path, is_warped and loop_settings are ignored, with a `warning`). " +
+      "Audio clips require file_path; by default the file is first imported " +
+      "into the Live project (recommended). Optional name/color apply right " +
+      "after creation.",
     {
       type: z.enum(["midi", "audio"]),
-      target_id: z.string().describe("ClipSlot, Track, or TakeLane id"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("ClipSlot, Track, or TakeLane id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress(),
       scene_index: z
         .number()
         .int()
         .min(0)
         .optional()
         .describe("With a track target: create in this session clip slot instead of the arrangement"),
+      scene_id: z.string().optional().describe("With a track target: the session clip slot of this scene"),
+      scene_name: z
+        .string()
+        .optional()
+        .describe("With a track target: the session clip slot of the scene with this name"),
       start_time: z.number().optional().describe("Arrangement position in beats (track/take-lane targets)"),
       duration: z.number().positive().optional().describe("Clip length in beats"),
       notes: z.array(z.object(noteShape)).optional().describe("MIDI only: initial notes"),
+      patterns: z
+        .array(patternSchema())
+        .optional()
+        .describe("MIDI only: step patterns, written with the notes, e.g. a drum line per pad"),
+      repeat: repeatSchema().optional(),
       name: z.string().optional(),
       color: z.string().optional().describe("#RRGGBB"),
       file_path: z.string().optional().describe("Audio file path (audio clips only)"),
@@ -464,19 +2921,23 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         .describe("Audio only: copy the file into the Live project first"),
     },
     async (args) => {
-      let target = resolve(args.target_id, DataModelObject);
-      if (args.scene_index !== undefined) {
-        if (!(target instanceof Track))
-          throw new Error(`scene_index requires a Track target, got ${classOf(target)}.`);
-        const slot = target.clipSlots[args.scene_index];
-        if (!slot)
-          throw new Error(
-            `scene_index ${args.scene_index} out of range (track has ${target.clipSlots.length} slots).`,
-          );
-        target = slot;
+      // Audio-only fields on a MIDI clip are ignored, as they always were
+      // (callers may build both types from one template); the result says so.
+      let warning: string | undefined;
+      if (args.type === "midi") {
+        const audioOnly = (["file_path", "is_warped", "loop_settings"] as const).filter(
+          (k) => args[k] !== undefined,
+        );
+        if (audioOnly.length)
+          warning = `${audioOnly.join(", ")} only apply to audio clips: ignored for this MIDI clip.`;
+      } else {
+        const midiOnly = (["notes", "patterns", "repeat"] as const).filter((k) => args[k] !== undefined);
+        if (midiOnly.length) throw new UsageError(`${midiOnly.join(", ")} only apply to MIDI clips.`);
       }
+      const target = clipTarget(args);
       const need = (cond: unknown, what: string) => {
-        if (cond === undefined || cond === null) throw new Error(`${what} is required for this target/type.`);
+        if (cond === undefined || cond === null)
+          throw new UsageError(`${what} is required for this target/type.`);
       };
       const parsedColor = args.color !== undefined ? hexToColor(args.color) : undefined;
       const finish = (clip: Clip<"1.0.0">, extra?: Record<string, unknown>) => {
@@ -487,6 +2948,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
       if (args.type === "midi") {
         need(args.duration, "duration");
+        // every note is built (and checked) before the clip exists
+        const { notes } = noteList(args, args.duration!);
         let clip: MidiClip<"1.0.0">;
         if (target instanceof ClipSlot) {
           clip = await target.createMidiClip(args.duration!);
@@ -494,22 +2957,24 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           need(args.start_time, "start_time");
           clip = await target.createMidiClip(args.start_time!, args.duration!);
         } else {
-          throw new Error(
+          throw new UsageError(
             `MIDI clips need a ClipSlot, MidiTrack, or TakeLane target, got ${classOf(target)}.`,
           );
         }
-        if (args.notes?.length) clip.notes = args.notes.map(toNoteDescription);
-        return finish(clip);
+        if (notes.length) clip.notes = notes;
+        return finish(clip, { warning });
       }
 
       need(args.file_path, "file_path");
       // Validate the target before importing so a bad target doesn't leave an
       // orphan copy in the project folder.
       if (!(target instanceof ClipSlot) && !(target instanceof AudioTrack) && !(target instanceof TakeLane))
-        throw new Error(
+        throw new UsageError(
           `Audio clips need a ClipSlot, AudioTrack, or TakeLane target, got ${classOf(target)}.`,
         );
-      if (args.notes) throw new Error("notes only apply to MIDI clips.");
+      if (!(target instanceof ClipSlot)) need(args.start_time, "start_time");
+      if (args.loop_settings && args.is_warped === undefined)
+        throw new UsageError("is_warped is required when loop_settings is set.");
       const filePath = args.import_into_project
         ? await context.resources.importIntoProject(args.file_path!)
         : args.file_path!;
@@ -524,7 +2989,6 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       if (target instanceof ClipSlot) {
         clip = await target.createAudioClip({ filePath, isWarped: args.is_warped, loopSettings });
       } else {
-        need(args.start_time, "start_time");
         clip = await target.createAudioClip({
           filePath,
           startTime: args.start_time!,
@@ -539,170 +3003,949 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_get",
+    { title: "Get clip", annotations: READ },
     "Get full detail for one clip (MIDI: note count; audio: file, warp settings " +
-      "and warp markers). Use midi_clip_get_notes for the actual notes.",
+      "and warp markers) and its `location`: view 'session' (track, scene_index, " +
+      "scene and clip slot), 'arrangement' (track) or 'take_lane' (track and take " +
+      "lane). Use midi_clip_get_notes for the actual notes.",
     { clip_id: z.string() },
-    ({ clip_id }) => clipSummary(resolve(clip_id, Clip), true),
+    ({ clip_id }) => {
+      const clip = resolve(clip_id, Clip);
+      return { ...clipSummary(clip, true), location: locate(clip) };
+    },
   );
+
+  const clipProps = () => ({
+    name: z.string().optional(),
+    color: z.string().optional().describe("#RRGGBB"),
+    muted: z.boolean().optional(),
+    looping: z.boolean().optional(),
+    warping: z.boolean().optional().describe("Audio clips only"),
+    warp_mode: z.enum(WARP_MODES).optional().describe("Audio clips only"),
+  });
+  const CLIP_PROPS = Object.keys(clipProps());
+  type ClipProps = z.objectOutputType<ReturnType<typeof clipProps>, z.ZodTypeAny>;
+
+  // Validates one clip's changes and returns the setters, so that a batch can
+  // check every clip before the first write.
+  function clipWrites(clip: Clip<"1.0.0">, p: ClipProps): () => void {
+    const parsedColor = p.color !== undefined ? hexToColor(p.color) : undefined;
+    if ((p.warping !== undefined || p.warp_mode !== undefined) && !(clip instanceof AudioClip))
+      throw new UsageError("warping/warp_mode only apply to audio clips.");
+    return () => {
+      if (p.name !== undefined) clip.name = p.name;
+      if (parsedColor !== undefined) clip.color = parsedColor;
+      if (p.muted !== undefined) clip.muted = p.muted;
+      if (p.looping !== undefined) clip.looping = p.looping;
+      if (clip instanceof AudioClip) {
+        if (p.warping !== undefined) clip.warping = p.warping;
+        if (p.warp_mode !== undefined) clip.warpMode = WarpMode[p.warp_mode];
+      }
+    };
+  }
+
+  const CLIP_SCOPES = ["all", "session", "arrangement", "take_lanes"] as const;
+
+  // A track's clips in the given scope; a clip listed twice counts once.
+  function clipsOf(track: Track<"1.0.0">, scope: (typeof CLIP_SCOPES)[number], nameContains?: string) {
+    const want = (s: string) => scope === "all" || scope === s;
+    const all = [
+      ...(want("session") ? track.clipSlots.flatMap((s) => s.clip ?? []) : []),
+      ...(want("arrangement") ? track.arrangementClips : []),
+      ...(want("take_lanes") ? track.takeLanes.flatMap((l) => l.clips) : []),
+    ];
+    const seen = new Set<bigint>();
+    const q = nameContains?.toLowerCase();
+    return all.filter((c) => {
+      if (seen.has(c.handle.id)) return false;
+      seen.add(c.handle.id);
+      return q === undefined || c.name.toLowerCase().includes(q);
+    });
+  }
 
   tool(
     "clip_set",
+    { title: "Set clip properties", annotations: SET },
     "Set clip properties. color is '#RRGGBB'. warping/warp_mode apply to audio " +
-      "clips only. Note: enabling looping on an unwarped audio clip enables warping.",
+      "clips only. Note: enabling looping on an unwarped audio clip enables warping. " +
+      "Address one clip by clip_id; several by `items` (one entry per clip, each " +
+      "with its own values); or every clip of one track by `select` {track_id | " +
+      "track_index | track_name, scope, name_contains} with the values at the top " +
+      "level, e.g. warp all clips of the Drums track. All changes form one undo " +
+      "step; nothing is changed if any clip is invalid.",
     {
-      clip_id: z.string(),
-      name: z.string().optional(),
-      color: z.string().optional(),
-      muted: z.boolean().optional(),
-      looping: z.boolean().optional(),
-      warping: z.boolean().optional(),
-      warp_mode: z.enum(WARP_MODES).optional(),
+      clip_id: z.string().optional(),
+      ...clipProps(),
+      items: z
+        .array(z.object({ clip_id: z.string(), ...clipProps() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per clip; returns {items}"),
+      select: z
+        .object({
+          ...trackAddress(),
+          scope: z
+            .enum(CLIP_SCOPES)
+            .default("all")
+            .describe("session slots, arrangement, take lanes, or all of them"),
+          name_contains: z
+            .string()
+            .optional()
+            .describe("Only clips whose name contains this (case-insensitive)"),
+        })
+        .optional()
+        .describe("Apply the top-level values to the matching clips of one track; returns {items}"),
     },
-    ({ clip_id, name, color, muted, looping, warping, warp_mode }) => {
-      const clip = resolve(clip_id, Clip);
-      // Validate everything before the first setter runs — each setter is its
-      // own host transaction, so a late throw would leave partial changes.
-      const parsedColor = color !== undefined ? hexToColor(color) : undefined;
-      if ((warping !== undefined || warp_mode !== undefined) && !(clip instanceof AudioClip))
-        throw new Error("warping/warp_mode only apply to audio clips.");
-      if (name !== undefined) clip.name = name;
-      if (parsedColor !== undefined) clip.color = parsedColor;
-      if (muted !== undefined) clip.muted = muted;
-      if (looping !== undefined) clip.looping = looping;
-      if (clip instanceof AudioClip) {
-        if (warping !== undefined) clip.warping = warping;
-        if (warp_mode !== undefined) clip.warpMode = WarpMode[warp_mode];
+    (args) => {
+      let plan: Array<{ clip: Clip<"1.0.0">; write: () => void }>;
+      let writes = true; // false only for a single clip_id with nothing to set
+      let batch: boolean;
+      if (args.select) {
+        if (args.clip_id !== undefined || args.items)
+          throw new UsageError("Give one of clip_id, items, or select.");
+        if (!given(args, CLIP_PROPS))
+          throw new UsageError(`Nothing to set — give ${CLIP_PROPS.join(", ")}.`);
+        const { scope, name_contains, ...address } = args.select;
+        batch = true;
+        plan = clipsOf(findTrack(address), scope, name_contains).map((clip) =>
+          at(() => `clip ${remember(clip)} (${JSON.stringify(clip.name)})`, () => ({
+            clip,
+            write: clipWrites(clip, args),
+          })),
+        );
+      } else {
+        const e = entries(args, args.items, ["clip_id", ...CLIP_PROPS]);
+        batch = e.batch;
+        plan = e.list.map((it, i) =>
+          at(itemLabel(batch, i), () => {
+            if (it.clip_id === undefined) throw new UsageError("Provide clip_id, items, or select.");
+            const clip = resolve(it.clip_id, Clip);
+            if (!given(it, CLIP_PROPS)) {
+              if (batch) throw new UsageError(`nothing to set — give ${CLIP_PROPS.join(", ")}.`);
+              writes = false;
+            }
+            return { clip, write: clipWrites(clip, it) };
+          }),
+        );
       }
-      return clipSummary(clip);
+      // Validation is done: apply every clip's setters as one undo step.
+      if (plan.length && writes)
+        context.withinTransaction(() => {
+          for (const { write } of plan) write();
+        });
+      const out = plan.map(({ clip }) => clipSummary(clip));
+      return batch ? { items: out } : out[0];
     },
   );
 
   tool(
     "clip_delete",
+    { title: "Delete clip", annotations: DESTRUCTIVE },
     "Delete a clip (session or arrangement). The clip's parent determines how it " +
       "is removed.",
     { clip_id: z.string() },
     async ({ clip_id }) => {
-      const clip = resolve(clip_id, Clip);
-      const parent = clip.parent;
-      if (parent instanceof ClipSlot) {
-        await parent.deleteClip();
-      } else if (parent instanceof Track) {
-        await parent.deleteClip(clip);
-      } else if (parent instanceof TakeLane && parent.parent instanceof Track) {
-        await (parent.parent as Track<"1.0.0">).deleteClip(clip);
-      } else {
-        throw new Error(`Cannot determine how to delete clip with parent ${parent ? classOf(parent) : "null"}.`);
-      }
+      await removeClip(resolve(clip_id, Clip));
       return { deleted: clip_id };
     },
   );
 
+  // -- copying clips (clip_copy, arrangement_copy_range) --------------------
+
+  // What a copy cannot carry over: Live's API cannot read these.
+  const CLIP_COPY_LOST = [
+    "clip envelopes (automation and modulation)",
+    "groove, launch settings and follow actions",
+  ];
+  const AUDIO_COPY_LOST = [
+    ...CLIP_COPY_LOST,
+    "clip gain, transpose and fades (not in Live's API)",
+    "warp markers: Live warps the copy itself (from the file's .asd analysis or its Auto-Warp " +
+      "preference), so the same beat positions can map to other audio — see warp_markers_match",
+  ];
+  const MIN_LOOP_BEATS = 0.25; // ClipLoopSettings: a loop is at least one 16th note
+
+  // A new audio clip from a source clip: its file and warping, and its markers
+  // and loop as ClipLoopSettings allow them for a new clip (index.d.mts
+  // ClipLoopSettings). Where they do not, the copy starts with the file's own
+  // region, and `lost` says so. Warp markers cannot be set at all.
+  function audioCopySpec(source: AudioClip<"1.0.0">) {
+    const filePath = source.filePath;
+    if (!filePath) throw new Error(`Audio clip ${remember(source)} has no file path, so it cannot be copied.`);
+    const isWarped = source.warping;
+    const r = regionOf(source);
+    const lost = [...AUDIO_COPY_LOST];
+    // an unwarped clip cannot loop (looping enables warping)
+    let looping = r.looping && isWarped;
+    if (looping && r.loopEnd - r.loopStart < MIN_LOOP_BEATS) {
+      looping = false;
+      lost.push("the loop: it is shorter than 0.25 beats, the shortest a new clip allows");
+    }
+    const loopSettings: ClipLoopSettings = {
+      looping,
+      startMarker: r.startMarker,
+      endMarker: r.endMarker,
+      loopStart: looping ? r.loopStart : r.startMarker,
+      loopEnd: looping ? r.loopEnd : r.endMarker,
+    };
+    const positions = [loopSettings.startMarker, loopSettings.endMarker, loopSettings.loopStart, loopSettings.loopEnd];
+    const allowed =
+      loopSettings.startMarker <= loopSettings.endMarker &&
+      loopSettings.loopEnd - loopSettings.loopStart >= MIN_LOOP_BEATS &&
+      (isWarped || positions.every((v) => v >= 0));
+    if (!allowed) lost.push("the start/end markers and loop (a new clip cannot have them): the copy plays the file's own region");
+    return {
+      filePath,
+      isWarped,
+      loopSettings: allowed ? loopSettings : undefined,
+      warpMode: num(source.warpMode),
+      warpMarkers: isWarped ? source.warpMarkers : undefined,
+      lost,
+    };
+  }
+  type AudioCopySpec = ReturnType<typeof audioCopySpec>;
+
+  const sameWarpMarkers = (a: WarpMarker[], b: WarpMarker[]) =>
+    a.length === b.length &&
+    a.every((m, i) => num(m.beatTime) === num(b[i].beatTime) && num(m.sampleTime) === num(b[i].sampleTime));
+
+  // How an audio copy came out compared with its spec: whether Live warped it
+  // like the source, and which region fields (and, in the arrangement, the
+  // length) differ from what was asked.
+  function audioCopyCheck(copy: AudioClip<"1.0.0">, spec: AudioCopySpec, length?: number) {
+    const want = spec.loopSettings;
+    const got = regionOf(copy);
+    const differs: Array<{ field: string; requested: number | boolean; got: number | boolean }> = want
+      ? (["looping", "startMarker", "endMarker", "loopStart", "loopEnd"] as const)
+          .filter((k) => got[k] !== want[k])
+          .map((k) => ({ field: k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`), requested: want[k], got: got[k] }))
+      : [];
+    const duration = num(copy.duration);
+    if (length !== undefined && Math.abs(duration - length) > 1e-9)
+      differs.push({ field: "duration", requested: length, got: duration });
+    return {
+      warp_markers_match: spec.warpMarkers ? sameWarpMarkers(copy.warpMarkers, spec.warpMarkers) : undefined,
+      differs: differs.length ? differs : undefined,
+    };
+  }
+
+  // The properties a copy takes over (or is given), set after it exists.
+  type CopyProps = { name: string; color: number; muted: boolean; looping: boolean };
+  function applyCopyProps(copy: Clip<"1.0.0">, p: CopyProps, notes?: NoteDescription[], warpMode?: number) {
+    if (notes?.length && copy instanceof MidiClip) copy.notes = notes;
+    if (copy.name !== p.name) copy.name = p.name;
+    if (num(copy.color) !== p.color) copy.color = p.color;
+    if (copy.muted !== p.muted) copy.muted = p.muted;
+    // a MIDI copy holds its notes unrolled from 0, so its own loop flag only
+    // decides whether it repeats when it is played past its end (session)
+    if (copy instanceof MidiClip && copy.looping !== p.looping) copy.looping = p.looping;
+    if (copy instanceof AudioClip && warpMode !== undefined && copy.warping && num(copy.warpMode) !== warpMode)
+      copy.warpMode = warpMode;
+  }
+
+  tool(
+    "clip_copy",
+    { title: "Copy or move clip", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Copy a clip to a session slot, an arrangement position or a take lane, or move it there " +
+      "(move:true deletes the source once the copy exists). Live's API has no clip copy or " +
+      "move, so a new clip is created. Target as in clip_create: a clip slot id (target_id, or " +
+      "a track with scene_index/scene_id/scene_name; the slot must be empty), or a track or " +
+      "take lane id with start_time (beats). MIDI clips go to MIDI tracks, audio clips to " +
+      "audio tracks. `duration` sets the copy's length (default: the source's `duration`); a " +
+      "longer MIDI copy repeats the source's loop (or its region, when it does not loop), a " +
+      "longer audio copy only repeats a looping source (Live caps the others). MIDI: the notes are " +
+      "re-based to where the source plays them — the copy starts at its first played beat, " +
+      "since the API cannot set a MIDI clip's markers or loop — and `fidelity` is 'notes'. " +
+      "In the arrangement the copy plays the same. A session copy of a looping clip loops " +
+      "its whole length, so it only repeats like the source when the source's start marker " +
+      "is inside its loop and the copy holds whole loops; otherwise `lost` says what differs. " +
+      "A session MIDI source's default length comes from its markers (its first pass: any " +
+      "part before the loop, then the loop once). Audio: the copy uses the source's file, " +
+      "warping, warp mode and markers/loop (as Live allows them for a new clip); Live warps it itself, so " +
+      "`fidelity` is 'approximate', `warp_markers_match` says whether it warped like the " +
+      "source and `differs` lists region fields (or the length) Live set otherwise. `lost` lists what no copy " +
+      "carries over (envelopes, groove, launch settings, ...). name and color default to the " +
+      "source's. An arrangement copy over existing clips reports them in `overlaps`. Undo " +
+      "steps: create, notes and properties, delete (move). If the copy cannot be created, " +
+      "nothing is changed.",
+    {
+      clip_id: z.string().describe("The clip to copy or move"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("ClipSlot, Track or TakeLane id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress(),
+      scene_index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("With a track target: copy to this session clip slot instead of the arrangement"),
+      scene_id: z.string().optional().describe("With a track target: the session clip slot of this scene"),
+      scene_name: z.string().optional().describe("With a track target: the session clip slot of the scene with this name"),
+      start_time: z.number().min(0).optional().describe("Arrangement position in beats (track and take-lane targets)"),
+      duration: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Length of the copy in beats; default the source's. Longer: the source's loop (or a MIDI region) repeats"),
+      name: z.string().optional().describe("Name of the copy; default the source's"),
+      color: z.string().optional().describe("#RRGGBB; default the source's"),
+      move: z.boolean().default(false).describe("Delete the source once the copy exists"),
+    },
+    async (args) => {
+      const source = resolve(args.clip_id, Clip);
+      if (!(source instanceof MidiClip) && !(source instanceof AudioClip))
+        throw new UsageError(`Clip ${args.clip_id} is neither a MIDI nor an audio clip.`);
+      const midi = source instanceof MidiClip;
+      const color = args.color !== undefined ? hexToColor(args.color) : undefined;
+
+      // Validate the target before anything is created.
+      const target = clipTarget(args);
+      let holder: Track<"1.0.0"> | null;
+      if (target instanceof ClipSlot) {
+        if (args.start_time !== undefined)
+          throw new UsageError("start_time only applies to arrangement and take-lane targets, not a clip slot.");
+        if (!midi && args.duration !== undefined)
+          throw new UsageError("An audio copy in a clip slot takes no duration: its length follows the source's markers.");
+        const occupant = target.clip;
+        if (occupant)
+          throw new UsageError(
+            occupant.handle.id === source.handle.id
+              ? "The target is the clip's own slot."
+              : `The target slot already holds clip ${remember(occupant)} (${quote(occupant.name)}): ` +
+                  "delete it first or pick an empty slot.",
+          );
+        holder = holderTrack(target);
+      } else if (target instanceof Track || target instanceof TakeLane) {
+        if (args.start_time === undefined)
+          throw new UsageError("start_time is required for arrangement and take-lane targets.");
+        holder = target instanceof Track ? target : holderTrack(target);
+      } else {
+        throw new UsageError(`Clips can be copied to a ClipSlot, Track or TakeLane, got ${classOf(target)}.`);
+      }
+      const kind = midi ? "MIDI" : "audio";
+      const fits = (t: Track<"1.0.0">) => (midi ? t instanceof MidiTrack : t instanceof AudioTrack);
+      if ((target instanceof Track || holder) && !fits(holder!))
+        throw new UsageError(
+          `A ${kind} clip can only be copied to a ${kind} track; ${describeTrack(holder!)} is of type ` +
+            `${trackKind(holder!)}.`,
+        );
+      const home = parentOf(source);
+      const region = regionOf(source);
+      const length =
+        args.duration ?? (midi && home instanceof ClipSlot ? sessionClipLength(region) : num(source.duration));
+      if (!(length > 0)) throw new Error(`Clip ${args.clip_id} has no length (${length} beats), so it cannot be copied.`);
+      const start = args.start_time ?? 0;
+      if (
+        args.move &&
+        !(target instanceof ClipSlot) &&
+        home?.handle.id === target.handle.id &&
+        num(source.startTime) === start &&
+        length === num(source.duration)
+      )
+        return {
+          ...clipSummary(source, true),
+          location: locate(source),
+          source_id: args.clip_id,
+          moved: false,
+          unchanged: "the clip is already there",
+        };
+
+      // Everything the copy needs is read before the first write.
+      const props: CopyProps = {
+        name: args.name ?? source.name,
+        color: color ?? num(source.color),
+        muted: source.muted,
+        looping: region.looping,
+      };
+      const notes = source instanceof MidiClip ? renderNotes(source.notes, region, 0, length, MAX_EXPANDED_NOTES) : undefined;
+      const spec = source instanceof AudioClip ? audioCopySpec(source) : undefined;
+      const loopMismatch = midi && target instanceof ClipSlot ? sessionLoopMismatch(region, length) : undefined;
+      const laneClips = target instanceof Track ? target.arrangementClips : target instanceof TakeLane ? target.clips : [];
+      const overlaps = clipsInRange(laneClips, start, start + length)
+        .filter((c) => !(args.move && c.handle.id === source.handle.id))
+        .map((c) => remember(c));
+
+      let copy: Clip<"1.0.0">;
+      try {
+        if (spec) {
+          const { filePath, isWarped, loopSettings } = spec;
+          copy =
+            target instanceof ClipSlot
+              ? await target.createAudioClip({ filePath, isWarped, loopSettings })
+              : await (target as AudioTrack<"1.0.0"> | TakeLane<"1.0.0">).createAudioClip({
+                  filePath,
+                  startTime: start,
+                  duration: length,
+                  isWarped,
+                  loopSettings,
+                });
+        } else {
+          copy =
+            target instanceof ClipSlot
+              ? await target.createMidiClip(length)
+              : await (target as MidiTrack<"1.0.0"> | TakeLane<"1.0.0">).createMidiClip(start, length);
+        }
+      } catch (e) {
+        throw new Error(`Could not create the copy: ${errorMessage(e)} Nothing was changed.`);
+      }
+      // The copy exists: from here on a failure is reported, not thrown.
+      let error: string | undefined;
+      try {
+        context.withinTransaction(() => applyCopyProps(copy, props, notes, spec?.warpMode));
+      } catch (e) {
+        error = `the copy ${remember(copy)} was created, but its notes or properties could not be set: ${errorMessage(e)}`;
+      }
+      let moved = false;
+      if (args.move && error) {
+        error += "; the source was kept";
+      } else if (args.move) {
+        try {
+          await removeClip(source);
+          moved = true;
+        } catch (e) {
+          error = `copied, but the source ${args.clip_id} could not be deleted: ${errorMessage(e)}`;
+        }
+      }
+      return {
+        ...clipSummary(copy, true),
+        location: locate(copy),
+        source_id: args.clip_id,
+        moved,
+        fidelity: spec ? "approximate" : "notes",
+        lost: spec ? spec.lost : loopMismatch ? [...CLIP_COPY_LOST, loopMismatch] : CLIP_COPY_LOST,
+        ...(spec && copy instanceof AudioClip
+          ? audioCopyCheck(copy, spec, target instanceof ClipSlot ? undefined : length)
+          : {}),
+        overlaps: overlaps.length ? overlaps : undefined,
+        error,
+      };
+    },
+  );
+
+  tool(
+    "arrangement_copy_range",
+    { title: "Copy arrangement range", annotations: DESTRUCTIVE },
+    "Copy a stretch of the arrangement to another position, e.g. \"repeat the chorus\": the " +
+      "clips of every audio and MIDI track (or only `tracks`) between start_time and end_time " +
+      "(beats) are copied to to_time, OVERWRITING what is there: the target range is cleared " +
+      "first on every selected track (as track_clear_clips_in_range does: clips crossing its " +
+      "edges are shortened), even where the source range is empty. Live's API cannot insert " +
+      "time, so nothing moves later. MIDI clips crossing the source range's edges are trimmed to " +
+      "it (notes re-based, as in clip_copy; notes starting before the range are left out); " +
+      "audio clips crossing an edge cannot be trimmed and are skipped and listed in `skipped`. " +
+      "Audio copies are approximate as in clip_copy (see `lost`). Take-lane clips are not " +
+      "copied (counted in take_lane_clips_not_copied). include_cue_points also copies the cue " +
+      "points in the range, except onto a beat that already has one. The ranges must not " +
+      "overlap. Undo steps: clear, create, notes and properties, then cue points (create, " +
+      "name). Once the range is cleared, a copy that fails is reported per clip.",
+    {
+      start_time: z.number().min(0).describe("Start of the range to copy, in beats"),
+      end_time: z.number().describe("End of the range to copy (exclusive), in beats"),
+      to_time: z.number().min(0).describe("Where the copy starts, in beats"),
+      tracks: z
+        .array(z.object(trackAddress()))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every audio and MIDI track"),
+      include_cue_points: z
+        .boolean()
+        .default(false)
+        .describe("Also copy the cue points in the range (not onto a beat that already has one)"),
+    },
+    async ({ start_time: from, end_time: to, to_time: dest, tracks: list, include_cue_points }) => {
+      if (!(to > from)) throw new UsageError(`end_time ${to} must be after start_time ${from}.`);
+      const length = to - from;
+      if (overlapsRange(dest, dest + length, from, to))
+        throw new UsageError(
+          `The target range ${dest}-${dest + length} overlaps the source range ${from}-${to}: copy it ` +
+            "to a position at least end_time - start_time beats away.",
+        );
+      const regular = song().tracks;
+      const holdsClips = (t: Track<"1.0.0">) => t instanceof AudioTrack || t instanceof MidiTrack;
+      const tracks = list ? trackSelection(list, regular) : regular.filter(holdsClips);
+      for (const t of tracks)
+        if (!holdsClips(t))
+          throw new UsageError(
+            `${describeTrack(t)} is a ${trackKind(t, regular)} track: only audio and MIDI tracks have arrangement clips.`,
+          );
+
+      // Snapshot the source range before the first write.
+      type Plan = {
+        track: Track<"1.0.0">;
+        sourceId: string;
+        start: number;
+        length: number;
+        trimmed: boolean;
+        props: CopyProps;
+        notes?: NoteDescription[];
+        spec?: AudioCopySpec;
+      };
+      let noteTotal = 0;
+      const rows = tracks.map((track) => {
+        const plans: Plan[] = [];
+        const skipped: Array<{ source_id: string; name: string; start_time: number; end_time: number; reason: string }> = [];
+        for (const clip of clipsInRange(track.arrangementClips, from, to)) {
+          const cs = num(clip.startTime);
+          const ce = num(clip.endTime);
+          const a = Math.max(cs, from);
+          const b = Math.min(ce, to);
+          const trimmed = a > cs + 1e-9 || b < ce - 1e-9;
+          const region = regionOf(clip);
+          const base = {
+            track,
+            sourceId: remember(clip),
+            start: dest + (a - from),
+            length: b - a,
+            trimmed,
+            props: { name: clip.name, color: num(clip.color), muted: clip.muted, looping: region.looping },
+          };
+          const skip = (reason: string) =>
+            skipped.push({ source_id: base.sourceId, name: clip.name, start_time: cs, end_time: ce, reason });
+          if (clip instanceof MidiClip) {
+            const notes = renderNotes(clip.notes, region, a - cs, b - a, MAX_EXPANDED_NOTES);
+            noteTotal += notes.length;
+            plans.push({ ...base, notes });
+          } else if (!(clip instanceof AudioClip)) {
+            skip(`a ${classOf(clip)} cannot be copied`);
+          } else if (trimmed) {
+            skip(
+              "the audio clip crosses the edge of the range, and an audio copy cannot be trimmed (Live's API " +
+                "cannot set a clip's markers after creation): copy a range that contains it whole",
+            );
+          } else {
+            try {
+              plans.push({ ...base, spec: audioCopySpec(clip) });
+            } catch (e) {
+              skip(errorMessage(e));
+            }
+          }
+        }
+        const laneClips = track.takeLanes.reduce((n, lane) => n + clipsInRange(lane.clips, from, to).length, 0);
+        return { track, plans, skipped, laneClips };
+      });
+      if (noteTotal > MAX_EXPANDED_NOTES)
+        throw new UsageError(`The copy would write ${noteTotal} notes; at most ${MAX_EXPANDED_NOTES} are allowed.`);
+      const existingCues = song().cuePoints.map((c) => ({ c, time: num(c.time) }));
+      const taken = new Set(existingCues.map((x) => x.time));
+      const cueSources = include_cue_points
+        ? existingCues.filter((x) => x.time >= from && x.time < to).sort((p, q) => p.time - q.time)
+        : [];
+      const cueCopies = cueSources.filter((x) => !taken.has(x.time + dest - from));
+
+      // 1. Clear the target range on every track (one undo step).
+      const cleared = tracks.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(tracks.map((t) => t.clearClipsInRange(dest, dest + length))),
+          )
+        : [];
+      if (cleared.length && cleared.every((r) => r.status === "rejected"))
+        throw new Error(
+          `Could not clear the target range: ${errorMessage((cleared[0] as PromiseRejectedResult).reason)} Nothing was changed.`,
+        );
+      // 2. Create the copies on the cleared tracks (one undo step).
+      const work = rows.flatMap((row, i) => (cleared[i].status === "fulfilled" ? row.plans : []));
+      const created = work.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(
+              work.map((p) =>
+                p.spec
+                  ? (p.track as AudioTrack<"1.0.0">).createAudioClip({
+                      filePath: p.spec.filePath,
+                      startTime: p.start,
+                      duration: p.length,
+                      isWarped: p.spec.isWarped,
+                      loopSettings: p.spec.loopSettings,
+                    })
+                  : (p.track as MidiTrack<"1.0.0">).createMidiClip(p.start, p.length),
+              ),
+            ),
+          )
+        : [];
+      // 3. Their notes and properties (one undo step).
+      const outcome = new Map<Plan, { copy?: Clip<"1.0.0">; error?: string }>();
+      work.forEach((p, k) => {
+        const r = created[k];
+        outcome.set(
+          p,
+          r.status === "fulfilled" ? { copy: r.value } : { error: `could not be created: ${errorMessage(r.reason)}` },
+        );
+      });
+      if ([...outcome.values()].some((o) => o.copy))
+        context.withinTransaction(() => {
+          for (const [p, o] of outcome) {
+            if (!o.copy) continue;
+            try {
+              applyCopyProps(o.copy, p.props, p.notes, p.spec?.warpMode);
+            } catch (e) {
+              o.error = `was created, but its notes or properties could not be set: ${errorMessage(e)}`;
+            }
+          }
+        });
+      // 4. Cue points (create, then name).
+      let cuePoints: unknown[] | undefined;
+      const errors: string[] = [];
+      if (include_cue_points) {
+        const skippedCues = cueSources
+          .filter((x) => !cueCopies.includes(x))
+          .map((x) => ({
+            source_id: remember(x.c),
+            name: x.c.name,
+            time: x.time + dest - from,
+            skipped: "a cue point is already at that beat",
+          }));
+        let made: Array<Record<string, unknown>> = [];
+        if (cueCopies.length) {
+          try {
+            const results = await createBatch(
+              cueCopies.map((x) => ({ name: x.c.name })),
+              (i) => song().createCuePoint(cueCopies[i].time + dest - from),
+            );
+            made = results.map((r, i) => ({
+              source_id: remember(cueCopies[i].c),
+              ...(r.created ? cuePointSummary(r.created) : {}),
+              error: r.error,
+            }));
+          } catch (e) {
+            errors.push(`cue points: ${errorMessage(e)}`);
+          }
+        }
+        cuePoints = [...made, ...skippedCues];
+      }
+
+      let copied = 0;
+      const out = rows.map((row, i) => {
+        const clearError = cleared[i].status === "rejected" ? errorMessage((cleared[i] as PromiseRejectedResult).reason) : undefined;
+        if (clearError) errors.push(`${describeTrack(row.track)}: the target range could not be cleared: ${clearError}`);
+        const copies = clearError
+          ? []
+          : row.plans.map((p) => {
+              const o = outcome.get(p)!;
+              if (o.copy && !o.error) copied++;
+              if (o.error) errors.push(`${describeTrack(row.track)}: the copy of clip ${p.sourceId} ${o.error}`);
+              return {
+                source_id: p.sourceId,
+                ...(o.copy ? { id: remember(o.copy), name: o.copy.name } : {}),
+                start_time: o.copy ? num(o.copy.startTime) : p.start,
+                end_time: o.copy ? num(o.copy.endTime) : p.start + p.length,
+                trimmed: p.trimmed || undefined,
+                ...(p.spec && o.copy instanceof AudioClip ? audioCopyCheck(o.copy, p.spec, p.length) : {}),
+                error: o.error,
+              };
+            });
+        return {
+          ...trackRow(row.track, regular),
+          cleared: !clearError,
+          copies,
+          skipped: row.skipped.length ? row.skipped : undefined,
+        };
+      });
+      const laneClips = rows.reduce((n, r) => n + r.laneClips, 0);
+      return {
+        source: { start_time: from, end_time: to },
+        target: { start_time: dest, end_time: dest + length },
+        tracks: out,
+        copied_count: copied,
+        skipped_count: rows.reduce((n, r) => n + r.skipped.length, 0),
+        lost: work.some((p) => p.spec) ? AUDIO_COPY_LOST : CLIP_COPY_LOST,
+        take_lane_clips_not_copied: laneClips || undefined,
+        cue_points: cuePoints,
+        errors: errors.length ? errors : undefined,
+      };
+    },
+  );
+
+  // -- MIDI notes ------------------------------------------------------------
+
+  function resolveScale(spec: ScaleSpec): Scale {
+    const classes = (intervals: number[]) =>
+      [...new Set(intervals.map((i) => pitchClass(i, 0)))].sort((a, b) => a - b);
+    if (spec !== "song")
+      return { root_note: parsePitchClass(spec.root, "snap_to_scale.root"), intervals: classes(spec.intervals) };
+    const s = song();
+    const intervals = classes(s.scaleIntervals.map(num));
+    if (!intervals.length) throw new Error("Live reported no intervals for the song's scale.");
+    return { root_note: num(s.rootNote), intervals, name: s.scaleName };
+  }
+
+  // Live's grid setting in beats. Song has no time signature, so a bar is the
+  // first scene's (4/4 without scenes).
+  const GRID_BEATS: Record<string, number> = {
+    Half: 2,
+    Quarter: 1,
+    Eighth: 0.5,
+    Sixteenth: 0.25,
+    ThirtySecond: 0.125,
+  };
+  const GRID_BARS: Record<string, number> = { EightBars: 8, FourBars: 4, TwoBars: 2, Bar: 1 };
+  function songGrid() {
+    const s = song();
+    const quantization = gridName(s.gridQuantization);
+    const isTriplet = s.gridIsTriplet;
+    const scene = s.scenes[0];
+    const bar = scene ? (num(scene.signatureNumerator) * 4) / num(scene.signatureDenominator) : 4;
+    const bars = GRID_BARS[quantization];
+    const beats = GRID_BEATS[quantization] ?? (bars === undefined ? undefined : bars * bar);
+    if (beats === undefined)
+      throw new UsageError(
+        `Live's grid is ${quantization === "NoGrid" ? "off" : quote(String(quantization))}: ` +
+          'give the grid in beats instead of "song".',
+      );
+    return { beats: isTriplet ? (beats * 2) / 3 : beats, quantization, is_triplet: isTriplet };
+  }
+
   tool(
     "midi_clip_get_notes",
-    "Get all MIDI notes of a clip. Times/durations in beats relative to clip start.",
-    { clip_id: z.string() },
-    ({ clip_id }) => {
-      const notes = resolve(clip_id, MidiClip).notes;
+    { title: "Get MIDI notes", annotations: READ },
+    "Get the MIDI notes of a clip. Times/durations in beats relative to clip start. " +
+      "`select` returns only the matching notes (pitch range, also as note names like " +
+      "\"C1\"; start time range; in_scale against the song's scale; every_nth; " +
+      "only_selected: the notes the user selected in Live, when Live reports them — " +
+      "unverified, a `warning` says when it reported no selection). Notes carry " +
+      "`selected` when Live reports it. format \"compact\" returns each note as " +
+      "[pitch, start_time, duration, velocity], plus an object of its other fields " +
+      "that differ from `defaults`: several times smaller for dense clips.",
+    {
+      clip_id: z.string(),
+      select: noteSelectSchema().optional().describe("Only the notes matching every given filter"),
+      only_selected: z.boolean().optional().describe("Same as select.only_selected"),
+      format: z
+        .enum(["full", "compact"])
+        .default("full")
+        .describe("full: one object per note; compact: one tuple per note"),
+    },
+    ({ clip_id, select, only_selected, format }) => {
+      const sel: NoteSelect = { ...select, only_selected: only_selected || select?.only_selected };
+      const scale = sel.in_scale !== undefined ? resolveScale("song") : undefined;
+      const matches = noteFilter(sel, scale);
+      const all = resolve(clip_id, MidiClip).notes;
+      const mask = matches(all);
+      const notes = all.filter((_, i) => mask[i]).map(noteOut);
       return {
         note_count: notes.length,
-        notes: notes.map((n) => ({
-          pitch: num(n.pitch),
-          start_time: num(n.startTime),
-          duration: num(n.duration),
-          velocity: n.velocity === undefined ? undefined : num(n.velocity),
-          muted: n.muted,
-          probability: n.probability === undefined ? undefined : num(n.probability),
-          velocity_deviation: n.velocityDeviation === undefined ? undefined : num(n.velocityDeviation),
-          release_velocity: n.releaseVelocity === undefined ? undefined : num(n.releaseVelocity),
-        })),
+        total_note_count: select !== undefined || only_selected ? all.length : undefined,
+        scale,
+        warning: sel.only_selected ? selectionWarning(all) : undefined,
+        ...(format === "compact" ? compactNotes(notes) : { notes }),
       };
     },
   );
 
   tool(
     "midi_clip_set_notes",
+    { title: "Write MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
     "Write notes to a MIDI clip. mode 'replace' (default) replaces ALL notes; " +
       "mode 'merge' adds the given notes on top of the existing ones (layering " +
-      "without re-sending the current content). For mechanical edits of existing " +
-      "notes (transpose, shift, quantize, ...) prefer midi_clip_edit_notes.",
+      "without re-sending the current content). Pitches are 0-127 or note names " +
+      "(C3 = 60). Shortcuts: `patterns` writes one pitch per string, e.g. " +
+      "{note:\"F#1\", steps:\"x.x.x.x.\", step:0.25} (\"X\" = accent), and `repeat` " +
+      "{length, times?} copies the notes and patterns every `length` beats, filling " +
+      "the clip (to its loop end when looping) when times is omitted. For mechanical " +
+      "edits of existing notes (transpose, shift, quantize, ...) prefer midi_clip_edit_notes.",
     {
       clip_id: z.string(),
-      notes: z.array(z.object(noteShape)),
+      notes: z
+        .array(z.object(noteShape))
+        .optional()
+        .describe("Notes to write; [] in mode replace clears the clip"),
+      patterns: z.array(patternSchema()).optional().describe("Step patterns, written with the notes"),
+      repeat: repeatSchema().optional(),
       mode: z.enum(["replace", "merge"]).default("replace"),
     },
-    ({ clip_id, notes, mode }) => {
-      const clip = resolve(clip_id, MidiClip);
-      const incoming = notes.map(toNoteDescription);
-      clip.notes = mode === "merge" ? [...clip.notes, ...incoming] : incoming;
-      return { note_count: mode === "merge" ? undefined : notes.length, added: mode === "merge" ? notes.length : undefined };
+    (args) => {
+      if (args.notes === undefined && args.patterns === undefined)
+        throw new UsageError("Give notes and/or patterns (notes: [] with mode replace clears the clip).");
+      const clip = resolve(args.clip_id, MidiClip);
+      // Filling needs the clip's end, in the same clip beats as note times.
+      const fill = args.repeat !== undefined && args.repeat.times === undefined;
+      const end = fill ? num(clip.looping ? clip.loopEnd : clip.endMarker) : Infinity;
+      const { notes, copies } = noteList(args, end);
+      const merge = args.mode === "merge";
+      clip.notes = merge ? [...clip.notes, ...notes] : notes;
+      return {
+        note_count: merge ? undefined : notes.length,
+        added: merge ? notes.length : undefined,
+        copies,
+      };
     },
   );
 
   tool(
     "midi_clip_edit_notes",
-    "Transform existing notes of a MIDI clip server-side — no need to read and " +
-      "rewrite the note list. Optional `select` restricts which notes are " +
-      "affected (by pitch/time range); others pass through untouched. Transforms " +
-      "(applied in this order): transpose (semitones), time_shift (beats), " +
-      "velocity_scale, velocity_offset, quantize (snap start times to a beat " +
-      "grid, strength 0-1), or delete=true to remove the selected notes. " +
-      "Results are clamped to valid MIDI ranges.",
+    { title: "Edit MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Transform the existing notes of a MIDI clip (clip_id), or of several clips alike " +
+      "(clip_ids), server-side — no need to read and rewrite the note list. Optional " +
+      "`select` restricts which notes are affected (pitch/time range, in_scale, " +
+      "every_nth, only_selected = the user's note selection in Live, when Live reports " +
+      "it: unverified); others pass through untouched. Transforms, applied in this " +
+      "order: transpose (semitones), snap_to_scale (\"song\" or {root, intervals}: notes " +
+      "outside the scale move to the nearest scale note, ties go down), set (velocity, " +
+      "probability, velocity_deviation, release_velocity, muted), velocity_scale, " +
+      "velocity_offset, time_shift (beats), quantize (start times to a grid in beats or " +
+      "Live's \"song\" grid, strength 0-1), swing, duration_set or duration_scale, " +
+      "legato (each note lasts until the next later start among the selected notes; " +
+      "notes starting together are a chord and end together; the last ones keep their " +
+      "length), humanize (random ±timing beats and ±velocity, reproducible with `seed`; " +
+      "the seed used is returned) — or delete=true to remove the selected notes. " +
+      "Results are clamped to valid MIDI ranges. Each clip gets one notes write, all " +
+      "clips together form one undo step, and nothing is written if an argument or a " +
+      "clip is invalid.",
     {
-      clip_id: z.string(),
-      select: z
-        .object({
-          pitch_min: z.number().int().min(0).max(127).optional(),
-          pitch_max: z.number().int().min(0).max(127).optional(),
-          time_min: z.number().optional(),
-          time_max: z.number().optional(),
-        })
-        .optional(),
+      clip_id: z.string().optional().describe("The MIDI clip (or give clip_ids)"),
+      clip_ids: z
+        .array(z.string())
+        .min(1)
+        .optional()
+        .describe("Several MIDI clips, edited alike; returns {items}"),
+      select: noteSelectSchema().optional().describe("Only transform the notes matching every given filter"),
       transpose: z.number().int().optional().describe("Semitones, negative = down"),
+      snap_to_scale: scaleSchema()
+        .optional()
+        .describe('Move notes outside the scale to the nearest scale note; "song" = Live\'s current scale'),
+      set: z
+        .object({
+          velocity: z.number().min(0).max(127).optional(),
+          probability: z.number().min(0).max(1).optional(),
+          velocity_deviation: z.number().optional(),
+          release_velocity: z.number().min(0).max(127).optional(),
+          muted: z.boolean().optional(),
+        })
+        .optional()
+        .describe("Set these fields on every selected note"),
       time_shift: z.number().optional().describe("Beats, negative = earlier"),
       velocity_scale: z.number().min(0).optional(),
       velocity_offset: z.number().optional(),
       quantize: z
-        .object({ grid: z.number().positive().describe("Grid in beats, e.g. 0.25 = 1/16"), strength: z.number().min(0).max(1).default(1) })
+        .object({ grid: gridSchema("Grid"), strength: z.number().min(0).max(1).default(1) })
+        .optional(),
+      swing: z
+        .object({
+          amount: z
+            .number()
+            .min(0)
+            .max(1)
+            .describe("0 = straight, about 0.67 = triplet feel, 1 = dotted: the off-beat moves amount × grid/2"),
+          grid: gridSchema("Swing grid").default(0.25),
+        })
+        .optional()
+        .describe("Delay every second grid step; positions in between move proportionally"),
+      duration_set: z.number().positive().optional().describe("New length of every selected note, in beats"),
+      duration_scale: z.number().positive().optional().describe("Multiply lengths, e.g. 0.5 = shorter"),
+      legato: z
+        .boolean()
+        .optional()
+        .describe(
+          "Lengthen or cut each selected note to the next later start among the selected notes; notes " +
+            "starting less than 1/64 beat apart are a chord and end together; the last ones keep their length",
+        ),
+      humanize: z
+        .object({
+          timing: z.number().min(0).default(0).describe("Largest random start shift, ± beats (e.g. 0.02)"),
+          velocity: z.number().min(0).default(0).describe("Largest random velocity change, ± (whole steps)"),
+          seed: z
+            .number()
+            .int()
+            .optional()
+            .describe(
+              "Same seed, clips and notes: same result; omitted = a random seed, returned as humanize_seed",
+            ),
+        })
         .optional(),
       delete: z.boolean().optional().describe("Delete the selected notes instead of transforming"),
     },
     (args) => {
-      const clip = resolve(args.clip_id, MidiClip);
+      if ((args.clip_id === undefined) === (args.clip_ids === undefined))
+        throw new UsageError("Give clip_id or clip_ids (one of them).");
+      if (args.duration_set !== undefined && args.duration_scale !== undefined)
+        throw new UsageError("Give duration_set or duration_scale, not both.");
+      const hz = args.humanize;
+      if (hz && !hz.timing && !hz.velocity) throw new UsageError("humanize: give timing and/or velocity.");
       const sel = args.select ?? {};
+      const scale =
+        args.snap_to_scale !== undefined || sel.in_scale !== undefined
+          ? resolveScale(args.snap_to_scale ?? "song")
+          : undefined;
+      const matches = noteFilter(sel, scale);
+      const grid = args.quantize?.grid === "song" || args.swing?.grid === "song" ? songGrid() : undefined;
+      const gridBeats = (g: number | "song") => (g === "song" ? grid!.beats : g);
+      const seed = hz ? (hz.seed ?? Math.floor(Math.random() * 2 ** 31)) : undefined;
+      const random = seed === undefined ? undefined : seededRandom(seed);
+      // Every clip is resolved before the first write.
+      const ids = args.clip_ids ?? [args.clip_id!];
+      const clips = ids.map((id, i) =>
+        at(args.clip_ids ? `clip_ids[${i}]` : undefined, () => resolve(id, MidiClip)),
+      );
+      clips.forEach((clip, i) => {
+        const first = clips.findIndex((c) => c.handle.id === clip.handle.id);
+        if (first !== i)
+          throw new UsageError(`clip_ids[${i}]: clip ${ids[i]} is listed twice, also as clip_ids[${first}].`);
+      });
       const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
-      const selected = (n: NoteDescription) =>
-        (sel.pitch_min === undefined || num(n.pitch) >= sel.pitch_min) &&
-        (sel.pitch_max === undefined || num(n.pitch) <= sel.pitch_max) &&
-        (sel.time_min === undefined || num(n.startTime) >= sel.time_min) &&
-        (sel.time_max === undefined || num(n.startTime) <= sel.time_max);
-      let changed = 0;
-      const out: NoteDescription[] = [];
-      for (const n of clip.notes) {
-        if (!selected(n)) {
-          out.push(n);
-          continue;
+      const edits = clips.map((clip) => {
+        const notes = clip.notes;
+        const mask = matches(notes);
+        const changed = mask.filter(Boolean).length;
+        const warning = sel.only_selected ? selectionWarning(notes) : undefined;
+        if (args.delete) return { clip, out: notes.filter((_, i) => !mask[i]), changed, warning };
+        const out = notes.slice();
+        const edited: NoteDescription[] = []; // the selected notes, transformed, in time order
+        for (const i of timeOrder(notes)) {
+          if (!mask[i]) continue;
+          const n = notes[i];
+          const t = { ...n, pitch: num(n.pitch), startTime: num(n.startTime), duration: num(n.duration) };
+          if (args.transpose) t.pitch = clamp(t.pitch + args.transpose, 0, 127);
+          if (args.snap_to_scale !== undefined) t.pitch = snapToScale(t.pitch, scale!);
+          const set = args.set;
+          if (set?.velocity !== undefined) t.velocity = set.velocity;
+          if (set?.probability !== undefined) t.probability = set.probability;
+          if (set?.velocity_deviation !== undefined) t.velocityDeviation = set.velocity_deviation;
+          if (set?.release_velocity !== undefined) t.releaseVelocity = set.release_velocity;
+          if (set?.muted !== undefined) t.muted = set.muted;
+          if (args.velocity_scale !== undefined || args.velocity_offset !== undefined) {
+            const v = num(t.velocity ?? 100) * (args.velocity_scale ?? 1) + (args.velocity_offset ?? 0);
+            t.velocity = clamp(v, 1, 127);
+          }
+          if (args.time_shift) t.startTime = Math.max(0, t.startTime + args.time_shift);
+          if (args.quantize) {
+            const g = gridBeats(args.quantize.grid);
+            const snapped = Math.round(t.startTime / g) * g;
+            t.startTime = t.startTime + (snapped - t.startTime) * args.quantize.strength;
+          }
+          if (args.swing) t.startTime = swingTime(t.startTime, gridBeats(args.swing.grid), args.swing.amount);
+          if (args.duration_set !== undefined) t.duration = args.duration_set;
+          if (args.duration_scale !== undefined)
+            t.duration = Math.max(MIN_NOTE_DURATION, t.duration * args.duration_scale);
+          out[i] = t;
+          edited.push(t);
         }
-        if (args.delete) {
-          changed++;
-          continue;
-        }
-        const t = { ...n, pitch: num(n.pitch), startTime: num(n.startTime) };
-        if (args.transpose) t.pitch = clamp(t.pitch + args.transpose, 0, 127);
-        if (args.time_shift) t.startTime = Math.max(0, t.startTime + args.time_shift);
-        if (args.velocity_scale !== undefined || args.velocity_offset !== undefined) {
-          const v = num(t.velocity ?? 100) * (args.velocity_scale ?? 1) + (args.velocity_offset ?? 0);
-          t.velocity = clamp(v, 1, 127);
-        }
-        if (args.quantize) {
-          const snapped = Math.round(t.startTime / args.quantize.grid) * args.quantize.grid;
-          t.startTime = t.startTime + (snapped - t.startTime) * args.quantize.strength;
-        }
-        changed++;
-        out.push(t);
-      }
-      clip.notes = out;
-      return { note_count: out.length, changed_count: changed };
+        if (args.legato) legato(edited);
+        // Two draws per note, in time order (clip by clip), whether timing,
+        // velocity or both are used: a seed always gives a note the same draws.
+        if (random && hz)
+          for (const t of edited) {
+            const dt = random() * 2 - 1;
+            const dv = random() * 2 - 1;
+            if (hz.timing) t.startTime = Math.max(0, t.startTime + dt * hz.timing);
+            if (hz.velocity) t.velocity = clamp(num(t.velocity ?? 100) + Math.round(dv * hz.velocity), 1, 127);
+          }
+        return { clip, out, changed, warning };
+      });
+      // One notes write per clip (none where nothing is selected), all in one undo step.
+      const writes = edits.filter((e) => e.changed > 0);
+      if (writes.length)
+        context.withinTransaction(() => {
+          for (const e of writes) e.clip.notes = e.out;
+        });
+      const summary = (e: (typeof edits)[number]) => ({
+        note_count: e.out.length,
+        changed_count: e.changed,
+        warning: e.warning,
+      });
+      const extra = { humanize_seed: seed, song_grid: grid, scale };
+      return args.clip_ids
+        ? { items: edits.map((e) => ({ clip_id: remember(e.clip), ...summary(e) })), ...extra }
+        : { ...summary(edits[0]), ...extra };
     },
   );
 
@@ -710,12 +3953,15 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_get",
+    { title: "Get device", annotations: READ },
     "Get detail for one device: parameters (metadata + ids), rack chains, drum " +
       "rack pads, or Simpler sample. Big devices have 100+ parameters — use " +
       "parameter_filter (case-insensitive substring on the name) to fetch only " +
       "what you need, include_values to read current values in the same call, " +
       "and include_chain_devices to inline each rack chain's devices (e.g. map " +
-      "a whole drum kit pad→note→sample in one call).",
+      "a whole drum kit pad→note→sample in one call). `location` says where the " +
+      "device sits: its track, the path through racks (\"Kit > Drum Rack > pad 36 > " +
+      "Simpler\"), its device_index, and the chain and rack it is in.",
     {
       device_id: z.string(),
       parameter_filter: z.string().optional(),
@@ -743,32 +3989,284 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
                 devices: include_chain_devices ? c.devices.map(deviceSummary) : undefined,
               }))
             : undefined,
+        location: locate(device),
+      };
+    },
+  );
+
+  // A sample file a tool is about to load: an absolute path to a file that
+  // exists. Checked before anything is changed.
+  function checkSamplePath(file: string, what: string) {
+    const problem = mediaProblem(file);
+    if (problem) throw new UsageError(`${what} ${JSON.stringify(file)}: ${problem === "file not found" ? "no such file" : problem}.`);
+  }
+
+  // The path to load: the file's copy in the Live project (import_into_project),
+  // or the file itself.
+  async function samplePathToLoad(file: string, importIt: boolean) {
+    if (!importIt) return { load: file, imported: undefined };
+    try {
+      const imported = await context.resources.importIntoProject(file);
+      return { load: imported, imported };
+    } catch (e) {
+      throw new Error(`Could not import ${file} into the project: ${errorMessage(e)}`);
+    }
+  }
+
+  // import_into_project: on by default where a sample is new (device_insert
+  // sample_path, drum_kit_build); off by default on simpler_replace_sample,
+  // which loaded the file as it is before the parameter existed.
+  const importSampleSchema = (byDefault: boolean) =>
+    z
+      .boolean()
+      .default(byDefault)
+      .describe(
+        "Copy the sample into the Live project first and load the copy (recommended: the set keeps " +
+          `working when it is moved or the original is deleted); default ${byDefault}`,
+      );
+
+  tool(
+    "device_insert",
+    { title: "Insert device", annotations: CREATE },
+    "Insert a built-in Live device (by name, e.g. 'Reverb', 'Auto Filter', 'EQ " +
+      "Eight', 'Compressor', 'Simpler', 'Drum Rack', 'Operator', 'Wavetable') into " +
+      "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
+      "0-based position in the device chain; omitted = append at the end. The " +
+      "target is a Track or Chain id, or a track given by track_id/track_index/track_name. " +
+      "`sample_path` (Simpler only) loads an audio file into the new Simpler — by default " +
+      "its copy in the Live project (import_into_project); if the sample cannot be loaded, " +
+      "the Simpler is removed again and the call fails. " +
+      "`parameters` sets initial values right after the insert (and the sample), in one undo step " +
+      "(each {name, value | value_item | reset | delta}, as in device_set); if one " +
+      "cannot be set, none are, and the device is still inserted with `errors` saying why.",
+    {
+      target_id: z.string().optional().describe("Track or Chain id"),
+      ...trackAddress(),
+      device_name: z.string(),
+      index: z.number().int().min(0).optional(),
+      sample_path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Simpler only: absolute path of an audio file to load into it"),
+      import_into_project: importSampleSchema(true),
+      parameters: z.array(initialParameter).min(1).optional().describe("Initial parameter values"),
+    },
+    async ({ device_name, index, sample_path, import_into_project, parameters, ...address }) => {
+      parameters?.forEach((p, i) => at(`parameters[${i}]`, () => writeKind(p)));
+      if (sample_path !== undefined) {
+        if (device_name.trim().toLowerCase() !== "simpler")
+          throw new UsageError(`sample_path only applies to a Simpler, not ${quote(device_name)}.`);
+        checkSamplePath(sample_path, "sample_path");
+      }
+      const target = findTarget(address);
+      if (!(target instanceof Track) && !(target instanceof Chain))
+        throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
+      const device = await target.insertDevice(device_name, index ?? target.devices.length);
+      // A sample that cannot be loaded removes the new device again.
+      let imported: string | undefined;
+      if (sample_path !== undefined) {
+        try {
+          if (!(device instanceof Simpler)) throw new Error(`${describeDevice(device)} is not a Simpler.`);
+          const file = await samplePathToLoad(sample_path, import_into_project);
+          imported = file.imported;
+          await device.replaceSample(file.load);
+        } catch (e) {
+          await removeInserted(target, device, `Could not load the sample ${sample_path}: ${errorMessage(e)}`);
+        }
+      }
+      const extra = { imported_path: imported };
+      if (!parameters) return { ...deviceSummary(device), ...extra };
+      // The device exists now: a failing value is reported, not thrown.
+      const result = await setInitialParameters(device, parameters);
+      return {
+        ...deviceSummary(device),
+        ...extra,
+        parameters: result.parameters,
+        errors: result.error ? [result.error] : undefined,
       };
     },
   );
 
   tool(
-    "device_insert",
-    "Insert a built-in Live device (by name, e.g. 'Reverb', 'Auto Filter', 'EQ " +
-      "Eight', 'Compressor', 'Simpler', 'Drum Rack', 'Operator', 'Wavetable') into " +
-      "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
-      "0-based position in the device chain; omitted = append at the end.",
+    "device_set",
+    { title: "Set device", annotations: SET_RELATIVE },
+    "Switch a device on or off and/or set several of its parameters, in one call and " +
+      "one undo step (nothing is changed if any entry is invalid). Address the device " +
+      "by device_id, or by its track (track_id/track_index/track_name) and `device`: a " +
+      'name, an index, or a path into racks such as ["Drum Rack", {"pad": 36}, ' +
+      '"Simpler"]. `enabled` sets the device\'s "Device On" parameter — a Live naming ' +
+      "convention, not an API field: a device without one falls back to its first " +
+      "parameter if that is a two-state switch, and `on_parameter` reports which " +
+      "parameter was used (`fallback: true`). Each `parameters` entry names the " +
+      "parameter (name: exact, then case-insensitive, then unique substring; or " +
+      "parameter_id) and gives one of value (internal units), value_item (a " +
+      'quantized parameter\'s choice by name, e.g. "Saw"), reset:true (the default) or ' +
+      "delta (added to the current value, clamped).",
     {
-      target_id: z.string().describe("Track or Chain id"),
-      device_name: z.string(),
-      index: z.number().int().min(0).optional(),
+      ...deviceAddress,
+      enabled: z.boolean().optional().describe("true = on, false = off (bypassed)"),
+      parameters: z
+        .array(
+          z.object({
+            name: parameterName.optional(),
+            parameter_id: z.string().optional().describe("Instead of name: the parameter's id"),
+            ...parameterWrite,
+          }),
+        )
+        .min(1)
+        .optional(),
     },
-    async ({ target_id, device_name, index }) => {
-      const target = resolve(target_id, DataModelObject);
-      if (!(target instanceof Track) && !(target instanceof Chain))
-        throw new Error(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
-      const device = await target.insertDevice(device_name, index ?? target.devices.length);
-      return deviceSummary(device);
+    async ({ enabled, parameters, ...address }) => {
+      if (enabled === undefined && !parameters)
+        throw new UsageError("Nothing to set — give enabled and/or parameters.");
+      const device = findDevice(address);
+      // Validate everything before the first write.
+      const onOff = enabled !== undefined ? onOffParameter(device) : undefined;
+      const plan: PlannedWrite[] = [];
+      const labels: string[] = [];
+      if (onOff) {
+        plan.push(planWrite(onOff.param, { value: enabled ? onOff.on : onOff.off }));
+        labels.push("enabled");
+      }
+      const own = new Set(device.parameters.map((p) => p.handle.id));
+      (parameters ?? []).forEach((p, i) =>
+        at(`parameters[${i}]`, () => {
+          if ((p.name === undefined) === (p.parameter_id === undefined))
+            throw new UsageError("give exactly one of name and parameter_id.");
+          const param =
+            p.parameter_id !== undefined
+              ? resolve(p.parameter_id, DeviceParameter)
+              : findParameter(device, p.name!);
+          if (!own.has(param.handle.id))
+            throw new UsageError(`parameter ${p.parameter_id} is not a parameter of ${describeDevice(device)}.`);
+          plan.push(planWrite(param, p));
+          labels.push(`parameters[${i}]`);
+        }),
+      );
+      await applyWrites(plan, labels);
+      // Report the on-state even when only parameters were set, if the device has one.
+      let state = onOff;
+      if (!state)
+        try {
+          state = onOffParameter(device);
+        } catch {
+          // no on/off switch: leave `enabled` out
+        }
+      const [values, onValue] = await Promise.all([
+        Promise.all(plan.filter((w) => w.param !== onOff?.param).map((w) => parameterWithValue(w.param))),
+        state ? state.param.getValue().then(num) : undefined,
+      ]);
+      return {
+        ...deviceSummary(device),
+        enabled: state ? onValue !== state.off : undefined,
+        on_parameter: state
+          ? { id: remember(state.param), name: state.param.name, fallback: state.fallback || undefined }
+          : undefined,
+        parameters: parameters ? values : undefined,
+      };
+    },
+  );
+
+  tool(
+    "parameter_find",
+    { title: "Find parameters", annotations: READ },
+    "Find device parameters by name without walking device_get: in the whole Live Set " +
+      "(every regular, return and main track), on one track (track_id/track_index/" +
+      "track_name), or in one device (device_id, or track + device); racks are searched " +
+      "through all their chains. `query` is a case-insensitive substring of the " +
+      "parameter name (omit it to list everything in scope); `value_item` keeps only " +
+      'quantized parameters with a matching choice (e.g. "saw"). Each match carries its ' +
+      "id (for parameter_set, parameter_get, device_set), its device's id and name, the " +
+      'track, and a readable path such as "Drums > Drum Rack > pad 36 > Simpler". ' +
+      "include_values adds current values (internal units). At most `limit` matches " +
+      "are returned; `total` counts them all.",
+    {
+      query: z.string().optional().describe("Case-insensitive substring of the parameter name"),
+      value_item: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Only quantized parameters with a value item whose name or short name contains this"),
+      ...deviceAddress,
+      include_values: z.boolean().default(false),
+      include_value_items: z.boolean().default(true),
+      limit: z.number().int().min(1).max(500).default(50),
+    },
+    async ({ query, value_item, include_values, include_value_items, limit, ...address }) => {
+      type Root = { devices: Device<"1.0.0">[]; track?: Track<"1.0.0">; prefix: string[] };
+      let roots: Root[];
+      if (address.device_id !== undefined || address.device !== undefined) {
+        const { device, track, path } = locateDevice(address);
+        roots = [{ devices: [device], track, prefix: path.slice(0, -1) }];
+      } else if (hasTrackAddress(address)) {
+        const track = findTrack(address);
+        roots = [{ devices: track.devices, track, prefix: [track.name] }];
+      } else {
+        const s = song();
+        roots = [...s.tracks, ...s.returnTracks, s.mainTrack].map((track) => ({
+          devices: track.devices,
+          track,
+          prefix: [track.name],
+        }));
+      }
+      const q = query?.toLowerCase();
+      const item = value_item?.toLowerCase();
+      const wanted = (p: DeviceParameter<"1.0.0">) =>
+        (q === undefined || p.name.toLowerCase().includes(q)) &&
+        (item === undefined ||
+          (p.isQuantized &&
+            p.valueItems.some((v) => [v.name, v.shortName].some((n) => n?.toLowerCase().includes(item)))));
+      const MAX_DEVICES = 1000;
+      type Match = { param: DeviceParameter<"1.0.0">; device: Device<"1.0.0">; root: Root; path: string[] };
+      const found: Match[] = [];
+      let total = 0;
+      let searched = 0;
+      let stopped = false;
+      const walk = (devices: Device<"1.0.0">[], root: Root, prefix: string[], depth: number) => {
+        for (const device of devices) {
+          if (searched >= MAX_DEVICES) {
+            stopped = true;
+            return;
+          }
+          searched++;
+          const path = [...prefix, device.name];
+          for (const param of device.parameters) {
+            if (!wanted(param)) continue;
+            total++;
+            if (found.length < limit) found.push({ param, device, root, path });
+          }
+          if (device instanceof RackDevice && depth < 8)
+            device.chains.forEach((c, i) => walk(c.devices, root, [...path, chainLabel(c, i)], depth + 1));
+        }
+      };
+      for (const root of roots) walk(root.devices, root, root.prefix, 0);
+      const matches = await Promise.all(
+        found.map(async ({ param, device, root, path }) => ({
+          ...(include_values
+            ? await parameterWithValue(param, include_value_items)
+            : parameterSummary(param, include_value_items)),
+          device_id: remember(device),
+          device_name: device.name,
+          track_id: root.track ? remember(root.track) : undefined,
+          track_name: root.track?.name,
+          path: path.join(" > "),
+        })),
+      );
+      return {
+        matches,
+        total,
+        truncated: total > matches.length,
+        devices_searched: searched,
+        // the search stopped early: total counts only what was searched
+        device_limit_reached: stopped || undefined,
+      };
     },
   );
 
   tool(
     "device_delete",
+    { title: "Delete device", annotations: DESTRUCTIVE },
     "Delete a device from its track or chain.",
     { device_id: z.string() },
     async ({ device_id }) => {
@@ -785,6 +4283,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_duplicate",
+    { title: "Duplicate device", annotations: CREATE },
     "Duplicate a device; the copy is inserted right after the original.",
     { device_id: z.string() },
     async ({ device_id }) => {
@@ -796,12 +4295,297 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  // What a rebuilt device (device_copy, device_preset_load) does not carry over.
+  const LOST =
+    "automation, modulation and MIDI/macro mappings, a custom device name, and any device " +
+    "state that is not a parameter";
+
+  tool(
+    "device_copy",
+    { title: "Copy or move device", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Copy a device to a track or rack chain, or to another position in its own chain; " +
+      "with move:true the original is deleted afterwards, which is how a device is moved " +
+      "or reordered (Live's API has no device move, reorder or copy). LOSSY: a fresh " +
+      "built-in device is inserted at the target and the parameter values are copied by " +
+      `name (a Simpler also gets its sample); ${LOST} are lost, and the copy has a new ` +
+      "id (after a move the old id is gone). Racks cannot be copied this way: " +
+      "device_duplicate copies one in place. Target: target_id (Track or Chain id) or " +
+      "track_id/track_index/track_name; omitted = the device's own track or chain. " +
+      "`index` counts the target's current devices, before a move removes the original " +
+      "(omitted = append). `device_name` is the built-in device to insert when the " +
+      "device was renamed in Live (default: its name). Live allows one instrument per " +
+      "track or chain, so an instrument cannot be copied next to another one. Undo " +
+      "steps: insert, sample, values, delete. If the copy cannot be inserted or its " +
+      "sample cannot be loaded, nothing is changed; values that cannot be copied are " +
+      "listed in `not_copied`, and then a move keeps the original.",
+    {
+      device_id: z.string().describe("The device to copy or move"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("Track or Chain id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress(),
+      index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("0-based position among the target's current devices; omitted = append"),
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Built-in device to insert; default: the device's name"),
+      move: z.boolean().default(false).describe("Delete the original once everything was copied"),
+    },
+    async ({ device_id, index, device_name, move, ...address }) => {
+      const source = resolve(device_id, Device);
+      rejectRack(source, "copied by name");
+      const from = source.parent;
+      const target =
+        address.target_id !== undefined || hasTrackAddress(address) ? findTarget(address) : from;
+      if (!(target instanceof Track) && !(target instanceof Chain))
+        throw new UsageError(
+          `Devices can be copied into a Track or Chain, got ${target ? classOf(target) : "none"}.`,
+        );
+      if (move && !(from instanceof Track) && !(from instanceof Chain))
+        throw new Error(`Cannot move a device whose parent is ${from ? classOf(from) : "null"}.`);
+      const count = target.devices.length;
+      if (index !== undefined && index > count)
+        throw new UsageError(`index ${index} out of range (0-${count}, or omit it to append).`);
+      const insertAt = index ?? count;
+      const position =
+        from && from.handle.id === target.handle.id
+          ? target.devices.findIndex((d) => d.handle.id === source.handle.id)
+          : -1;
+      // Moving a device onto its own position would only lose state.
+      if (move && position >= 0 && (insertAt === position || insertAt === position + 1))
+        return {
+          ...deviceSummary(source),
+          index: position,
+          source_id: device_id,
+          moved: false,
+          unchanged: "the device is already at that position",
+        };
+
+      // Read everything from the original before the first write.
+      const saved = await readValues(source);
+      const samplePath = (source instanceof Simpler && source.sample?.filePath) || undefined;
+      const copy = await insertBuiltIn(target, device_name ?? source.name, insertAt, device_name === undefined);
+      const { sample, applied, skipped: notCopied } = await restoreDevice(copy, saved, samplePath, target);
+      let moved = false;
+      let error: string | undefined;
+      let kept: string | undefined;
+      if (move) {
+        if (notCopied.length) {
+          kept = "the copy is incomplete (see not_copied), so the original was kept";
+        } else {
+          try {
+            await (from as DeviceHolder).deleteDevice(source);
+            moved = true;
+          } catch (e) {
+            error = `copied, but the original ${device_id} could not be deleted: ${errorMessage(e)}`;
+          }
+        }
+      }
+      return {
+        ...deviceSummary(copy),
+        index: target.devices.findIndex((d) => d.handle.id === copy.handle.id),
+        source_id: device_id,
+        moved,
+        fidelity: "approximate",
+        lost: LOST,
+        copied_parameters: applied,
+        not_copied: notCopied.length ? notCopied : undefined,
+        sample,
+        original_kept: kept,
+        error,
+      };
+    },
+  );
+
+  // -- device presets (JSON files of this server, not Live presets) ----------
+
+  tool(
+    "device_preset_save",
+    { title: "Save device preset", annotations: DESTRUCTIVE },
+    "Save a device's parameter values (and a Simpler's sample path) as a named preset " +
+      "of this server: a JSON file in the extension's storage directory " +
+      "(presets/<name>.json). It is not a Live preset (.adv): Live's API cannot read or " +
+      "write those. Address the device by device_id, or track + device as in " +
+      "device_set. Racks cannot be saved. `device_name` records the built-in device a " +
+      "load inserts (default: the device's name; pass it if the device was renamed in " +
+      "Live). The sample is referenced by its path, not copied. An existing preset of " +
+      "the same name (case-insensitive) is only replaced with overwrite:true. Names are " +
+      "1-64 letters, digits, spaces and - _ . , ( ) ' + & #, starting with a letter or digit.",
+    {
+      name: z.string().describe("Preset name"),
+      ...deviceAddress,
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Built-in device a load inserts; default: the device's name"),
+      overwrite: z.boolean().default(false).describe("Replace an existing preset of the same name"),
+    },
+    async ({ name, device_name, overwrite, ...address }) => {
+      const base = presetBaseName(name);
+      const device = findDevice(address);
+      rejectRack(device, "saved as a preset");
+      const store = presets();
+      const samplePath = (device instanceof Simpler && device.sample?.filePath) || undefined;
+      const preset: Preset = {
+        format: PRESET_FORMAT,
+        version: 1,
+        name: base,
+        device_name: device_name ?? device.name,
+        device_class: classOf(device),
+        saved_at: new Date().toISOString(),
+        parameters: await readValues(device),
+        sample: samplePath ? { file_path: samplePath } : undefined,
+      };
+      const { name: stored, replaced } = store.write(base, preset, overwrite);
+      return {
+        name: stored,
+        device_name: preset.device_name,
+        parameter_count: preset.parameters.length,
+        sample: preset.sample,
+        replaced,
+        directory: store.dir,
+      };
+    },
+  );
+
+  tool(
+    "device_preset_list",
+    { title: "List device presets", annotations: READ },
+    "List the presets saved with device_preset_save: name, the built-in device they " +
+      "insert, parameter count, sample, and when they were saved. Files in the presets " +
+      "directory that are not valid presets are listed under `unreadable`.",
+    {
+      device_name: z.string().optional().describe("Only presets for this built-in device (case-insensitive)"),
+    },
+    ({ device_name }) => {
+      const store = presets();
+      const all = store.list();
+      const want = device_name?.toLowerCase();
+      return {
+        directory: store.dir,
+        presets: all.presets
+          .filter(({ preset }) => want === undefined || preset.device_name.toLowerCase() === want)
+          .map(({ name, preset }) => ({
+            name,
+            device_name: preset.device_name,
+            parameter_count: preset.parameters.length,
+            sample: preset.sample ?? undefined,
+            saved_at: preset.saved_at,
+          })),
+        unreadable: all.unreadable.length ? all.unreadable : undefined,
+      };
+    },
+  );
+
+  tool(
+    "device_preset_load",
+    { title: "Load device preset", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Load a preset saved with device_preset_save. Onto an existing device (device_id, " +
+      "or track + device as in device_set): its parameters are set by name in one undo " +
+      "step, and a Simpler also loads the preset's sample in place of its own. Or as a " +
+      "new device: give the target instead (target_id: Track or Chain id, or " +
+      "track_id/track_index/track_name without `device`) and optionally `index`; the " +
+      "preset's built-in device (or `device_name`) is inserted there first. Values the " +
+      "device has no parameter for, or that Live refuses, are listed in `not_applied`. " +
+      `A preset holds parameter values only: ${LOST} are not part of it.`,
+    {
+      name: z.string().describe("Preset name (case-insensitive)"),
+      ...deviceAddress,
+      target_id: z
+        .string()
+        .optional()
+        .describe("Insert a new device into this Track or Chain instead of loading onto an existing one"),
+      index: z.number().int().min(0).optional().describe("New device only: 0-based position; omitted = append"),
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("New device only: the built-in device to insert instead of the preset's"),
+    },
+    async ({ name, index, device_name, ...address }) => {
+      const base = presetBaseName(name);
+      const onto = address.device_id !== undefined || address.device !== undefined;
+      if (onto && address.target_id !== undefined)
+        throw new UsageError("Give a device to load onto, or target_id to insert a new one, not both.");
+      if (onto && (index !== undefined || device_name !== undefined))
+        throw new UsageError("index and device_name only apply when inserting a new device.");
+      if (!onto && address.target_id === undefined && !hasTrackAddress(address))
+        throw new UsageError(
+          "Give the device to load onto (device_id, or a track and device), or where to insert " +
+            "a new one (target_id, or track_id/track_index/track_name).",
+        );
+      const store = presets();
+      const file = store.find(base);
+      if (!file) {
+        const names = store.list().presets.map((p) => quote(p.name));
+        throw new UsageError(`No preset named ${quote(base)}. Saved presets: ${names.join(", ") || "none"}.`);
+      }
+      const presetName = path.basename(file, ".json");
+      let preset: Preset;
+      try {
+        preset = readPresetFile(file);
+      } catch (e) {
+        // the file is broken, not the Live Set: no stale-id hint
+        throw new UsageError(`Preset ${quote(presetName)} cannot be loaded: ${errorMessage(e)}`);
+      }
+
+      // Validate the destination before the first write.
+      let device: Device<"1.0.0">;
+      let inserted: { target: DeviceHolder } | undefined;
+      if (onto) {
+        device = findDevice(address);
+        rejectRack(device, "loaded from a preset");
+      } else {
+        const target = findTarget(address);
+        if (!(target instanceof Track) && !(target instanceof Chain))
+          throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
+        const count = target.devices.length;
+        if (index !== undefined && index > count)
+          throw new UsageError(`index ${index} out of range (0-${count}, or omit it to append).`);
+        device = await insertBuiltIn(target, device_name ?? preset.device_name, index ?? count, false);
+        inserted = { target };
+      }
+      const { sample, applied, skipped: notApplied } = await restoreDevice(
+        device,
+        preset.parameters,
+        preset.sample?.file_path,
+        inserted?.target,
+      );
+      const mismatch = device.name.toLowerCase() !== preset.device_name.toLowerCase();
+      return {
+        ...deviceSummary(device),
+        preset: presetName,
+        inserted: inserted !== undefined,
+        index: inserted
+          ? inserted.target.devices.findIndex((d) => d.handle.id === device.handle.id)
+          : undefined,
+        applied_parameters: applied,
+        not_applied: notApplied.length ? notApplied : undefined,
+        sample,
+        warning: mismatch
+          ? `The preset was saved from ${quote(preset.device_name)}; only parameters with the same ` +
+            "names were set."
+          : undefined,
+      };
+    },
+  );
+
   // -- racks / chains --------------------------------------------------------
 
   tool(
     "chain_get",
+    { title: "Get rack chain", annotations: READ },
     "Get detail for a rack chain: its devices and mixer (volume/pan/sends with " +
-      "values). Drum chains also report their receiving note.",
+      "values). Drum chains also report their receiving note. `location` gives the " +
+      "track, the path to the chain, its rack and chain_index.",
     { chain_id: z.string() },
     async ({ chain_id }) => {
       const chain = resolve(chain_id, Chain);
@@ -809,12 +4593,14 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         ...chainSummary(chain),
         devices: chain.devices.map(deviceSummary),
         mixer: await mixerDetail(chain.mixer),
+        location: locate(chain),
       };
     },
   );
 
   tool(
     "rack_insert_chain",
+    { title: "Insert rack chain", annotations: CREATE },
     "Insert a new chain into a rack device at the given 0-based index.",
     { rack_device_id: z.string(), index: z.number().int().min(0) },
     async ({ rack_device_id, index }) => {
@@ -825,27 +4611,299 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "drum_chain_set",
-    "Set the MIDI note a drum rack chain (pad) responds to.",
+    { title: "Set drum pad note", annotations: SET },
+    "Set the MIDI note a drum rack chain (pad) responds to: 0-127 or a note name (C1 = 36).",
     {
       drum_chain_id: z.string(),
-      receiving_note: z.number().int().min(0).max(127),
+      receiving_note: pitchSchema("The MIDI note the pad plays on"),
     },
     ({ drum_chain_id, receiving_note }) => {
+      const note = parsePitch(receiving_note, "receiving_note");
       const chain = resolve(drum_chain_id, DrumChain);
-      chain.receivingNote = receiving_note;
+      chain.receivingNote = note;
       return chainSummary(chain);
     },
   );
 
   tool(
     "simpler_replace_sample",
+    { title: "Replace Simpler sample", annotations: DESTRUCTIVE },
     "Replace the sample loaded in a Simpler device with another audio file " +
-      "(absolute path).",
-    { simpler_device_id: z.string(), file_path: z.string() },
-    async ({ simpler_device_id, file_path }) => {
+      "(absolute path). The file is loaded as it is; with import_into_project:true " +
+      "(recommended) it is first copied into the Live project and the copy is loaded, so " +
+      "the set keeps working when it is moved or the original is deleted — the result's " +
+      "file_path is then the copy's and `imported_path` is set.",
+    { simpler_device_id: z.string(), file_path: z.string(), import_into_project: importSampleSchema(false) },
+    async ({ simpler_device_id, file_path, import_into_project }) => {
+      // The Simpler is checked first, so a bad id leaves no copy in the project.
       const simpler = resolve(simpler_device_id, Simpler);
-      const sample = await simpler.replaceSample(file_path);
-      return { id: remember(sample), file_path: sample.filePath };
+      const { load, imported } = await samplePathToLoad(file_path, import_into_project);
+      const sample = await simpler.replaceSample(load);
+      return { id: remember(sample), file_path: sample.filePath, imported_path: imported };
+    },
+  );
+
+  const MAX_KIT_PADS = 128;
+
+  tool(
+    "drum_kit_build",
+    { title: "Build drum kit", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Build or update a drum kit from sample files in one call: for each pad {note, " +
+      "sample_path, volume?, panning?} the Drum Rack's pad (chain) receiving that note is " +
+      "reused, or a new chain is created and set to receive it; a Simpler is inserted into it " +
+      "(a pad that already has a Simpler keeps it, and its sample is REPLACED), the sample is " +
+      "copied into the Live project (import_into_project, default) and loaded, and volume / " +
+      "panning set the pad's chain mixer (0-1, 0.85 = 0 dB; -1..1). The rack: rack_device_id, " +
+      "or a MIDI track (track_id/track_index/track_name) — its Drum Rack, or a new one appended " +
+      "when it has none. Notes are 0-127 or names (C1 = 36 is the usual kick). Every sample " +
+      "path, note and pad is checked before anything is changed; the samples are imported " +
+      "next, and an import that fails changes nothing in the set. After that a pad that fails " +
+      "is reported in its `pads` entry (`error`) while the others are built. Live's API cannot " +
+      "delete a chain, so a chain that was created stays even if its pad fails. Returns the " +
+      "rack and, per pad, the chain, the Simpler, the loaded sample and what was created. " +
+      "Undo steps: rack, chains, notes, Simplers, samples, mixer.",
+    {
+      ...trackAddress(),
+      rack_device_id: z.string().optional().describe("The Drum Rack to build in; or give a MIDI track"),
+      pads: z
+        .array(
+          z.object({
+            note: pitchSchema("The pad's MIDI note (its chain's receiving note)"),
+            sample_path: z.string().min(1).describe("Absolute path of the audio file"),
+            volume: z.number().min(0).max(1).optional().describe("Pad volume 0-1 (0.85 = 0 dB)"),
+            panning: z.number().min(-1).max(1).optional().describe("Pad panning, -1 = left, 1 = right"),
+          }),
+        )
+        .min(1)
+        .max(MAX_KIT_PADS),
+      import_into_project: importSampleSchema(true),
+    },
+    async ({ pads, rack_device_id, import_into_project, ...address }) => {
+      // 0. Check everything before the first change.
+      if ((rack_device_id === undefined) === !hasTrackAddress(address))
+        throw new UsageError("Give rack_device_id or a track (track_id, track_index or track_name), one of them.");
+      const notes = pads.map((p, i) =>
+        at(`pads[${i}]`, () => {
+          const note = parsePitch(p.note, "note");
+          checkSamplePath(p.sample_path, "sample_path");
+          return note;
+        }),
+      );
+      notes.forEach((n, i) => {
+        const first = notes.indexOf(n);
+        if (first !== i) throw new UsageError(`pads[${i}]: note ${n} (${noteName(n)}) is given twice, also by pads[${first}].`);
+      });
+      let rack: DrumRack<"1.0.0"> | undefined;
+      let track: Track<"1.0.0"> | undefined;
+      if (rack_device_id !== undefined) {
+        rack = resolve(rack_device_id, DrumRack);
+        track = devicePath(rack).track;
+      } else {
+        track = findTrack(address);
+        const racks = track.devices.filter((d): d is DrumRack<"1.0.0"> => d instanceof DrumRack);
+        if (racks.length > 1)
+          throw new UsageError(
+            `${describeTrack(track)} has ${racks.length} Drum Racks (${racks.map(describeDevice).join(", ")}): ` +
+              "give rack_device_id.",
+          );
+        rack = racks[0];
+        if (!rack && !(track instanceof MidiTrack))
+          throw new UsageError(`${describeTrack(track)} has no Drum Rack, and only a MIDI track can get one.`);
+      }
+      // A pad's chain in the rack: the drum chain receiving its note, if any.
+      const padChains = (r: DrumRack<"1.0.0">) => {
+        const chains = r.chains.filter((c) => c instanceof DrumChain);
+        return notes.map((note, i) => {
+          const hits = chains.filter((c) => num(c.receivingNote) === note);
+          if (hits.length > 1)
+            throw new UsageError(
+              `pads[${i}]: ${hits.length} chains of ${describeDevice(r)} receive note ${note} ` +
+                `(${hits.map((c) => remember(c)).join(", ")}), so the pad is ambiguous.`,
+            );
+          return hits[0];
+        });
+      };
+      const existing = rack ? padChains(rack) : notes.map(() => undefined);
+
+      // A pad's progress: the first failure stops it.
+      type Pad = {
+        i: number;
+        note: number;
+        chain?: Chain<"1.0.0">;
+        chainCreated: boolean;
+        simpler?: Simpler<"1.0.0">;
+        simplerCreated: boolean;
+        load: string;
+        imported?: string;
+        sample?: Sample<"1.0.0">;
+        error?: string;
+      };
+      const state: Pad[] = pads.map((p, i) => ({
+        i,
+        note: notes[i],
+        chain: existing[i],
+        chainCreated: false,
+        simplerCreated: false,
+        load: p.sample_path,
+      }));
+      const fail = (pad: Pad, step: string, e: unknown) => {
+        pad.error ??= `${step}: ${errorMessage(e)}`;
+      };
+      const live = () => state.filter((p) => !p.error);
+
+      // 1. Import the samples (each file once). A failure changes nothing in the set.
+      if (import_into_project) {
+        const copies = new Map<string, string>();
+        for (const pad of state) {
+          const file = pads[pad.i].sample_path;
+          if (!copies.has(file)) {
+            try {
+              copies.set(file, (await samplePathToLoad(file, true)).load);
+            } catch (e) {
+              const done = [...copies.values()];
+              throw new Error(
+                `pads[${pad.i}]: ${errorMessage(e)} Nothing was changed in the Live Set` +
+                  (done.length ? ` (already copied into the project: ${done.join(", ")}).` : "."),
+              );
+            }
+          }
+          pad.load = pad.imported = copies.get(file)!;
+        }
+      }
+
+      // 2. The rack.
+      let rackCreated = false;
+      if (!rack) {
+        const holder = track!;
+        let inserted: Device<"1.0.0">;
+        try {
+          inserted = await holder.insertDevice("Drum Rack", holder.devices.length);
+        } catch (e) {
+          throw new Error(
+            `Could not insert a Drum Rack on ${describeTrack(holder)}: ${errorMessage(e)} Nothing was changed in the Live Set.`,
+          );
+        }
+        if (!(inserted instanceof DrumRack))
+          await removeInserted(holder, inserted, `Live inserted ${describeDevice(inserted)}, not a Drum Rack.`);
+        rack = inserted as DrumRack<"1.0.0">;
+        rackCreated = true;
+        // a default preset with pads: reuse them like an existing rack's
+        padChains(rack).forEach((c, i) => (state[i].chain = c));
+      }
+      const theRack = rack;
+
+      // 3. Chains for the new pads (one undo step), all inserted at the current
+      // end: an index that is valid in whatever order Live applies them, and in
+      // call order (last pad first) they end up in the pads' order. insertChain
+      // is typed as returning a Chain: only a DrumChain has a receiving note.
+      const newPads = state.filter((p) => !p.chain);
+      if (newPads.length) {
+        const end = theRack.chains.length;
+        const order = [...newPads].reverse();
+        const made = await context.withinTransaction(() =>
+          Promise.allSettled(order.map(() => theRack.insertChain(end))),
+        );
+        made.forEach((r, k) => {
+          const pad = order[k];
+          if (r.status === "rejected") return fail(pad, "creating its chain", r.reason);
+          pad.chainCreated = true;
+          if (r.value instanceof DrumChain) pad.chain = r.value;
+          else
+            fail(
+              pad,
+              "creating its chain",
+              `Live created ${classOf(r.value)} ${remember(r.value)}, not a drum chain, so it has no receiving note`,
+            );
+        });
+        // 4. Their receiving notes (one undo step).
+        const chained = newPads.filter((p) => !p.error);
+        if (chained.length)
+          context.withinTransaction(() => {
+            for (const pad of chained)
+              try {
+                (pad.chain as DrumChain<"1.0.0">).receivingNote = pad.note;
+              } catch (e) {
+                fail(pad, "setting its note", e);
+              }
+          });
+      }
+
+      // 5. A Simpler in every pad that has none (one undo step).
+      for (const pad of live()) pad.simpler = pad.chain!.devices.find((d): d is Simpler<"1.0.0"> => d instanceof Simpler);
+      const needSimpler = live().filter((p) => !p.simpler);
+      if (needSimpler.length) {
+        const made = await context.withinTransaction(() =>
+          Promise.allSettled(needSimpler.map((p) => p.chain!.insertDevice("Simpler", 0))),
+        );
+        made.forEach((r, k) => {
+          const pad = needSimpler[k];
+          if (r.status === "rejected") return fail(pad, "inserting a Simpler", r.reason);
+          if (!(r.value instanceof Simpler))
+            return fail(pad, "inserting a Simpler", `Live inserted ${describeDevice(r.value)}, not a Simpler`);
+          pad.simpler = r.value;
+          pad.simplerCreated = true;
+        });
+      }
+
+      // 6. The samples (one undo step).
+      const loading = live();
+      if (loading.length) {
+        const loaded = await context.withinTransaction(() =>
+          Promise.allSettled(loading.map((p) => p.simpler!.replaceSample(p.load))),
+        );
+        loaded.forEach((r, k) =>
+          r.status === "fulfilled" ? (loading[k].sample = r.value) : fail(loading[k], `loading ${loading[k].load}`, r.reason),
+        );
+      }
+
+      // 7. Pad levels on the chain mixers (one undo step).
+      const levels: Array<{ pad: Pad; param: DeviceParameter<"1.0.0">; value: number; what: string }> = [];
+      for (const pad of live()) {
+        const { volume, panning } = pads[pad.i];
+        try {
+          const mixer = pad.chain!.mixer;
+          if (volume !== undefined)
+            levels.push({ pad, param: mixer.volume, value: planWrite(mixer.volume, { value: volume }).target(volume), what: "volume" });
+          if (panning !== undefined)
+            levels.push({ pad, param: mixer.panning, value: planWrite(mixer.panning, { value: panning }).target(panning), what: "panning" });
+        } catch (e) {
+          fail(pad, "setting its level", e);
+        }
+      }
+      const writes = levels.filter((w) => !w.pad.error);
+      if (writes.length) {
+        const settled = await context.withinTransaction(() =>
+          Promise.allSettled(writes.map((w) => w.param.setValue(w.value))),
+        );
+        settled.forEach((r, k) => {
+          if (r.status === "rejected") fail(writes[k].pad, `setting its ${writes[k].what}`, r.reason);
+        });
+      }
+
+      const out = state.map((pad) => ({
+        note: pad.note,
+        note_name: noteName(pad.note),
+        chain_id: pad.chain ? remember(pad.chain) : undefined,
+        chain_created: pad.chainCreated,
+        simpler_device_id: pad.simpler ? remember(pad.simpler) : undefined,
+        simpler_created: pad.simplerCreated,
+        sample: pad.sample ? { id: remember(pad.sample), file_path: pad.sample.filePath } : undefined,
+        source_path: pads[pad.i].sample_path,
+        imported_path: pad.imported,
+        volume: pads[pad.i].volume,
+        panning: pads[pad.i].panning,
+        error: pad.error,
+      }));
+      const failed = out.filter((p) => p.error);
+      return {
+        rack_device_id: remember(theRack),
+        rack_created: rackCreated,
+        track_id: track ? remember(track) : undefined,
+        track_name: track?.name,
+        pads: out,
+        built_count: out.length - failed.length,
+        errors: failed.length ? failed.map((p) => `note ${p.note} (${p.note_name}): ${p.error}`) : undefined,
+      };
     },
   );
 
@@ -853,86 +4911,272 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "parameter_get",
-    "Read current values (and metadata) of one or more device/mixer parameters.",
-    { parameter_ids: z.array(z.string()).min(1) },
-    async ({ parameter_ids }) =>
-      Promise.all(parameter_ids.map((id) => parameterWithValue(resolve(id, DeviceParameter)))),
+    { title: "Get parameter values", annotations: READ },
+    "Read current values (and metadata) of device or mixer parameters: by id " +
+      "(`parameter_ids`) and/or by device and name (`parameters`: entries " +
+      "{device_id | track_id/track_index/track_name + device, parameter}, where device " +
+      'is a name, an index or a path into racks such as ["Drum Rack", {"pad": 36}, ' +
+      '"Simpler"], and parameter matches exactly first, then case-insensitively, then ' +
+      "by unique substring; an entry may also be {parameter_id}). Results follow that " +
+      "order; entries found by device also carry device_id and device_name. Values are " +
+      "internal units; quantized parameters also report the current `value_item`.",
+    {
+      parameter_ids: z.array(z.string()).min(1).optional(),
+      parameters: z
+        .array(z.object(parameterAddress))
+        .min(1)
+        .optional()
+        .describe("Parameters by device and name (or parameter_id)"),
+    },
+    async ({ parameter_ids, parameters }) => {
+      if (!parameter_ids && !parameters) throw new UsageError("Provide parameter_ids and/or parameters.");
+      const list = [
+        ...(parameter_ids ?? []).map((id) => ({ param: resolve(id, DeviceParameter), device: undefined })),
+        ...(parameters ?? []).map((p, i) => at(`parameters[${i}]`, () => findParameterEntry(p))),
+      ];
+      return Promise.all(list.map(withValue));
+    },
   );
 
   tool(
     "parameter_set",
-    "Set one or more device/mixer parameter values. Values must be within the " +
-      "parameter's [min, max]; quantized parameters take the value_items index. " +
-      "Multiple values are grouped into a single undo step.",
-    {
-      values: z
-        .array(z.object({ parameter_id: z.string(), value: z.number() }))
-        .min(1),
-    },
+    { title: "Set parameter values", annotations: SET_RELATIVE },
+    "Set one or more device or mixer parameters in one undo step; nothing is changed if " +
+      "any entry is invalid. Each entry addresses its parameter by parameter_id, or by " +
+      "device and name as in parameter_get ({device_id | track + device, parameter}), " +
+      "and gives exactly one of: value (internal units within [min, max]; a quantized " +
+      "parameter takes its value_items index), value_item (a quantized parameter's " +
+      'choice by name or short name, e.g. "Saw"), reset:true (the default value) or ' +
+      "delta (added to the current value, clamped to [min, max]). Returns the " +
+      "parameters with their new values.",
+    { values: z.array(z.object({ ...parameterAddress, ...parameterWrite })).min(1) },
     async ({ values }) => {
-      const params = values.map((v) => ({
-        param: resolve(v.parameter_id, DeviceParameter),
-        value: v.value,
-      }));
-      await context.withinTransaction(() =>
-        Promise.all(params.map(({ param, value }) => param.setValue(value))),
+      const labels = values.map((_, i) => `values[${i}]`);
+      const plan = values.map((v, i) =>
+        at(labels[i], () => {
+          const { param, device } = findParameterEntry(v);
+          return { ...planWrite(param, v), device };
+        }),
       );
-      return Promise.all(params.map(({ param }) => parameterWithValue(param)));
+      await applyWrites(plan, labels);
+      return Promise.all(plan.map(withValue));
     },
   );
 
   tool(
     "mixer_get",
+    { title: "Get mixer", annotations: READ },
     "Get the mixer of a track or rack chain: volume, panning, and sends with " +
-      "current values and parameter ids (settable via parameter_set).",
-    { target_id: z.string().describe("Track, Chain, or mixer id") },
-    async ({ target_id }) => {
-      const target = resolve(target_id, DataModelObject);
-      const mixer =
-        target instanceof Track || target instanceof Chain
-          ? target.mixer
-          : target instanceof TrackMixer || target instanceof ChainMixer
-            ? target
-            : null;
-      if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
-      return await mixerDetail(mixer);
-    },
+      "current values and parameter ids (settable via parameter_set). Address it " +
+      "by target_id, or the track by track_id/track_index/track_name.",
+    { target_id: z.string().optional().describe("Track, Chain, or mixer id"), ...trackAddress() },
+    async (args) => await mixerDetail(findMixer(args).mixer),
   );
+
+  const mixerTarget = () => ({
+    target_id: z.string().optional().describe("Track, Chain, or mixer id"),
+    ...trackAddress(),
+  });
+  const mixerValues = () => ({
+    volume: z.number().min(0).max(1).optional(),
+    panning: z.number().min(-1).max(1).optional(),
+    sends: z
+      .array(
+        z.object({
+          index: z.number().int().min(0).optional().describe("Send index; order matches the return tracks"),
+          return_name: z
+            .string()
+            .optional()
+            .describe("Instead of index: the return track's name (track mixers only)"),
+          value: z.number().min(0).max(1),
+        }),
+      )
+      .optional(),
+  });
+  type MixerValues = z.objectOutputType<ReturnType<typeof mixerValues>, z.ZodTypeAny>;
+  type AnyMixer = TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">;
+
+  // Validates one mixer's values and returns its parameter writes.
+  function mixerWrites(mixer: AnyMixer, v: MixerValues): Array<() => Promise<void>> {
+    const writes: Array<() => Promise<void>> = [];
+    if (v.volume !== undefined) writes.push(() => mixer.volume.setValue(v.volume!));
+    if (v.panning !== undefined) writes.push(() => mixer.panning.setValue(v.panning!));
+    for (const send of v.sends ?? []) {
+      if ((send.index === undefined) === (send.return_name === undefined))
+        throw new UsageError("Each send takes exactly one of index or return_name.");
+      let index = send.index!;
+      if (send.return_name !== undefined) {
+        if (!(mixer instanceof TrackMixer))
+          throw new UsageError("return_name only applies to track mixers; address rack chain sends by index.");
+        const returns = song().returnTracks.map((track, i) => ({ track, i }));
+        const describe = (r: (typeof returns)[number]) => `${JSON.stringify(r.track.name)} (send ${r.i})`;
+        const hint = "Use the send index.";
+        index = byName("return track", send.return_name, returns, (r) => r.track.name, describe, { hint }).i;
+      }
+      const p = mixer.sends[index];
+      if (!p) throw new UsageError(`send index ${index} out of range (${mixer.sends.length} sends).`);
+      writes.push(() => p.setValue(send.value));
+    }
+    if (!writes.length) throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
+    return writes;
+  }
+
+  // all_tracks selection. A group's volume already changes how loud its tracks
+  // are, so volume is set on the top-most tracks only: a track inside a group
+  // that is set is "covered" and keeps its own volume, so the change is not
+  // applied twice. Panning and sends are each track's own (a grouped track's
+  // sends go straight to the return tracks), so with `perTrack` (panning or
+  // sends are set) a covered track is selected too, marked `coveredBy`, and
+  // only its volume is left alone. Excluded tracks and everything inside an
+  // excluded group are left alone; a group that contains an excluded track is
+  // not set either (that would change the excluded track too) — its other
+  // tracks are set one by one instead.
+  function topmostTracks(exclude: TrackAddress[], perTrack: boolean) {
+    const excluded = new Set(exclude.map((a, i) => at(`exclude[${i}]`, () => findTrack(a)).handle.id));
+    const tracks = song().tracks.map((track) => {
+      const groups: Track<"1.0.0">[] = []; // innermost first
+      for (let g = track.groupTrack; g && groups.length < 64; g = g.groupTrack) groups.push(g);
+      return { track, groups };
+    });
+    const holdsExcluded = new Set(
+      tracks
+        .filter(({ track }) => excluded.has(track.handle.id))
+        .flatMap(({ groups }) => groups.map((g) => g.handle.id)),
+    );
+    const selected: Array<{ track: Track<"1.0.0">; coveredBy?: string }> = [];
+    const skipped: Array<{ track_id: string; name: string; reason: string }> = [];
+    for (const { track, groups } of tracks) {
+      const skip = (reason: string) => skipped.push({ track_id: remember(track), name: track.name, reason });
+      const excludedGroup = groups.find((g) => excluded.has(g.handle.id));
+      // groups that will be set, innermost first: those holding no excluded track
+      const setGroups = groups.filter((g) => !holdsExcluded.has(g.handle.id));
+      if (excluded.has(track.handle.id)) skip("excluded");
+      else if (excludedGroup) skip(`inside the excluded group ${JSON.stringify(excludedGroup.name)}`);
+      else if (holdsExcluded.has(track.handle.id))
+        skip("group containing an excluded track; its other tracks are set instead");
+      else if (setGroups.length) {
+        const coveredBy = `covered by its group ${JSON.stringify(setGroups[setGroups.length - 1].name)}`;
+        if (perTrack) selected.push({ track, coveredBy });
+        else skip(coveredBy);
+      } else selected.push({ track });
+    }
+    return { selected, skipped };
+  }
 
   tool(
     "mixer_set",
-    "Set volume, panning, and/or sends of a track or rack chain mixer in one " +
-      "call (single undo step). Volume is normalized 0-1 (0.85 = 0 dB unity, " +
-      "1.0 = +6 dB); panning is -1..1; sends are addressed by index (order " +
-      "matches the return tracks).",
+    { title: "Set mixer", annotations: SET },
+    "Set volume, panning, and/or sends of track or rack chain mixers in one call " +
+      "(single undo step; nothing is changed if any target is invalid). Volume is " +
+      "normalized 0-1 (0.85 = 0 dB unity, 1.0 = +6 dB); panning is -1..1; each " +
+      "send is addressed by index (order matches the return tracks) or return_name. " +
+      "Choose the mixers with ONE of: target_id (Track, Chain, or mixer id) or " +
+      "track_id/track_index/track_name; `targets` (the same values on several); " +
+      "`all_tracks` (every regular track, minus `exclude`); or `items` (one entry " +
+      "per mixer with its own values). all_tracks sets volume on the top-most tracks " +
+      "only: a group track covers the tracks inside it, which keep their volume " +
+      "(listed in `skipped`, or with `volume_skipped` when they get panning or sends); " +
+      "panning and sends are set on every track, grouped tracks included (a grouped " +
+      "track's sends go straight to the returns). Tracks inside an excluded group are " +
+      "left alone, and a group holding an excluded track is not set itself — its " +
+      "other tracks are. A single target returns its mixer; the other forms return " +
+      "{items} (plus `skipped` for all_tracks).",
     {
-      target_id: z.string().describe("Track, Chain, or mixer id"),
-      volume: z.number().min(0).max(1).optional(),
-      panning: z.number().min(-1).max(1).optional(),
-      sends: z
-        .array(z.object({ index: z.number().int().min(0), value: z.number().min(0).max(1) }))
-        .optional(),
+      ...mixerTarget(),
+      ...mixerValues(),
+      targets: z
+        .array(z.object(mixerTarget()))
+        .min(1)
+        .optional()
+        .describe("Several mixers that get the top-level values"),
+      all_tracks: z
+        .boolean()
+        .optional()
+        .describe("Apply the top-level values to every regular track (volume: top-most only, see description)"),
+      exclude: z
+        .array(z.object(trackAddress()))
+        .optional()
+        .describe("With all_tracks: tracks to leave alone, including everything inside an excluded group"),
+      items: z
+        .array(z.object({ ...mixerTarget(), ...mixerValues() }))
+        .min(1)
+        .optional()
+        .describe("One entry per mixer, each with its own values"),
     },
-    async ({ target_id, volume, panning, sends }) => {
-      const target = resolve(target_id, DataModelObject);
-      const mixer =
-        target instanceof Track || target instanceof Chain
-          ? target.mixer
-          : target instanceof TrackMixer || target instanceof ChainMixer
-            ? target
-            : null;
-      if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
-      const writes: Array<() => Promise<void>> = [];
-      if (volume !== undefined) writes.push(() => mixer.volume.setValue(volume));
-      if (panning !== undefined) writes.push(() => mixer.panning.setValue(panning));
-      for (const send of sends ?? []) {
-        const p = mixer.sends[send.index];
-        if (!p) throw new Error(`send index ${send.index} out of range (${mixer.sends.length} sends).`);
-        writes.push(() => p.setValue(send.value));
+    async (args) => {
+      const single = args.target_id !== undefined || hasTrackAddress(args);
+      const forms = [
+        single && "target_id/track_*",
+        args.targets && "targets",
+        args.all_tracks && "all_tracks",
+        args.items && "items",
+      ].filter(Boolean);
+      if (forms.length !== 1)
+        throw new UsageError(
+          forms.length
+            ? `Choose one way to address mixers, got ${forms.join(" + ")}.`
+            : "Provide target_id or track_id/track_index/track_name, targets, all_tracks, or items.",
+        );
+      if (args.exclude && !args.all_tracks) throw new UsageError("exclude only applies with all_tracks.");
+      const hasValues = given(args, Object.keys(mixerValues()));
+      if (args.items && hasValues)
+        throw new UsageError("With items, give volume/panning/sends in each entry instead.");
+      if (!args.items && !hasValues)
+        throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
+
+      // Validate every target before the first write.
+      type Plan = {
+        mixer: AnyMixer;
+        owner: DataModelObject<"1.0.0">;
+        writes: Array<() => Promise<void>>;
+        volumeSkipped?: string;
+      };
+      let plan: Plan[];
+      let skipped: ReturnType<typeof topmostTracks>["skipped"] | undefined;
+      if (args.items) {
+        plan = args.items.map((it, i) =>
+          at(`items[${i}]`, () => {
+            const { mixer, owner } = findMixer(it);
+            return { mixer, owner, writes: mixerWrites(mixer, it) };
+          }),
+        );
+      } else if (args.targets) {
+        plan = args.targets.map((t, i) =>
+          at(`targets[${i}]`, () => {
+            const { mixer, owner } = findMixer(t);
+            return { mixer, owner, writes: mixerWrites(mixer, args) };
+          }),
+        );
+      } else if (args.all_tracks) {
+        const sel = topmostTracks(args.exclude ?? [], args.panning !== undefined || args.sends !== undefined);
+        skipped = sel.skipped;
+        plan = sel.selected.map(({ track, coveredBy }) =>
+          at(() => `track ${describeTrack(track)}`, () => ({
+            mixer: track.mixer,
+            owner: track,
+            // a covered track gets the panning and sends, not the volume
+            writes: mixerWrites(track.mixer, coveredBy ? { ...args, volume: undefined } : args),
+            volumeSkipped: coveredBy && args.volume !== undefined ? coveredBy : undefined,
+          })),
+        );
+      } else {
+        const { mixer, owner } = findMixer(args);
+        plan = [{ mixer, owner, writes: mixerWrites(mixer, args) }];
       }
-      if (!writes.length) throw new Error("Nothing to set — provide volume, panning, and/or sends.");
-      await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
-      return await mixerDetail(mixer);
+      const writes = plan.flatMap((p) => p.writes);
+      if (writes.length) await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
+      if (single) return await mixerDetail(plan[0].mixer);
+      return {
+        items: await Promise.all(
+          plan.map(async ({ mixer, owner, volumeSkipped }) => ({
+            target_id: remember(owner),
+            name: owner instanceof Track ? owner.name : undefined,
+            ...(await mixerDetail(mixer)),
+            volume_skipped: volumeSkipped,
+          })),
+        ),
+        skipped,
+      };
     },
   );
 
@@ -940,6 +5184,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "import_file",
+    { title: "Import file into project", annotations: CREATE },
     "Copy a file into the Live project folder so Live manages it. Returns the " +
       "imported path — use that path (not the original) in subsequent calls.",
     { file_path: z.string() },
@@ -948,47 +5193,780 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     }),
   );
 
+  const audioTrackOf = (track: Track<"1.0.0">, what = "rendered") => {
+    if (!(track instanceof AudioTrack))
+      throw new UsageError(`Only audio tracks can be ${what}; ${describeTrack(track)} is a ${classOf(track)}.`);
+    return track;
+  };
+
+  // A render's analysis, or why the file could not be analyzed (the render
+  // itself succeeded, so that is not a failure of the call).
+  async function analysisOf(file: string) {
+    try {
+      return { analysis: await analyzeWav(file) };
+    } catch (e) {
+      return { analysis_error: `${file} could not be analyzed: ${errorMessage(e)}` };
+    }
+  }
+
   tool(
     "render_track_audio",
-    "Render the pre-effects audio of an audio track between two arrangement beat " +
-      "positions. Returns the path of an audio file (WAV/AIFF) in the extension's " +
-      "temp directory.",
-    { track_id: z.string(), start_time: z.number(), end_time: z.number() },
-    async ({ track_id, start_time, end_time }) => ({
-      audio_path: await context.resources.renderPreFxAudio(
-        resolve(track_id, AudioTrack),
-        start_time,
-        end_time,
-      ),
-    }),
+    { title: "Render track audio", annotations: CREATE },
+    "Render the pre-FX audio of an audio track between two arrangement beat " +
+      "positions and return the path of the WAV file. Pre-FX means the track's " +
+      "clip audio before its device chain (no effects, mixer or sends). Since " +
+      "Live 12.4.15 the render is not normalized, so its levels are meaningful " +
+      "(Live's version cannot be detected: on older versions they are not). " +
+      "The file is written to the extension's temp directory, which may be " +
+      "cleaned between sessions: persist:true copies it into the Live project " +
+      "(`imported_path`; or pass it to import_file, or clip_create, which imports " +
+      "by default). analyze:true reads the WAV and returns `analysis`: overall and " +
+      "per-channel peak and RMS in dBFS (null = digital silence), `clipped_samples` " +
+      `(at or over full scale), \`silent\` (peak below ${SILENCE_DBFS} dBFS) and a ` +
+      `${ENVELOPE_BUCKETS}-part \`envelope\` (peak and RMS per part) — an agent behind a ` +
+      "remote client cannot open the file itself. PCM 8/16/24/32-bit and float 32/64-bit " +
+      "WAVs are read. Audio tracks only, addressed by track_id, track_index or " +
+      "track_name — or `tracks` to render several over the same range (returns {items}).",
+    {
+      ...trackAddress(),
+      start_time: z.number(),
+      end_time: z.number(),
+      tracks: z
+        .array(z.object(trackAddress()))
+        .min(1)
+        .optional()
+        .describe("Several audio tracks (each by track_id, track_index or track_name), rendered one by one"),
+      analyze: z.boolean().default(false).describe("Return levels, clipping, silence and an envelope of the render"),
+      persist: z.boolean().default(false).describe("Copy the render into the Live project (imported_path)"),
+    },
+    async ({ start_time, end_time, tracks: list, analyze, persist, ...address }, extra) => {
+      if (!(end_time > start_time))
+        throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
+      if (list && hasTrackAddress(address))
+        throw new UsageError("Give tracks, or one track by track_id/track_index/track_name, not both.");
+      // Every track is checked before the first render.
+      const targets = (list ? trackSelection(list, song().tracks) : [findTrack(address)]).map((t) => audioTrackOf(t));
+      const renderOne = async (track: AudioTrack<"1.0.0">) => {
+        const audioPath = await context.resources.renderPreFxAudio(track, start_time, end_time);
+        const result: Record<string, unknown> = { audio_path: audioPath };
+        if (persist)
+          try {
+            result.imported_path = await context.resources.importIntoProject(audioPath);
+          } catch (e) {
+            throw new Error(`Rendered to ${audioPath}, but it could not be copied into the project: ${errorMessage(e)}`);
+          }
+        if (analyze) Object.assign(result, await analysisOf(audioPath));
+        return result;
+      };
+      const items: Record<string, unknown>[] = [];
+      let rendering = targets[0];
+      const what = () => `Rendering ${describeTrack(rendering)}`;
+      if (!list) return withHeartbeat(extra, (s) => `${what()} (${s} s)`, () => renderOne(targets[0]));
+      return withHeartbeat(
+        extra,
+        (s) => `${what()}, ${items.length + 1} of ${targets.length} (${s} s)`,
+        async () => {
+          for (const track of targets) {
+            // a render cannot be aborted, but a client that went away needs no more of them
+            if (extra.signal.aborted) break;
+            rendering = track;
+            const head = { track_id: remember(track), track_name: track.name };
+            try {
+              items.push({ ...head, ...(await renderOne(track)) });
+            } catch (e) {
+              // one track's failure does not lose the renders already made
+              items.push({ ...head, error: errorMessage(e) });
+            }
+          }
+          return { items };
+        },
+      );
+    },
+  );
+
+  tool(
+    "audio_track_consolidate",
+    { title: "Consolidate audio track range", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Consolidate a range of an audio track into one clip, like Live's Consolidate for audio " +
+      "comps: the track's pre-FX audio between start_time and end_time (beats) is rendered " +
+      "(its clips as they play, before the device chain, which stays on the track), copied " +
+      "into the Live project, the range is CLEARED (clips crossing its edges are shortened), " +
+      "and one unwarped audio clip of the render is created at start_time, optionally named " +
+      "and colored (#RRGGBB). Unwarped, it plays at the current tempo only. Destructive: " +
+      "confirm with the user first. Audio tracks only; the range must hold a clip. If the " +
+      "render, the import or the clearing fails, " +
+      "nothing is changed; if the clip cannot be created after the range was cleared, the " +
+      "error says so and where the render is — undo in Live restores the clips. Undo steps: " +
+      "clear, create, name and color.",
+    {
+      ...trackAddress(),
+      start_time: z.number().min(0).describe("Start of the range in beats"),
+      end_time: z.number().describe("End of the range in beats"),
+      name: z.string().optional().describe("Name of the new clip"),
+      color: z.string().optional().describe("#RRGGBB"),
+    },
+    async ({ start_time, end_time, name, color, ...address }, extra) => {
+      if (!(end_time > start_time))
+        throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
+      const parsedColor = color !== undefined ? hexToColor(color) : undefined;
+      const track = audioTrackOf(findTrack(address), "consolidated");
+      if (!clipsInRange(track.arrangementClips, start_time, end_time).length)
+        throw new UsageError(`${describeTrack(track)} has no arrangement clips between ${start_time} and ${end_time}.`);
+      // Render and import first: until the range is cleared nothing changes.
+      // Once started, the call runs to its end even if the client goes away,
+      // so that the set is never left with a cleared range and no clip.
+      let rendered: string;
+      let imported: string;
+      try {
+        [rendered, imported] = await withHeartbeat(
+          extra,
+          (s) => `Rendering ${describeTrack(track)} (${s} s)`,
+          async () => {
+            const file = await context.resources.renderPreFxAudio(track, start_time, end_time);
+            return [file, await context.resources.importIntoProject(file)] as const;
+          },
+        );
+      } catch (e) {
+        throw new Error(`Could not render and import the range: ${errorMessage(e)} Nothing was changed.`);
+      }
+      try {
+        await track.clearClipsInRange(start_time, end_time);
+      } catch (e) {
+        throw new Error(`Could not clear the range: ${errorMessage(e)} Nothing was changed (the render is at ${imported}).`);
+      }
+      let clip: AudioClip<"1.0.0">;
+      try {
+        clip = await track.createAudioClip({
+          filePath: imported,
+          startTime: start_time,
+          duration: end_time - start_time,
+          isWarped: false,
+        });
+      } catch (e) {
+        throw new Error(
+          `The range ${start_time}-${end_time} was cleared, but the consolidated clip could not be created: ` +
+            `${errorMessage(e)} The render is at ${imported}; undo in Live restores the clips.`,
+        );
+      }
+      let error: string | undefined;
+      if (name !== undefined || parsedColor !== undefined)
+        try {
+          context.withinTransaction(() => {
+            if (name !== undefined) clip.name = name;
+            if (parsedColor !== undefined) clip.color = parsedColor;
+          });
+        } catch (e) {
+          error = `the clip was created, but its name or color could not be set: ${errorMessage(e)}`;
+        }
+      return {
+        ...clipSummary(clip, true),
+        location: locate(clip),
+        rendered_path: rendered,
+        imported_path: imported,
+        cleared: [start_time, end_time],
+        error,
+      };
+    },
+  );
+
+  const MAX_SAMPLE_RESULTS = 500;
+
+  tool(
+    "sample_search",
+    { title: "Search sample files", annotations: READ },
+    "Find audio files (for clip_create, simpler_replace_sample, device_insert sample_path, " +
+      "drum_kit_build) without a shell: a read-only search of the sample folders — the " +
+      "`sample_roots` folders listed in the extension's config.json (read on every call) plus " +
+      "Live's default User Library and Factory Packs folders (~/Music/Ableton or " +
+      "~/Documents/Ableton) when they exist. Live's API has no browser access, so nothing else " +
+      "is searched; links leading outside these folders are not followed. `query` words must " +
+      "all occur in the file's path below its root (case-insensitive), e.g. \"kick 808\". " +
+      "Shallow files come first; the search stops at `limit` results, after max_depth folder " +
+      "levels, after time_limit_s or 20000 folders (`complete` false, `stopped` says why). " +
+      "Returns absolute paths, the `roots` searched (with `exists`) and config `problems`.",
+    {
+      query: z.string().optional().describe("Words that must all occur in the path below the root; omit to list"),
+      extensions: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe(`File extensions, e.g. ["wav", "aif"]; default ${AUDIO_EXTENSIONS.join(", ")}`),
+      roots: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe("Only the roots with these names or paths (see the result's `roots`)"),
+      limit: z.number().int().min(1).max(MAX_SAMPLE_RESULTS).default(50),
+      max_depth: z.number().int().min(0).max(32).default(12).describe("Folder levels below each root"),
+      time_limit_s: z.number().min(0.1).max(20).default(5).describe("Stop searching after this long"),
+    },
+    async ({ query, extensions, roots: only, limit, max_depth, time_limit_s }) => {
+      const config = configRoots(configFilePath(context.environment.storageDirectory));
+      let roots = [...config.roots, ...libraryRoots()];
+      if (only) {
+        const unknown = only.filter((o) => !roots.some((r) => r.name.toLowerCase() === o.toLowerCase() || r.path === o));
+        if (unknown.length)
+          throw new UsageError(
+            `No sample root named ${unknown.map(quote).join(", ")}. Roots: ` +
+              `${roots.map((r) => `${quote(r.name)} (${r.path})`).join(", ") || "none"}.`,
+          );
+        roots = roots.filter((r) => only.some((o) => r.name.toLowerCase() === o.toLowerCase() || r.path === o));
+      }
+      const exts = (extensions ?? AUDIO_EXTENSIONS).map((e) => (e.startsWith(".") ? e : `.${e}`).toLowerCase());
+      const terms = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+      const found = await searchSamples(roots, {
+        terms,
+        extensions: exts,
+        limit,
+        maxDepth: max_depth,
+        timeLimitMs: time_limit_s * 1000,
+        maxDirectories: 20_000,
+      });
+      return {
+        ...found,
+        problems: config.problems.length ? config.problems : undefined,
+        hint: found.roots.some((r) => r.exists)
+          ? undefined
+          : 'No sample folder exists: add folders to "sample_roots" in the extension\'s config.json ' +
+            `(${configFilePath(context.environment.storageDirectory) ?? "no storage directory"}), e.g. {"port": 8722, "sample_roots": ["/Users/me/Samples"]}.`,
+      };
+    },
+  );
+
+  // -- the user's selection (captured through context menus) ----------------
+
+  const HOW_TO_SELECT =
+    'In Live, the user right-clicks a clip, clip slot, track, scene, Drum Rack, Simpler or sample — or a ' +
+    "selection of clip slots, or a time selection in the arrangement — and chooses \"MCP: Use as selection\".";
+
+  // A captured object as selection_get reports it: its summary and location.
+  function describeCaptured(obj: DataModelObject<"1.0.0">): Record<string, unknown> {
+    const location = locate(obj);
+    if (obj instanceof Clip) return { ...clipSummary(obj), location };
+    if (obj instanceof ClipSlot) {
+      const clip = obj.clip;
+      return { id: remember(obj), class: "ClipSlot", clip: clip ? clipSummary(clip) : null, location };
+    }
+    if (obj instanceof Track) return { class: classOf(obj), ...summarizeTrack(obj), location };
+    if (obj instanceof Scene) return { class: "Scene", ...sceneSummary(obj, indexIn(song().scenes, obj)) };
+    if (obj instanceof Sample) return { id: remember(obj), class: "Sample", file_path: obj.filePath, location };
+    if (obj instanceof Device) return { ...deviceSummary(obj), location };
+    if (obj instanceof Chain) return { ...chainSummary(obj), location };
+    if (obj instanceof TakeLane) return { id: remember(obj), class: "TakeLane", name: obj.name, location };
+    return { id: remember(obj), class: classOf(obj), location };
+  }
+
+  // A lane of an arrangement selection (a track or take lane, as assumed: the
+  // SDK only says "lanes") with its clips that overlap the time selection.
+  function describeLane(obj: DataModelObject<"1.0.0">, time: Selection["time"]): Record<string, unknown> {
+    const base = { id: remember(obj), class: classOf(obj) };
+    let clips: Clip<"1.0.0">[];
+    let described: Record<string, unknown>;
+    if (obj instanceof Track) {
+      clips = obj.arrangementClips;
+      described = { ...base, name: obj.name, location: trackRef(obj) };
+    } else if (obj instanceof TakeLane) {
+      clips = obj.clips;
+      described = { ...base, name: obj.name, location: laneLocation(obj) };
+    } else {
+      return { ...base, location: locate(obj), error: "not a track or take lane, so no clips are listed" };
+    }
+    const hits = time ? clipsInRange(clips, time.start, time.end) : clips;
+    return { ...described, clips: hits.map((c) => clipSummary(c)) };
+  }
+
+  // A capture as selection_get / selection_wait return it. Objects are
+  // described now, not at capture time, so the result is current; one that
+  // was deleted since reports an error instead.
+  function describeSelection(sel: Selection) {
+    const item = (c: Selection["objects"][number], describe: (o: DataModelObject<"1.0.0">) => Record<string, unknown>) => {
+      if ("error" in c) return { error: c.error };
+      try {
+        return describe(c.object);
+      } catch (e) {
+        return {
+          id: c.id,
+          class: classOf(c.object),
+          error: `${errorMessage(e)} (was it deleted or moved since it was captured?)`,
+        };
+      }
+    };
+    const time = sel.time;
+    return {
+      captured: true,
+      seq: sel.seq,
+      captured_at: new Date(sel.capturedAt).toISOString(),
+      age_s: Math.round((Date.now() - sel.capturedAt) / 100) / 10,
+      scope: sel.scope,
+      kind: sel.kind,
+      problems: sel.problems,
+      ...(sel.kind === "arrangement"
+        ? {
+            time_selection: time && { start_time: time.start, end_time: time.end, length: time.end - time.start },
+            lanes: sel.objects.map((c) => item(c, (o) => describeLane(o, time))),
+          }
+        : { items: sel.objects.map((c) => item(c, describeCaptured)) }),
+    };
+  }
+
+  const SELECTION_RESULT =
+    "`seq` (increases with every capture), `captured_at`, `age_s`, the menu `scope`, `kind` and: for a " +
+    "clicked object (kind 'object') or a clip-slot selection ('clip_slots'), `items` — each with its id " +
+    "(usable in every other tool), a summary and its `location` (track, scene index or take lane, device " +
+    "path); for an arrangement time selection ('arrangement'), `time_selection` {start_time, end_time, " +
+    "length} in beats and `lanes`, each selected track or take lane with its clips overlapping the time " +
+    "selection. An object Live could not resolve, or that was deleted since, carries `error`.";
+
+  tool(
+    "selection_get",
+    { title: "Get the user's selection", annotations: READ },
+    "Get what the user last handed over from Live with the context-menu entry \"MCP: Use as " +
+      "selection\": Live's API has no selection getter, so this is how \"quantize this\", " +
+      "\"these slots\" or \"the selected range\" become ids. " +
+      HOW_TO_SELECT +
+      " Returns " +
+      SELECTION_RESULT +
+      " Check age_s: an old capture may not be what the user means now. Nothing captured yet: " +
+      "captured false, seq 0. To wait for the user to choose, use selection_wait.",
+    {},
+    () => {
+      const sel = selections.latest();
+      return sel ? describeSelection(sel) : { captured: false, seq: 0, hint: HOW_TO_SELECT };
+    },
+  );
+
+  tool(
+    "selection_wait",
+    { title: "Wait for the user's selection", annotations: READ },
+    "Wait until the user hands over a selection from Live (" +
+      HOW_TO_SELECT +
+      ") and return it as selection_get does: " +
+      SELECTION_RESULT +
+      " Tell the user what to select and to choose \"MCP: Use as selection\" first, then call " +
+      "this. It returns as soon as there is a capture newer than `after_seq` (default: the latest " +
+      "capture when the call starts), or after timeout_s seconds with timed_out: true — then ask " +
+      "again or call it again. Keep timeout_s under the client's request timeout (often 60 s).",
+    {
+      timeout_s: z
+        .number()
+        .min(1)
+        .max(55)
+        .default(50)
+        .describe("Seconds to wait, 1-55"),
+      after_seq: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Return as soon as the latest capture's seq is higher than this (a seq from selection_get), " +
+            "also for a capture made before this call; default: the latest seq now",
+        ),
+    },
+    async ({ timeout_s, after_seq }, extra) => {
+      // a seq that was never handed out would hide every capture until the timeout
+      const after = Math.min(after_seq ?? Infinity, selections.latestSeq);
+      const sel = await withHeartbeat(
+        extra,
+        (s) => `Waiting for the user's selection in Live (${s} of ${timeout_s} s)`,
+        () => selections.wait(after, timeout_s * 1000, extra.signal),
+      );
+      if (sel) return describeSelection(sel);
+      return {
+        captured: selections.latestSeq > 0,
+        timed_out: true,
+        seq: selections.latestSeq,
+        hint: `No new selection within ${timeout_s} s. ${HOW_TO_SELECT}`,
+      };
+    },
   );
 
   // -- ui / commands ---------------------------------------------------------
 
+  // A form for show_dialog: the server builds the page (src/dialogs.ts).
+  const formSchema = z
+    .object({
+      title: z.string().max(200).optional().describe("Heading"),
+      message: z.string().max(10_000).optional().describe("Text under the heading; line breaks are kept"),
+      fields: z
+        .array(
+          z
+            .object({
+              name: z
+                .string()
+                .regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/)
+                .describe("Key of the field's value in `values` (letters, digits, _; starting with a letter)"),
+              label: z.string().max(200).optional().describe("Label shown; default the name"),
+              type: z.enum(["text", "textarea", "number", "checkbox", "select"]).default("text"),
+              default: z
+                .union([z.string(), z.number(), z.boolean()])
+                .optional()
+                .describe("Initial value: a string (text, textarea, select: one of options), number or boolean (checkbox)"),
+              options: z.array(z.string().max(200)).min(1).max(100).optional().describe("select: the choices"),
+              placeholder: z.string().max(200).optional(),
+              min: z.number().optional().describe("number only"),
+              max: z.number().optional().describe("number only"),
+              step: z.number().positive().optional().describe("number only"),
+            })
+            .strict(),
+        )
+        .max(20)
+        .optional()
+        .describe("Inputs; their values come back in `values` with every button"),
+      choices: z
+        .array(z.string().min(1).max(60))
+        .min(1)
+        .max(8)
+        .optional()
+        .describe(
+          'Button labels, the first one highlighted; default ["OK"], or ["OK", "Cancel"] with fields. ' +
+            "Enter never presses a button",
+        ),
+    })
+    .strict();
+
   tool(
     "show_dialog",
-    "Show a modal HTML dialog inside Ableton Live and wait for the user to close " +
-      "it. The HTML can return a result by posting " +
-      "{method:'close_and_send', params:[resultString]} to " +
-      "window.webkit.messageHandlers.live (macOS) or window.chrome.webview " +
-      "(Windows). Useful to ask the user something or show a report. Blocks until " +
-      "closed.",
+    { title: "Show dialog in Live", annotations: DIALOG },
+    "Show a modal dialog inside Ableton Live; it blocks Live's UI until the user closes it. Give " +
+      "exactly one of: `form` {title?, message?, fields?, choices?} — the server builds the page " +
+      "(all text escaped) and returns the answer as JSON: `choice` (the button's label), " +
+      "`choice_index` and, with fields, `values` by field name (text, textarea, select: a string; " +
+      "number: a number or null; checkbox: a boolean). Use it to confirm a destructive edit (e.g. " +
+      'choices ["Delete 12 clips", "Cancel"]) or to ask for a few values. `html` — your own page, ' +
+      "which returns a string by posting {method:'close_and_send', params:[resultString]} to " +
+      "window.webkit.messageHandlers.live (macOS) or window.chrome.webview (Windows); the call " +
+      "returns it as `result`. `url` — an https:, file: or http://localhost page that posts " +
+      "close_and_send itself (`result`). By default the call waits until the dialog closes, but " +
+      "a client's request timeout (often 60 s) can end it first while the dialog stays open: " +
+      "for anything the user may think about, pass wait:false to get a `dialog_id` at once and " +
+      "poll dialog_result. One dialog at a time: while one is open (also the Status dialog), another is " +
+      "refused (dialog_result tells when it closed). Live cannot close a dialog from code, and " +
+      "dialogs keep no state between calls: each one starts from what you pass. Results carry " +
+      "`dialog_id` and `status`; a dialog Live cannot show fails the call (with wait:false, " +
+      "dialog_result reports status failed).",
     {
-      html: z.string(),
+      html: z.string().optional().describe("A page of your own (it must post close_and_send)"),
+      url: z
+        .string()
+        .optional()
+        .describe("Instead of html: load this https:, file: or http://localhost URL (the page posts close_and_send)"),
+      form: formSchema.optional().describe("Instead of html: a form the server builds and answers as JSON"),
       width: z.number().int().min(100).max(2000).default(480),
       height: z.number().int().min(80).max(1500).default(360),
+      wait: z
+        .boolean()
+        .default(true)
+        .describe("false: return a dialog_id at once (status open) and get the answer with dialog_result"),
+      force: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Open even though an earlier dialog is still reported open — only when the user says it is " +
+            "already closed (Live did not report it)",
+        ),
     },
-    async ({ html, width, height }) => ({
-      result: await context.ui.showModalDialog(
-        `data:text/html,${encodeURIComponent(html)}`,
-        width,
-        height,
+    async ({ html, url, form, width, height, wait, force }, extra) => {
+      const given = [html, url, form].filter((x) => x !== undefined).length;
+      if (given !== 1) throw new UsageError("Give exactly one of html, url and form.");
+      let page: string;
+      let answer: DialogRecord["answer"];
+      if (form) {
+        const choices = formChoices(form);
+        page = `data:text/html,${encodeURIComponent(formHtml(form, choices))}`;
+        answer = (raw) => formAnswer(form, choices, raw);
+      } else page = url !== undefined ? checkDialogUrl(url) : `data:text/html,${encodeURIComponent(html ?? "")}`;
+      const kind = form ? "form" : url !== undefined ? "url" : "html";
+      const record = dialogs.open(page, width, height, kind, { force, answer });
+      if (!wait)
+        return {
+          ...dialogOutcome(record),
+          hint: `Get the answer with dialog_result {dialog_id: ${JSON.stringify(record.id)}}.`,
+        };
+      // Live has no timeout for dialogs: wait until it closes, or until the
+      // client goes away (the dialog stays open; dialog_result still gets it).
+      await withHeartbeat(
+        extra,
+        (s) => `Waiting for the user to close the dialog in Live (${s} s)`,
+        () => dialogs.wait(record, Infinity, extra.signal),
+      );
+      if (record.status === "failed") throw new UsageError(`Live could not show the dialog: ${record.error}`);
+      return dialogOutcome(record);
+    },
+  );
+
+  const DIALOG_TTL_MIN = DIALOG_RESULT_TTL_MS / 60_000;
+
+  tool(
+    "dialog_result",
+    { title: "Get dialog result", annotations: READ },
+    "Get the answer of a dialog opened with show_dialog {wait:false}, or of one whose show_dialog " +
+      "call was cut off by a client timeout: `status` open (with `open_s`), closed with the answer " +
+      "— `result` (the string the page sent) or, for a form, `choice`, `choice_index` and `values` " +
+      "— or failed with `error`. An open dialog is waited for up to wait_s seconds; if it is " +
+      "still open then, the result has timed_out: true: call again (or tell the user the dialog " +
+      "is waiting). dialog_id defaults to the last dialog shown. Answers are kept for " +
+      `${DIALOG_TTL_MIN} minutes after the dialog closes.`,
+    {
+      dialog_id: z.string().optional().describe("From show_dialog; default the last dialog shown"),
+      wait_s: z
+        .number()
+        .min(0)
+        .max(50)
+        .default(30)
+        .describe("Seconds to wait for an open dialog, 0-50; keep it under the client's request timeout"),
+    },
+    async ({ dialog_id, wait_s }, extra) => {
+      const record = dialog_id !== undefined ? dialogs.get(dialog_id) : dialogs.latest();
+      if (!record)
+        throw new UsageError(
+          dialog_id !== undefined
+            ? `No dialog ${JSON.stringify(dialog_id)}: answers are kept for ${DIALOG_TTL_MIN} minutes ` +
+                "after the dialog closes (and are gone when Live restarts)."
+            : `No dialog was shown in the last ${DIALOG_TTL_MIN} minutes.`,
+        );
+      if (record.status === "open" && wait_s > 0)
+        await withHeartbeat(
+          extra,
+          (s) => `Waiting for the user to close the dialog in Live (${s} of ${wait_s} s)`,
+          () => dialogs.wait(record, wait_s * 1000, extra.signal),
+        );
+      const out = dialogOutcome(record);
+      return record.status === "open" ? { ...out, timed_out: wait_s > 0 ? true : undefined } : out;
+    },
+  );
+
+  // -- batch / batch_read ----------------------------------------------------
+
+  const MAX_BATCH_STEPS = 50;
+  const BATCH_TOOLS = new Set(["batch", "batch_read"]);
+  const STEP_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+  type Step = { tool: string; args?: Record<string, unknown>; as?: string };
+  type Outcome = { result: unknown } | { error: string };
+  type StepRef = { step: number; path: string[] };
+
+  // A fresh shape per tool (see deviceStep).
+  const batchShape = (readOnly: boolean) => ({
+    steps: z
+      .array(
+        z
+          .object({
+            tool: z.string().min(1).describe(readOnly ? "A read-only tool, e.g. track_get" : "Tool name, e.g. track_create"),
+            args: z
+              .record(z.unknown())
+              .optional()
+              .describe('The tool\'s arguments as in a direct call; {"$ref": "<step>.<path>"} takes a value from an earlier step\'s result'),
+            as: z
+              .string()
+              .regex(STEP_NAME)
+              .optional()
+              .describe("A name for this step's result in later $refs (letters, digits, _)"),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(MAX_BATCH_STEPS)
+      .describe(`1-${MAX_BATCH_STEPS} steps, run in order`),
+    on_error: z
+      .enum(["stop", "continue"])
+      .default(readOnly ? "continue" : "stop")
+      .describe(
+        "stop: no further steps after a failing one; continue: run the others (a step whose $ref " +
+          "points at a failed step fails too)",
       ),
-    }),
+  });
+
+  const isRefObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, "$ref");
+
+  // A {"$ref": "<step>.<path>"} value of step `current`: <step> is a 0-based
+  // index or an earlier step's `as`, <path> dot-separated keys and indexes.
+  function parseRef(value: Record<string, unknown>, where: string, names: Map<string, number>, current: number): StepRef {
+    const text = value.$ref;
+    if (typeof text !== "string" || Object.keys(value).length !== 1)
+      throw new UsageError(`${where}: a $ref is {"$ref": "<step>.<path>"} with a string and no other keys.`);
+    const [head, ...path] = text.split(".");
+    const step = /^\d+$/.test(head) ? Number(head) : names.get(head);
+    if (step === undefined || step >= current)
+      throw new UsageError(
+        `${where}: $ref ${quote(text)} names no earlier step: use the index of a step before step ` +
+          `${current}, or an earlier step's "as" name.`,
+      );
+    if (path.some((k) => k === "")) throw new UsageError(`${where}: $ref ${quote(text)} has an empty path segment.`);
+    return { step, path };
+  }
+
+  // Every $ref in a step's args, checked (in steps before it) before anything runs.
+  function countRefs(value: unknown, where: string, names: Map<string, number>, current: number): number {
+    if (isRefObject(value)) {
+      parseRef(value, where, names, current);
+      return 1;
+    }
+    if (Array.isArray(value)) return value.reduce((n: number, v, i) => n + countRefs(v, `${where}[${i}]`, names, current), 0);
+    if (typeof value === "object" && value !== null)
+      return Object.entries(value).reduce((n, [k, v]) => n + countRefs(v, `${where}.${k}`, names, current), 0);
+    return 0;
+  }
+
+  // The args with each $ref replaced by the value it points at.
+  function substitute(value: unknown, where: string, names: Map<string, number>, current: number, outcomes: Outcome[]): unknown {
+    if (isRefObject(value)) {
+      const { step, path } = parseRef(value, where, names, current);
+      const text = quote(String(value.$ref));
+      const outcome = outcomes[step];
+      if (!outcome || "error" in outcome)
+        throw new UsageError(`${where}: $ref ${text}: step ${step} failed, so it has no result.`);
+      let v: unknown = outcome.result;
+      for (const [i, key] of path.entries()) {
+        const next = Array.isArray(v)
+          ? /^\d+$/.test(key)
+            ? v[Number(key)]
+            : undefined
+          : typeof v === "object" && v !== null && Object.prototype.hasOwnProperty.call(v, key)
+            ? (v as Record<string, unknown>)[key]
+            : undefined;
+        if (next === undefined)
+          throw new UsageError(`${where}: $ref ${text}: step ${step}'s result has no ${quote(path.slice(0, i + 1).join("."))}.`);
+        v = next;
+      }
+      return v;
+    }
+    if (Array.isArray(value)) return value.map((v, i) => substitute(v, `${where}[${i}]`, names, current, outcomes));
+    if (typeof value === "object" && value !== null)
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, substitute(v, `${where}.${k}`, names, current, outcomes)]),
+      );
+    return value;
+  }
+
+  // A step's args through its tool's own schema (defaults applied), as the
+  // SDK validates a direct call.
+  function stepArgs(schema: z.ZodTypeAny, args: unknown, where: string, name: string): Record<string, unknown> {
+    const parsed = schema.safeParse(args);
+    if (parsed.success) return parsed.data as Record<string, unknown>;
+    const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "args"}: ${i.message}`).join("; ");
+    throw new UsageError(`${where}: invalid arguments for ${name}: ${issues}`);
+  }
+
+  async function runBatch(readOnly: boolean, steps: Step[], onError: "stop" | "continue", extra: ToolExtra) {
+    const self = readOnly ? "batch_read" : "batch";
+    const names = new Map<string, number>();
+    // Before the first step runs: every tool, name and $ref, and the args of
+    // every step without a $ref (those are checked when they run).
+    const plan = steps.map((step, i) => {
+      const where = `steps[${i}]`;
+      const entry = registry.get(step.tool);
+      if (!entry)
+        throw new UsageError(
+          known.has(step.tool)
+            ? `${where}: ${step.tool} is switched off on this server (read_only / disabled_tools in config.json).`
+            : `${where}: no tool named ${quote(step.tool)}.`,
+        );
+      const hints = entry.meta.annotations;
+      if (BATCH_TOOLS.has(step.tool)) throw new UsageError(`${where}: ${step.tool} cannot run inside ${self}.`);
+      if (hints.openWorldHint)
+        throw new UsageError(`${where}: ${step.tool} reaches outside the Live Set, so it only runs on its own.`);
+      if (readOnly && !hints.readOnlyHint)
+        throw new UsageError(`${where}: ${step.tool} can change the Live Set; batch_read runs read-only tools only (use batch).`);
+      const schema = z.object(entry.shape);
+      const args = step.args ?? {};
+      const refs = countRefs(args, `${where}.args`, names, i);
+      if (step.as !== undefined) {
+        if (names.has(step.as)) throw new UsageError(`${where}: the name ${quote(step.as)} is used by step ${names.get(step.as)}.`);
+        names.set(step.as, i);
+      }
+      return { step, entry, schema, parsed: refs ? undefined : stepArgs(schema, args, where, step.tool) };
+    });
+    // Steps report no progress of their own: they would reuse the batch's token.
+    const stepExtra: ToolExtra = { ...extra, _meta: undefined };
+    const progressToken = extra._meta?.progressToken;
+    const progress = (done: number, message: string) => {
+      if (progressToken !== undefined)
+        extra
+          .sendNotification({
+            method: "notifications/progress",
+            params: { progressToken, progress: done, total: steps.length, message },
+          })
+          .catch(() => {});
+    };
+    progress(0, `${steps.length} steps`);
+    const outcomes: Outcome[] = [];
+    const results: Record<string, unknown>[] = [];
+    for (const [i, p] of plan.entries()) {
+      if (extra.signal.aborted) break; // the client went away: run no more steps
+      const head = { step: i, tool: p.step.tool, as: p.step.as };
+      const where = `steps[${i}]`;
+      const started = Date.now();
+      try {
+        const args =
+          p.parsed ??
+          stepArgs(p.schema, substitute(p.step.args ?? {}, `${where}.args`, names, i, outcomes), where, p.step.tool);
+        const result = await p.entry.handler(args, stepExtra);
+        outcomes.push({ result });
+        results.push({ ...head, result });
+      } catch (e) {
+        const msg = errorMessage(e);
+        // as the tool wrapper logs: never the arguments
+        console.error(`[ableton-live-mcp] ${self} ${where} (${p.step.tool}) failed after ${Date.now() - started} ms: ${msg}`);
+        const error = e instanceof UsageError ? msg : `${msg} ${STALE_HINT}`;
+        outcomes.push({ error });
+        results.push({ ...head, error });
+      }
+      progress(i + 1, `${where} (${p.step.tool}) done`);
+      if ("error" in outcomes[i] && onError === "stop") break;
+    }
+    const failed = outcomes.filter((o) => "error" in o).length;
+    return {
+      ok: failed === 0 && outcomes.length === steps.length,
+      completed: outcomes.length - failed,
+      failed: failed || undefined,
+      results,
+      not_run: outcomes.length < steps.length ? steps.slice(outcomes.length).map((_, k) => outcomes.length + k) : undefined,
+    };
+  }
+
+  const BATCH_REF_HELP =
+    'A value written as {"$ref": "<step>.<path>"} is taken from an earlier step\'s result: <step> is ' +
+    "the 0-based step index or the step's `as` name, <path> dot-separated keys and array indexes, " +
+    'e.g. {"$ref": "0.id"}, {"$ref": "bass.clip_slots.0.clip.id"}. ';
+
+  tool(
+    "batch",
+    { title: "Run tools in sequence", annotations: DESTRUCTIVE_CUMULATIVE },
+    `Run up to ${MAX_BATCH_STEPS} tool calls in order in one request: \`steps: [{tool, args, as?}]\`, ` +
+      "each `args` exactly as in a direct call of that tool. " +
+      BATCH_REF_HELP +
+      "For dependent chains no compound tool covers (create a track, then a clip on it, then " +
+      "set its notes). Prefer the compound tools and `items` batches where they fit: they check " +
+      "everything first and form one undo step. Before the first step runs, every tool name, " +
+      "every $ref and the args of every step without a $ref are checked against the tools' " +
+      "schemas; steps with a $ref are checked when they run. Each step is its own undo step(s): " +
+      'the batch is not atomic. on_error "stop" (default) ends the batch at the first failing ' +
+      'step, "continue" runs the rest. Returns `results` (per step `result` or `error`), ' +
+      "`completed`, `ok`, `failed` and `not_run` (step indexes). As destructive as its steps; " +
+      "batch, batch_read, show_dialog and execute_command cannot be steps.",
+    batchShape(false),
+    ({ steps, on_error }, extra) => runBatch(false, steps, on_error, extra),
+  );
+
+  tool(
+    "batch_read",
+    { title: "Run read-only tools in sequence", annotations: READ },
+    `Run up to ${MAX_BATCH_STEPS} read-only tool calls in order in one request (the *_get tools, ` +
+      "midi_clip_get_notes, session_grid, arrangement_get, parameter_find, sample_search, " +
+      "selection_wait, ...): `steps: [{tool, args, as?}]` as in batch. " +
+      BATCH_REF_HELP +
+      "E.g. find a track, then read its first clip's notes. Any step whose tool can change the " +
+      'set is refused before anything runs. on_error "continue" (default) runs every step. ' +
+      "Returns `results` (per step `result` or `error`), `completed`, `ok` and `failed`.",
+    batchShape(true),
+    ({ steps, on_error }, extra) => runBatch(true, steps, on_error, extra),
   );
 
   tool(
     "execute_command",
+    { title: "Execute host command", annotations: COMMAND },
     "Invoke a command registered with the Extension Host by its string id. " +
       "This extension registers 'ableton-live-mcp.status' (shows a status dialog " +
       "in Live). Commands registered by other extensions can also be invoked if " +
@@ -1000,119 +5978,507 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  return server;
+  // -- resources ---------------------------------------------------------------
+
+  // Read-only views for clients that attach context instead of calling tools:
+  // the same data as song_get and track_get, offered only while those tools
+  // are. No subscriptions: the server is stateless and Live reports no
+  // changes, so a client reads again for fresh data.
+  const viaTool = async (name: string, args: Record<string, unknown>, extra: ToolExtra) => {
+    const entry = registry.get(name)!;
+    return entry.handler(z.object(entry.shape).parse(args), extra);
+  };
+  // A JSON resource read. Failures are logged like tool calls (by resource
+  // name, never the URI: it can carry a track name) and reach the client as
+  // JSON-RPC errors, argument errors as invalid params.
+  async function readJson(resource: string, uri: URL, read: () => Promise<unknown>) {
+    const started = Date.now();
+    try {
+      return { contents: [{ uri: uri.href, mimeType: "application/json", text: toJson(await read()) }] };
+    } catch (e) {
+      const msg = errorMessage(e);
+      console.error(`[ableton-live-mcp] resource ${resource} failed after ${Date.now() - started} ms: ${msg}`);
+      throw rpcError(e instanceof UsageError ? ErrorCode.InvalidParams : ErrorCode.InternalError, msg);
+    }
+  }
+
+  if (registry.has("song_get"))
+    server.registerResource(
+      "song",
+      "live://song",
+      {
+        title: "Live Set",
+        description:
+          "The Live Set as song_get returns it without arguments: tempo, scale, grid, tracks with ids, " +
+          "return and main tracks, scenes, cue points, environment. Read it again for fresh data.",
+        mimeType: "application/json",
+      },
+      (uri, extra) => readJson("song", uri, () => viaTool("song_get", {}, extra)),
+    );
+
+  // Names of all tracks (regular, return, main) for completions; none when
+  // the set cannot be read.
+  const trackNames = (): string[] => {
+    try {
+      const s = song();
+      return [...new Set([...s.tracks, ...s.returnTracks, s.mainTrack].map((t) => t.name))];
+    } catch {
+      return [];
+    }
+  };
+  // A track's URI: its name percent-encoded as one path segment, so that "/"
+  // or "," in a name cannot break the template match.
+  const trackUri = (name: string) => `live://tracks/${encodeURIComponent(name)}`;
+  // A URI per track whose name reads back as that track: names shared by
+  // several tracks (ambiguous) and "." / ".." (dot segments, which URL
+  // parsing removes) are left out; track_get reaches those by index or id.
+  function trackResources() {
+    try {
+      const s = song();
+      const all = [
+        ...s.tracks.map((t, i) => ({ t, where: `${trackKind(t, s.tracks)} track, track_index ${i}` })),
+        ...s.returnTracks.map((t, i) => ({ t, where: `return track, send_index ${i}` })),
+        { t: s.mainTrack, where: "main track" },
+      ];
+      const uses = new Map<string, number>();
+      for (const { t } of all) uses.set(t.name, (uses.get(t.name) ?? 0) + 1);
+      return all
+        .filter(({ t }) => uses.get(t.name) === 1 && !["", ".", ".."].includes(t.name))
+        .map(({ t, where }) => ({ uri: trackUri(t.name), name: t.name, description: where, mimeType: "application/json" }));
+    } catch (e) {
+      console.error(`[ableton-live-mcp] could not list the track resources: ${errorMessage(e)}`);
+      return [];
+    }
+  }
+  const decodedPrefix = (value: string) => {
+    try {
+      return decodeURIComponent(value).toLowerCase();
+    } catch {
+      return value.toLowerCase();
+    }
+  };
+
+  if (registry.has("track_get"))
+    server.registerResource(
+      "track",
+      new ResourceTemplate("live://tracks/{track}", {
+        list: () => ({ resources: trackResources() }),
+        complete: {
+          track: (value) =>
+            trackNames()
+              .filter((n) => n.toLowerCase().startsWith(decodedPrefix(value)))
+              .map(encodeURIComponent),
+        },
+      }),
+      {
+        title: "Track",
+        description:
+          "One track as track_get returns it (clip slots, take lanes, arrangement clips, devices, mixer). " +
+          "{track} is the track's name, percent-encoded (encodeURIComponent: a \"/\" in a name is %2F), " +
+          "matched like track_name: exactly first, then ignoring case; regular, return and main tracks.",
+        mimeType: "application/json",
+      },
+      (uri, variables, extra) =>
+        readJson("track", uri, async () => {
+          const raw = String(variables.track);
+          let name: string;
+          try {
+            name = decodeURIComponent(raw);
+          } catch {
+            throw new UsageError(`${quote(raw)} is not a percent-encoded track name (encode it with encodeURIComponent).`);
+          }
+          return viaTool("track_get", { track_name: name }, extra);
+        }),
+    );
+
+  // The full agent guide (the skill the instructions digest), without the
+  // skill's front matter.
+  server.registerResource(
+    "guide",
+    "live://guide",
+    {
+      title: "Ableton Live MCP guide",
+      description:
+        "How to use this server well: workflows, units, batching, what Live's API cannot do. The full " +
+        "version of the server instructions (skills/ableton-live/SKILL.md).",
+      mimeType: "text/markdown",
+    },
+    (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: GUIDE }] }),
+  );
+
+  // -- prompts -----------------------------------------------------------------
+
+  // Step-by-step instructions for common jobs (src/prompts.ts), offered only
+  // when every tool a prompt uses is exposed.
+  const promptEnv: PromptEnv = {
+    scale: () => {
+      try {
+        const s = song();
+        return { root: num(s.rootNote), intervals: s.scaleIntervals.map(num), name: s.scaleName };
+      } catch {
+        return undefined;
+      }
+    },
+    trackNames,
+  };
+  for (const p of PROMPTS) {
+    if (!p.tools.every((t) => registry.has(t))) continue;
+    server.registerPrompt(
+      p.name,
+      { title: p.title, description: p.description, argsSchema: p.args(promptEnv) },
+      (args) => {
+        try {
+          const text = renderPrompt(p, args as Record<string, string | undefined>, promptEnv);
+          return { description: p.title, messages: [{ role: "user", content: { type: "text", text } }] };
+        } catch (e) {
+          throw e instanceof UsageError ? rpcError(ErrorCode.InvalidParams, `${p.name}: ${e.message}`) : e;
+        }
+      },
+    );
+  }
+
+  return { server, tools: registry };
 }
 
 // ---------------------------------------------------------------------------
 // http server (stateless streamable-http MCP endpoint)
 
-function readConfig(context: Ctx): { port: number } {
-  const dir = context.environment.storageDirectory;
-  const fallback = { port: DEFAULT_PORT };
-  if (!dir) return fallback;
-  const file = path.join(dir, "config.json");
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    const port = (parsed as { port?: unknown }).port;
-    if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
-      return { port };
-    }
-    console.error(`[ableton-live-mcp] invalid port in ${file}, using ${DEFAULT_PORT}`);
-    return fallback;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-      // exists but unreadable/malformed — leave the user's file alone
-      console.error(`[ableton-live-mcp] could not read ${file}, using defaults:`, e);
-      return fallback;
-    }
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+// DNS-rebinding protection (the Streamable HTTP spec requires servers to
+// validate Origin). A web page whose domain rebinds to 127.0.0.1 reaches this
+// port, but the browser still sends the page's Host and, on cross-origin
+// requests, its Origin. Accept only a loopback Host (any port) and, when an
+// Origin is sent, only an http(s) loopback one; "null" is refused too.
+// Returns why the request is refused, or undefined to let it through.
+function foreignRequestReason(req: http.IncomingMessage): string | undefined {
+  const isLoopback = (url: string, schemes: string[]) => {
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+      const u = new URL(url);
+      return schemes.includes(u.protocol) && LOOPBACK_HOSTNAMES.has(u.hostname);
     } catch {
-      // storage dir not writable — run with defaults
+      return false;
     }
-    return fallback;
+  };
+  const host = req.headers.host;
+  if (!host) return "missing Host header";
+  if (!isLoopback(`http://${host}`, ["http:"])) return `invalid Host header: ${host}`;
+  const origin = req.headers.origin;
+  if (origin !== undefined && !isLoopback(origin, ["http:", "https:"]))
+    return `invalid Origin header: ${origin}`;
+  return undefined;
+}
+
+function sendJsonRpcError(
+  res: http.ServerResponse,
+  status: number,
+  code: number,
+  message: string,
+  headers: Record<string, string> = {},
+) {
+  res.writeHead(status, { ...headers, "content-type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
+// Request bodies are read by the handler (not the transport) to pick the
+// response mode; the limit is the transport's default.
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+// The request body as text, or undefined when it is over MAX_BODY_BYTES (the
+// rest is still drained, so the connection stays usable).
+function readBody(req: http.IncomingMessage): Promise<string | undefined> {
+  if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) return Promise.resolve(undefined);
+  return new Promise((resolve, reject) => {
+    const decoder = new TextDecoder();
+    let text = "";
+    let size = 0;
+    req.on("data", (chunk: Uint8Array) => {
+      size += chunk.byteLength;
+      if (size <= MAX_BODY_BYTES) text += decoder.decode(chunk, { stream: true });
+    });
+    req.on("end", () => resolve(size > MAX_BODY_BYTES ? undefined : text + decoder.decode()));
+    req.on("error", reject);
+  });
+}
+
+// A single tools/call of a PROGRESS_TOOLS tool whose client asked for
+// progress: only that is answered as an SSE stream.
+function wantsProgress(message: unknown): boolean {
+  if (typeof message !== "object" || message === null || Array.isArray(message)) return false;
+  const { method, params } = message as {
+    method?: unknown;
+    params?: { name?: unknown; _meta?: { progressToken?: unknown } };
+  };
+  const token = params?._meta?.progressToken;
+  return (
+    method === "tools/call" &&
+    typeof params?.name === "string" &&
+    PROGRESS_TOOLS.has(params.name) &&
+    (typeof token === "string" || typeof token === "number")
+  );
+}
+
+type ServerState =
+  | { kind: "starting" }
+  | { kind: "listening" }
+  | { kind: "failed"; error: string; code?: string };
+
+// In-Live status dialog, reachable from track context menus. Registered before
+// listen so that a failed start (e.g. EADDRINUSE) can be seen from inside Live.
+// `notes`: plain-text lines about config.json (switches, problems).
+function registerStatus(
+  context: Ctx,
+  port: number,
+  configFile: string | undefined,
+  state: () => ServerState,
+  dialogs: DialogStore,
+  notes: () => string[] = () => [],
+) {
+  const statusHtml = () => {
+    const s = state();
+    const lines = notes();
+    const config = configFile
+      ? `<code>${escapeHtml(configFile)}</code>`
+      : "the extension's config.json (no storage directory available)";
+    const body =
+      s.kind === "listening"
+        ? `<p>MCP endpoint: <code>http://127.0.0.1:${port}/mcp</code></p>` +
+          `<p>Add it to an MCP client as a streamable-http server.</p>` +
+          `<p style="font-size:smaller">Port set in ${config}</p>`
+        : s.kind === "failed"
+          ? `<p style="color:#ff8a80">The MCP server is not running: <code>${escapeHtml(s.error)}</code></p>` +
+            (s.code === "EADDRINUSE"
+              ? `<p>Port ${port} is already in use by another program.</p>`
+              : "") +
+            `<p>Set another <code>"port"</code> in ${config}, then restart Live.</p>`
+          : `<p>The MCP server is starting on port ${port}...</p>`;
+    const notesHtml = lines.length
+      ? `<ul style="font-size:smaller;padding-left:18px">${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>`
+      : "";
+    return (
+      // charset: the config path or error text may be non-ASCII
+      `<!doctype html><meta charset="utf-8">` +
+      `<body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
+      `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
+      body +
+      notesHtml +
+      `<button onclick="${DIALOG_BRIDGE}.postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
+      `</body>`
+    );
+  };
+  // Through the dialog store, so that show_dialog opens no second dialog over
+  // it. It always opens itself (force): the diagnosis must work even if a
+  // dialog was never reported closed. Failures are logged by the store.
+  context.commands.registerCommand("ableton-live-mcp.status", () => {
+    try {
+      const height = Math.min(560, 280 + 40 * notes().length);
+      dialogs.open(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, height, "status", { force: true });
+    } catch (e) {
+      console.error("[ableton-live-mcp] status dialog:", e);
+    }
+  });
+  for (const scope of ["AudioTrack", "MidiTrack"] as const) {
+    context.ui
+      .registerContextMenuAction(scope, "Ableton Live MCP: Status", "ableton-live-mcp.status")
+      .catch((e: unknown) => console.error(`[ableton-live-mcp] could not add the ${scope} status entry:`, e));
   }
 }
 
+// The instructions line that tells the agent which tools config.json switched
+// off, so that it says so instead of looking for workarounds.
+function exposureNote(config: Config, all: ReadonlyMap<string, Registered>, allowed: ReadonlySet<string>) {
+  const off = [...all.keys()].filter((n) => !allowed.has(n));
+  if (!off.length) return undefined;
+  const reads = off.filter((n) => all.get(n)!.meta.annotations.readOnlyHint);
+  const what = config.readOnly
+    ? "This server is read-only (read_only in config.json): every tool that changes the Live Set is switched " +
+      `off${reads.length ? `, and so are ${reads.join(", ")}` : ""}`
+    : `Switched off on this server (disabled_tools in config.json): ${off.join(", ")}`;
+  return `- ${what}. Tell the user when a request needs them; don't look for workarounds.`;
+}
+
+// The Status dialog's lines about config.json. Never the token.
+function configNotes(config: Config, all: ReadonlyMap<string, Registered>, allowed: ReadonlySet<string>) {
+  const notes: string[] = [];
+  if (config.locked) notes.push(`Every request is refused: ${config.locked}. Fix config.json, then restart Live.`);
+  if (config.readOnly) notes.push(`Read-only: ${allowed.size} of ${all.size} tools are on (read_only).`);
+  const disabled = config.disabledTools.filter((n) => all.has(n));
+  if (disabled.length) notes.push(`Switched off (disabled_tools): ${disabled.join(", ")}.`);
+  if (config.tokenDigest) notes.push("Requests need the bearer token (auth_token in config.json).");
+  return [...notes, ...config.problems.map((p) => `config.json: ${p}`)];
+}
+
 export async function startServer(context: Ctx, hostApiVersion: string): Promise<void> {
-  const { port } = readConfig(context);
+  const config = readConfig(context.environment.storageDirectory);
+  const { port, file: configFile, progress } = config;
+  for (const p of config.problems) console.error(`[ableton-live-mcp] config: ${p}`);
+  let state: ServerState = { kind: "starting" };
+  let notes: string[] = config.problems.map((p) => `config.json: ${p}`);
+  // Dialogs outlive the per-request McpServer (show_dialog {wait:false}, then
+  // dialog_result), so the store lives here.
+  const dialogs = new DialogStore(context);
+  try {
+    registerStatus(context, port, configFile, () => state, dialogs, () => notes);
+  } catch (e) {
+    // a convenience only: never let it keep the endpoint from starting
+    console.error("[ableton-live-mcp] could not register the status command:", e);
+  }
+  // The user's selection arrives through context-menu commands; captures
+  // outlive the per-request McpServer, so the store lives here.
+  const selections = new SelectionStore(context);
+  try {
+    registerSelectionMenus(context, selections);
+  } catch (e) {
+    console.error("[ableton-live-mcp] could not register the selection menu entries:", e);
+  }
+
+  // The tools every per-request server exposes, decided once here from a
+  // catalog of all of them: read_only keeps the readOnlyHint ones,
+  // disabled_tools drops the ones it names. A name that is no tool is
+  // probably a typo of one the user wants off, so it locks the endpoint.
+  let catalog: ReadonlyMap<string, Registered>;
+  try {
+    catalog = buildServer(context, hostApiVersion, port, selections, dialogs).tools;
+  } catch (e) {
+    state = { kind: "failed", error: errorMessage(e) };
+    throw e;
+  }
+  const unknownTools = config.disabledTools.filter((n) => !catalog.has(n));
+  if (unknownTools.length)
+    lock(config, `disabled_tools in config.json names no tool: ${unknownTools.map((n) => JSON.stringify(n)).join(", ")}`);
+  const disabled = new Set(config.disabledTools);
+  const allowed: ReadonlySet<string> = new Set(
+    [...catalog]
+      .filter(([name, t]) => !disabled.has(name) && (!config.readOnly || t.meta.annotations.readOnlyHint === true))
+      .map(([name]) => name),
+  );
+  const exposure: Exposure = {
+    allowed: allowed.size < catalog.size ? allowed : undefined,
+    note: exposureNote(config, catalog, allowed),
+  };
+  notes = configNotes(config, catalog, allowed);
+  if (config.locked) console.error(`[ableton-live-mcp] every /mcp request is refused: ${config.locked} (${configFile})`);
+  let listeningSince = Date.now();
 
   const httpServer = http.createServer(async (req, res) => {
     try {
-      if (req.url === "/health") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, ...SERVER_INFO }));
+      // Before routing, so a rebinding page can't even probe /health.
+      const refused = foreignRequestReason(req);
+      if (refused) {
+        console.error(`[ableton-live-mcp] refused request: ${refused}`);
+        sendJsonRpcError(res, 403, -32000, `Forbidden: ${refused}`);
         return;
       }
-      if (!req.url?.startsWith("/mcp")) {
+      // One trailing slash is accepted ("/mcp/"), as clients are configured either way.
+      const rawPath = (req.url ?? "").split("?")[0];
+      const pathname = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
+      if (pathname === "/health") {
+        // Unauthenticated: only what any local client may know (no paths, no
+        // config details, never the token). 503 while config.json locks /mcp.
+        res.writeHead(config.locked ? 503 : 200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(
+          JSON.stringify({
+            ok: !config.locked,
+            ...SERVER_INFO,
+            host_api_version: hostApiVersion,
+            tool_count: allowed.size,
+            read_only: config.readOnly,
+            auth_required: config.tokenDigest !== undefined,
+            uptime_s: Math.floor((Date.now() - listeningSince) / 1000),
+            error: config.locked
+              ? "config.json has an invalid security setting, or cannot be read or parsed: every /mcp request is " +
+                "refused (the Status dialog in Live says why)"
+              : undefined,
+          }),
+        );
+        return;
+      }
+      if (pathname !== "/mcp") {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("Not found. MCP endpoint: POST /mcp");
         return;
       }
-      if (Number(req.headers["content-length"]) > 16_000_000) {
-        res.writeHead(413, { "content-type": "text/plain" });
-        res.end("Payload too large");
+      // Before anything else about /mcp, and before the body is read: an
+      // unauthenticated client learns nothing and gets nothing buffered.
+      if (config.tokenDigest && !bearerMatches(req.headers.authorization, config.tokenDigest)) {
+        const sent = req.headers.authorization !== undefined;
+        console.error(`[ableton-live-mcp] refused request: ${sent ? "invalid" : "missing"} bearer token`);
+        sendJsonRpcError(res, 401, -32000, "Unauthorized: this server needs the header Authorization: Bearer <token>", {
+          "www-authenticate": `Bearer realm="ableton-live-mcp"${sent ? ', error="invalid_token"' : ""}`,
+        });
         return;
+      }
+      if (config.locked) {
+        sendJsonRpcError(res, 503, -32000, `Service unavailable: ${config.locked}. Fix config.json, then restart Live.`);
+        return;
+      }
+      if (req.method !== "POST") {
+        // Stateless server: no standalone SSE stream to GET, no session to DELETE.
+        // Clients treat 405 on GET as "no server-initiated stream".
+        sendJsonRpcError(res, 405, -32000, "Method not allowed. MCP endpoint: POST /mcp", {
+          allow: "POST",
+        });
+        return;
+      }
+      const body = await readBody(req);
+      if (body === undefined) {
+        sendJsonRpcError(res, 413, -32000, `Payload Too Large: Request body must not exceed ${MAX_BODY_BYTES} bytes`);
+        return;
+      }
+      // Unparsable text is passed on as it is: the transport answers it with
+      // its spec-correct 400/-32700 (after its 406 and 415 checks).
+      let message: unknown = body;
+      try {
+        message = JSON.parse(body);
+      } catch {
+        // see above
       }
       // Stateless mode: a fresh server+transport per request. Object ids live in
       // the module-level store, so state survives across requests regardless.
+      // Responses are plain JSON, except for a long call that asked for
+      // progress: an SSE stream carries its notifications/progress, then the
+      // result (the SDK also sends a keep-alive comment every 15 s).
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
-        enableJsonResponse: true,
+        enableJsonResponse: !(progress && wantsProgress(message)),
       });
-      const mcp = buildServer(context, hostApiVersion, port);
+      const { server: mcp } = buildServer(context, hostApiVersion, port, selections, dialogs, exposure);
       res.on("close", () => {
         void transport.close();
         void mcp.close();
       });
       await mcp.connect(transport);
-      // No pre-parsed body: the transport reads the stream itself and answers
-      // spec-correct 400/-32700 (parse error), 406, and 415 responses.
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, message);
     } catch (e) {
       console.error("[ableton-live-mcp] request error:", e);
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal server error" },
-            id: null,
-          }),
-        );
-      }
+      if (!res.headersSent) sendJsonRpcError(res, 500, -32603, "Internal server error");
     }
   });
 
-  await new Promise<void>((res, rej) => {
-    httpServer.once("error", rej);
-    httpServer.listen(port, "127.0.0.1", res);
-  });
-  // The startup once-handler is spent; keep a persistent one so a later server
-  // 'error' (e.g. EMFILE on accept) is logged instead of crashing the host.
+  try {
+    await new Promise<void>((res, rej) => {
+      httpServer.once("error", rej);
+      httpServer.listen(port, "127.0.0.1", () => {
+        httpServer.off("error", rej);
+        res();
+      });
+    });
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    state = { kind: "failed", error: err?.message ?? String(e), code: err?.code };
+    throw e;
+  }
+  state = { kind: "listening" };
+  listeningSince = Date.now();
+  // Keep a persistent handler so a later server 'error' (e.g. EMFILE on
+  // accept) is logged instead of crashing the host.
   httpServer.on("error", (e) => console.error("[ableton-live-mcp] server error:", e));
   console.log(`[ableton-live-mcp] MCP server listening on http://127.0.0.1:${port}/mcp`);
-
-  // In-Live conveniences, registered only once the endpoint is actually up:
-  // a status dialog reachable from track context menus.
-  const statusHtml = () =>
-    `<!doctype html><body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
-    `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
-    `<p>MCP endpoint: <code>http://127.0.0.1:${port}/mcp</code></p>` +
-    `<p>Add it to an MCP client as a streamable-http server.</p>` +
-    `<button onclick="(window.webkit?.messageHandlers?.live??window.chrome?.webview).postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
-    `</body>`;
-  context.commands.registerCommand("ableton-live-mcp.status", () => {
-    context.ui
-      .showModalDialog(`data:text/html,${encodeURIComponent(statusHtml())}`, 420, 220)
-      .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
-  });
-  for (const scope of ["AudioTrack", "MidiTrack"] as const) {
-    void context.ui.registerContextMenuAction(
-      scope,
-      "Ableton Live MCP: Status",
-      "ableton-live-mcp.status",
+  if (!progress) console.log(`[ableton-live-mcp] progress notifications are off (${configFile})`);
+  if (exposure.allowed)
+    console.log(
+      `[ableton-live-mcp] ${allowed.size} of ${catalog.size} tools exposed ` +
+        `(${config.readOnly ? "read_only" : "disabled_tools"} in ${configFile})`,
     );
-  }
+  if (config.tokenDigest) console.log(`[ableton-live-mcp] requests need the bearer token (auth_token in ${configFile})`);
 }

@@ -11,6 +11,8 @@ await esbuild.build({
   format: "cjs",
   platform: "node",
   sourcesContent: false,
+  // src/instructions.md (the MCP server instructions) is imported as a string.
+  loader: { ".md": "text" },
   // The Extension Host evaluates the bundle in a VM context without `global`.
   define: { global: "globalThis", __EXT_VERSION__: JSON.stringify(manifest.version) },
   // That VM context also lacks web globals (Request, Response, ReadableStream,

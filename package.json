@@ -1,6 +1,6 @@
 {
   "name": "ableton-live-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MCP server for Ableton Live, embedded in a Live Extension",
   "main": "dist/extension.cjs",
   "type": "module",
@@ -12,11 +12,11 @@
     "build:dev": "tsc --noEmit && tsx build.ts",
     "start": "npm run build:dev && extensions-cli run",
     "package": "npm run build && extensions-cli package",
-    "test": "npm run build:dev && node test/e2e.mjs"
+    "test": "npm run build:dev && node test/e2e.mjs && node test/vm-context.mjs"
   },
   "dependencies": {
     "@ableton-extensions/sdk": "file:vendor/ableton-extensions-sdk-1.0.0-beta.0.tgz",
-    "@modelcontextprotocol/sdk": "^1.21.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "zod": "^3.25.0"
   },
   "devDependencies": {
