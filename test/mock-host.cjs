@@ -304,6 +304,11 @@ const SELECTION_SCOPES = ["ClipSlotSelection", "AudioTrack.ArrangementSelection"
 // SDK opens around every setter and async operation.
 const calls = { dialogs: [], commands: {}, menus: [], imports: [], transactions: { outer: 0, all: 0 } };
 let transactionDepth = 0;
+// Modal dialogs (index.d.mts showModalDialog): by default the user closes each
+// one at once with "mock-dialog-result"; with holdDialogs they stay open until
+// a fixture closes them, as a real dialog does until the user clicks.
+let holdDialogs = false;
+const openDialogs = [];
 
 const dataModel = {
   getObjectIsOfClass: (h, cls) => get(h).classes.includes(cls),
@@ -693,7 +698,11 @@ function makeActivation(storageDir, tempDir, sink = calls) {
           sink.menus.push({ scope, title, commandId });
           onOk((onUnreg) => onUnreg());
         },
-        showModalDialog: (url, w, hgt, ok) => { sink.dialogs.push({ url, w, hgt }); ok("mock-dialog-result"); },
+        showModalDialog: (url, w, hgt, ok, err) => {
+          sink.dialogs.push({ url, w, hgt });
+          if (holdDialogs) openDialogs.push({ url, ok, err });
+          else ok("mock-dialog-result");
+        },
         showProgressDialog: (opts, onShow) => onShow({ update: (o, cb) => cb && cb(), close: (cb) => cb && cb() }),
       },
     }),
@@ -768,6 +777,21 @@ const fixtures = {
   removeScenes: (keep) => {
     for (const sc of songObj.scenes.splice(keep)) objects.delete(sc.handle.id.toString());
     for (const t of songObj.tracks) t.slots.splice(keep);
+  },
+  // Keep dialogs open until closeDialog / failDialog (or not: false).
+  holdDialogs: (on) => { holdDialogs = on; },
+  // The open dialogs' URLs, oldest first.
+  openDialogs: () => openDialogs.map((d) => d.url),
+  // The user closes the oldest open dialog: its page posted close_and_send
+  // with `result`. failDialog: the host rejects it instead (no error value,
+  // like most host callbacks).
+  closeDialog: (result) => {
+    if (!openDialogs.length) throw new Error("mock: no open dialog");
+    openDialogs.shift().ok(result);
+  },
+  failDialog: () => {
+    if (!openDialogs.length) throw new Error("mock: no open dialog");
+    openDialogs.shift().err();
   },
   // A handle Live never handed out (a deleted or unknown object).
   bogusHandle: () => ({ id: 987654321n }),

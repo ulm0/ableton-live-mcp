@@ -386,6 +386,34 @@ const samples = await call("sample_search", { query: "wav", limit: 3, time_limit
 step(`sample_search: roots ${samples.roots.filter((r) => r.exists).map((r) => r.name).join(", ") || "none"}; ` +
   `${samples.results.length} results (complete=${samples.complete})`);
 
+// --- progress on SSE responses, batches: the host path the bare VM test can only approximate
+// A long call with a progressToken is the one request answered as an SSE stream: a progress
+// notification, then the result. If this fails, set "progress_notifications": false.
+const sseRes = await fetch(URL_, {
+  method: "POST",
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "render_track_audio",
+    arguments: { track_id: audio.id, start_time: 0, end_time: 2 }, _meta: { progressToken: "smoke" } } }),
+});
+assert.match(sseRes.headers.get("content-type"), /^text\/event-stream/);
+const sseEvents = (await sseRes.text()).split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)));
+assert.equal(sseEvents[0].method, "notifications/progress");
+assert.ok(JSON.parse(sseEvents.at(-1).result.content[0].text).audio_path, "SSE result");
+const progressed = [];
+const viaClient = await client.callTool({ name: "selection_wait", arguments: { timeout_s: 1 } }, undefined,
+  { onprogress: (p) => progressed.push(p) });
+assert.equal(JSON.parse(viaClient.content[0].text).timed_out, true);
+assert.ok(progressed.length >= 1, "the SDK client received progress");
+step(`SSE progress responses work in Live (${sseEvents.length} events, ${progressed.length} via the client)`);
+const chained = await call("batch", { steps: [
+  { tool: "track_create", args: { type: "midi", name: "MCP Smoke Batch" }, as: "t" },
+  { tool: "clip_create", args: { type: "midi", track_id: { $ref: "t.id" }, start_time: 0, duration: 4,
+    patterns: [{ note: "C1", steps: "x...x...x...x..." }] } },
+  { tool: "track_delete", args: { track_id: { $ref: "t.id" } } },
+] });
+assert.deepEqual([chained.ok, chained.completed], [true, 3], JSON.stringify(chained));
+step("batch: create, clip by $ref, delete");
+
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;
 await call("song_set", { tempo: origTempo + 5 });

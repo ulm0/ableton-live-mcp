@@ -80,6 +80,16 @@ the port, it is read on every search, so no restart is needed:
 { "port": 8722, "sample_roots": ["/Users/me/Samples", "~/Splice"] }
 ```
 
+Long calls (`show_dialog`, `dialog_result`, `selection_wait`, `render_track_audio`,
+`audio_track_consolidate`, `batch`, `batch_read`) send MCP progress notifications when the client
+asks for them; such a call is then answered as an SSE stream instead of plain JSON (see
+[How it works](#how-it-works)). `"progress_notifications": false` answers every request as JSON
+again (read at startup):
+
+```json
+{ "port": 8722, "progress_notifications": false }
+```
+
 Device presets saved with `device_preset_save` are JSON files in `presets/` in the same
 directory (one file per preset, named after it); they can be copied between machines, and
 deleting a file deletes the preset.
@@ -175,6 +185,31 @@ deleting a file deletes the preset.
   `selection_get` returns the last capture (ids, summaries, locations; for a time selection the
   start/end beats and the selected lanes with their overlapping clips), `selection_wait` waits up
   to 55 s for the next one. Captures are kept until the next one (or a restart of Live).
+- **Dialogs in Live**: `show_dialog {form: {title?, message?, fields?, choices?}}` builds the
+  page itself (every text escaped) and returns the answer as JSON — `choice` (the button's label),
+  `choice_index` and `values` by field name (text, textarea, number, checkbox, select) — e.g. to
+  confirm a bulk delete; `html` (your own page) and `url` (https:, file: or http://localhost)
+  return the string the page sends. Live's dialogs are modal, have no timeout and can't be closed
+  from code, so a waiting call can outlast the client's request timeout: `wait: false` returns a
+  `dialog_id` at once and `dialog_result {dialog_id?, wait_s ≤ 50}` polls for the answer (also
+  for a dialog whose waiting call was cut off). One dialog at a time (the next is refused while
+  one is open; `force` if Live never reported it closed); answers are kept for 10 minutes.
+- **Chains of calls**: `batch {steps: [{tool, args, as?}]}` runs up to 50 tool calls in order;
+  an argument `{"$ref": "<step>.<path>"}` takes a value from an earlier step's result (step index
+  or `as` name, then keys and array indexes, e.g. `{"$ref": "0.id"}`). Every tool name, `$ref` and
+  the arguments of steps without a `$ref` are checked against the tools' own schemas before the
+  first step runs; each step is its own undo step, and `on_error` stops (default) or continues
+  after a failing step. `batch_read` does the same for read-only tools only and refuses any other.
+  `show_dialog`, `execute_command` and the batch tools themselves can't be steps.
+- **Long calls**: `show_dialog`, `dialog_result`, `selection_wait`, `render_track_audio`,
+  `audio_track_consolidate`, `batch` and `batch_read` send `notifications/progress` when the
+  request carries a `progressToken` — right away, then every 10 s (batches: one per step, with the
+  total) — so a client that resets its timeout on progress keeps waiting. Only such a call is
+  answered as an SSE stream (with the SDK's 15 s keep-alive); every other request keeps a plain
+  JSON response. When the client goes away (the connection drops), waiting calls stop waiting,
+  multi-track renders and batches start no further render or step (a dialog stays open in Live:
+  `dialog_result` gets it). A `notifications/cancelled` cannot reach a running call: the server is
+  stateless, so it arrives in a request of its own.
 - On `initialize` the server sends short **instructions** (a digest of the
   [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
   and what the API cannot do. Clients that support server instructions (Claude Code) add them
@@ -182,7 +217,8 @@ deleting a file deletes the preset.
 - Every tool has a **title and MCP annotations**, so clients can auto-approve reads and single
   out destructive calls:
   - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `parameter_find`,
-    `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `sample_search`;
+    `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `sample_search`,
+    `dialog_result`, `batch_read` (it refuses steps that are not read-only);
   - setters (`*_set`): non-destructive, idempotent;
   - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`, `render_track_audio` —
     `persist` copies the render into the project): non-destructive;
@@ -191,7 +227,7 @@ deleting a file deletes the preset.
     `clip_copy` (`move` deletes the original), `device_preset_load` and `drum_kit_build` (replace
     Simpler samples), `device_preset_save` (`overwrite` replaces a preset),
     `arrangement_copy_range` (overwrites its target range), `audio_track_consolidate` (clears
-    its range);
+    its range), `batch` (as destructive as its steps);
   - `show_dialog` (non-destructive) and `execute_command` (destructive) are open-world.
 
 ## Security
@@ -204,7 +240,7 @@ be an `http(s)` origin on one of those hosts (`Origin: null` is refused). Anythi
 `Host` and no `Origin`, so they are unaffected.
 
 The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`,
-`Allow: POST`), plus `GET /health`.
+`Allow: POST`), plus `GET /health`. Request bodies over 4 MiB are refused with `413`.
 
 ## Tools
 
@@ -292,8 +328,15 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 ### UI & commands
 | Tool | Description |
 |------|-------------|
-| `show_dialog` | Show a modal HTML dialog inside Live (ask the user, show reports). Dialogs keep no state between calls. |
+| `show_dialog` | Show a modal dialog inside Live: a `form` (title, message, text/number/checkbox/select fields, buttons) answered as JSON (`choice`, `values`), your own `html`, or an https:/file:/localhost `url`. `wait: false` returns a `dialog_id` at once. One dialog at a time; dialogs keep no state between calls. |
+| `dialog_result` | The answer of a dialog (by `dialog_id`, default the last one): open, closed with the answer, or failed; waits up to `wait_s` ≤ 50 s for an open one. Kept 10 minutes after closing. |
 | `execute_command` | Invoke Extension Host commands, e.g. `ableton-live-mcp.status`. |
+
+### Batches
+| Tool | Description |
+|------|-------------|
+| `batch` | Run up to 50 tool calls in order (`steps: [{tool, args, as?}]`); `{"$ref": "<step>.<path>"}` passes an earlier step's result on. Names, `$ref`s and ref-free arguments are checked first; each step is its own undo step; `on_error` stop (default) or continue. Not for `show_dialog`, `execute_command` or the batch tools. |
+| `batch_read` | The same for read-only tools only (any other step is refused); continues after a failed step by default. |
 
 ## Skills
 
@@ -320,6 +363,7 @@ Typical things you can ask a connected assistant to do:
 - "Move the reverb before the EQ" (a lossy copy-and-delete: see `device_copy`)
 - "What happens in bars 17 to 33?" / "Check the set for missing samples"
 - "Quantize the clip I selected" (after right-clicking it → "MCP: Use as selection")
+- "Delete the unused scenes, but ask me in Live first" (`show_dialog {form, wait: false}`, `dialog_result`)
 
 ## Limitations
 
@@ -340,7 +384,11 @@ Typical things you can ask a connected assistant to do:
   its pad fails.
 - `sample_search` only sees the folders it is given (`sample_roots`) and Live's default library
   folders — the API has no browser access.
-- `show_dialog` blocks until the user closes the dialog in Live.
+- Dialogs are modal: they block Live's UI until the user closes them, and Live can't close them
+  from code. A `show_dialog` call waits by default (`wait: false` + `dialog_result` don't).
+- `batch` is not atomic: each step is its own undo step, and a failing step leaves the earlier
+  ones applied. Live's `withinTransaction` only groups synchronous changes, so steps that wait for
+  Live can't share one undo step.
 
 ## Tests
 
@@ -351,7 +399,10 @@ node test/live-smoke.mjs  # against a real running Live with the extension loade
 ```
 
 `test/vm-context.mjs` evaluates `dist/extension.cjs` the way the Extension Host does (no
-`global`, no web globals), so a broken `build.ts` banner fails CI instead of failing in Live.
+`global`, no web globals), so a broken `build.ts` banner fails CI instead of failing in Live. It
+also runs an SSE (progress) response inside that context; the real Extension Host has not been
+tested with SSE responses yet (`test/live-smoke.mjs` checks them against Live) — if long calls
+fail there, set `"progress_notifications": false`.
 
 The live smoke test creates its own tracks/clips/devices, verifies every tool family
 (MIDI notes, warping, drum racks, rendering, ...), and deletes everything it created.
@@ -390,6 +441,9 @@ Also: if the dev Extension Host crashes, Live may refuse the next control-channe
   startup, so restart Live afterwards.
 - **403 Forbidden**: the request's `Host` or `Origin` is not a loopback address (see
   [Security](#security)). Connect to `http://127.0.0.1:<port>/mcp` or `http://localhost:<port>/mcp`.
+- **"A dialog is already open in Live"**: the server shows one dialog at a time. `dialog_result`
+  returns the open one's answer once the user closes it; if the user did close it and Live
+  never reported it, `show_dialog {force: true}` opens the next one anyway.
 - **Failed tool calls** are logged to `ExtensionHost.txt` with the tool name, duration and
   error message (never the arguments).
 - **Changed config.json but nothing happened**: config is only read when the extension

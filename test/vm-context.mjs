@@ -100,6 +100,25 @@ const rendered = await toolCall(3, "render_track_audio", { track_name: "Drums", 
 assert.ok(rendered.analysis, `analysis failed in the VM context: ${rendered.analysis_error}`);
 assert.equal(rendered.analysis.silent, true, "the mock's Drums track has no clips: a silent render");
 assert.ok(Array.isArray((await toolCall(4, "sample_search", { limit: 1, time_limit_s: 1 })).results));
+// a long call that asks for progress is answered as an SSE stream (ReadableStream,
+// TextEncoder and timers inside the context): a progress notification, then the result
+const sse = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+  method: "POST",
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call",
+    params: { name: "selection_wait", arguments: { timeout_s: 1 }, _meta: { progressToken: "vm" } } }),
+});
+assert.equal(sse.status, 200);
+assert.match(sse.headers.get("content-type"), /^text\/event-stream/);
+const events = (await sse.text()).split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)));
+assert.deepEqual([events[0].method, events[0].params.progressToken], ["notifications/progress", "vm"]);
+assert.equal(events.at(-1).id, 5);
+assert.equal(JSON.parse(events.at(-1).result.content[0].text).timed_out, true);
+// form dialogs and batches run inside the context too
+assert.equal((await toolCall(6, "show_dialog", { form: { message: "?" } })).problem.length > 0, true);
+const read = await toolCall(7, "batch_read", { steps: [{ tool: "song_get", args: { include: ["tracks"] }, as: "s" },
+  { tool: "track_get", args: { track_id: { $ref: "s.tracks.1.id" }, include: [] } }] });
+assert.deepEqual([read.ok, read.results[1].result.name], [true, "Drums"]);
 
 fs.rmSync(storageDir, { recursive: true, force: true });
 console.log("OK — bundle activates and serves MCP in a bare VM context");

@@ -92,6 +92,30 @@ or the port was changed in the extension's `config.json` (default 8722).
   (`items[2]: ...`). The user undoes the whole batch with one Cmd/Ctrl-Z.
 - Prefer one batched call over a loop of single calls.
 
+## Chaining dependent calls (`batch`, `batch_read`)
+
+- When a call needs the result of the one before (create a track, then a clip on it, then its
+  notes) and no compound tool does it, send the whole chain in one `batch {steps:[{tool, args,
+  as?}]}` (up to 50 steps, run in order). `args` are exactly a direct call's arguments; a value
+  `{"$ref": "<step>.<path>"}` is taken from an earlier step's result — `<step>` is its 0-based
+  index or its `as` name, `<path>` keys and array indexes:
+  `batch {steps:[{tool:"track_create", args:{type:"midi", name:"Keys"}, as:"keys"},
+  {tool:"clip_create", args:{type:"midi", track_id:{"$ref":"keys.id"}, start_time:0, duration:4}},
+  {tool:"midi_clip_set_notes", args:{clip_id:{"$ref":"1.id"}, notes:[...]}}]}`.
+- Unknown tools, bad `$ref`s and invalid arguments of steps without a `$ref` fail the call
+  before anything runs; steps with a `$ref` are checked when they run. The batch is NOT one undo
+  step and not atomic: with `on_error:"stop"` (default) it ends at the first failing step and
+  the earlier ones stay applied — read `results` (per step `result` or `error`), `completed`
+  and `not_run`, and tell the user what happened. `on_error:"continue"` runs the rest.
+- Prefer the compound tools and `items` batches when they fit: they validate everything first
+  and are one undo step. `batch` cannot hold `show_dialog`, `execute_command` or another batch.
+- `batch_read` is the read-only form (`*_get`, `midi_clip_get_notes`, `session_grid`,
+  `arrangement_get`, `parameter_find`, `sample_search`, `selection_wait`, ...): it refuses any
+  step that can change the set and continues after a failed step by default. E.g. a track by
+  name, then the notes of its first clip: `{steps:[{tool:"track_get", args:{track_name:"Bass",
+  include:["clip_slots"]}, as:"t"}, {tool:"midi_clip_get_notes",
+  args:{clip_id:{"$ref":"t.clip_slots.0.clip.id"}}}]}`.
+
 ## Units and conventions
 
 - All times, positions, durations are **beats** (quarter notes), not seconds or bars.
@@ -301,10 +325,25 @@ or the port was changed in the extension's `config.json` (default 8722).
 
 ## Interacting with the user in Live
 
-- `show_dialog` displays HTML inside Live and blocks until closed — use sparingly, e.g. to
-  confirm a destructive batch edit or present a summary. The HTML must call
-  `close_and_send` (see tool description) to return a value. Dialogs keep no state between
-  calls: each one starts from the HTML you pass.
+- `show_dialog` opens a modal dialog in Live; it blocks Live's UI until the user closes it, so
+  use it sparingly: to confirm a destructive bulk edit, ask for a few values, or show a summary.
+- Prefer a `form`: the server builds the page (all text escaped) and answers as JSON.
+  `show_dialog {form:{title:"Delete 12 clips?", message:"On Drums and Perc.\nUndo restores them.",
+  choices:["Delete", "Keep"]}, wait:false}` → `dialog_result {dialog_id}` → `{status:"closed",
+  choice:"Delete", choice_index:0}`. Fields (`text`, `textarea`, `number`, `checkbox`, `select`
+  with `options`; `name`, `label?`, `default?`) come back in `values` by name, with every button
+  (number: a number or null). Default buttons: OK, or OK and Cancel with fields. Act only on the
+  choice the user made; `choice: null` means the dialog closed without a button.
+- Waiting: by default `show_dialog` returns when the dialog closes, but the client's request
+  timeout (often 60 s) can end the call first while the dialog stays open. For anything the user
+  has to think about, pass `wait:false` and poll `dialog_result {dialog_id, wait_s}` (≤ 50 s;
+  `timed_out:true` = still open: call again). After a cut-off call, `dialog_result` without an id
+  returns the last dialog's answer. Answers are kept 10 minutes.
+- One dialog at a time: while one is open, `show_dialog` is refused with its `dialog_id` — get
+  its answer instead. Only when the user says it is closed already, retry with `force:true`.
+- Own pages: `html` (it must post `close_and_send` itself, see the tool description) or `url`
+  (https:, file: or http://localhost) return the page's string as `result`. Dialogs keep no
+  state between calls: each one starts from what you pass. Live cannot close a dialog from code.
 
 ## What is NOT possible
 
@@ -342,4 +381,6 @@ project (each step is undoable in Live).
 `device_preset_save` with `overwrite` replaces a saved preset file. `track_delete` and `scene_delete`
 by name need the exact name, so a case-insensitive guess can't delete the wrong object. They carry the MCP
 `destructiveHint` annotation; read-only tools carry `readOnlyHint`. For bulk destructive edits
-the user didn't explicitly enumerate, confirm first.
+the user didn't explicitly enumerate, confirm first — in Live with a `show_dialog` form
+(see [Interacting with the user in Live](#interacting-with-the-user-in-live)) or in the chat.
+`batch` carries `destructiveHint` too (it runs whatever its steps do); `batch_read` is read-only.

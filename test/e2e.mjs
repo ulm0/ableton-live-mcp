@@ -5,6 +5,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { createRequire } from "node:module";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -60,7 +61,7 @@ const usageError = async (name, args, pattern) => {
 
 // tools/list
 const { tools } = await client.listTools();
-assert.equal(tools.length, 57, `expected exactly 57 tools, got ${tools.length}`);
+assert.equal(tools.length, 60, `expected exactly 60 tools, got ${tools.length}`);
 
 // every tool has a title and explicit hints — the spec defaults
 // (destructiveHint/openWorldHint true) must never apply by omission
@@ -80,7 +81,7 @@ const annotationGroups = [
   [{ readOnlyHint: true, openWorldHint: false }, ["song_get", "track_get", "clip_get",
     "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get",
     "parameter_find", "device_preset_list", "scene_get", "session_grid", "arrangement_get", "song_audit",
-    "selection_get", "selection_wait", "sample_search"]],
+    "selection_get", "selection_wait", "sample_search", "dialog_result", "batch_read"]],
   [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
     "clip_set", "drum_chain_set", "parameter_set", "mixer_set", "device_set"]],
   [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
@@ -94,20 +95,23 @@ const annotationGroups = [
     "arrangement_copy_range"]],
   // device_copy / clip_copy move delete the original; device_preset_load and drum_kit_build replace
   // Simpler samples; audio_track_consolidate clears its range
+  // batch: as destructive as its steps
   [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes", "device_copy", "device_preset_load",
-    "clip_copy", "drum_kit_build", "audio_track_consolidate"]],
+    "clip_copy", "drum_kit_build", "audio_track_consolidate", "batch"]],
   [{ ...write(false, false), openWorldHint: true }, ["show_dialog"]],
   [{ ...write(true, false), openWorldHint: true }, ["execute_command"]],
 ];
 for (const [expected, names] of annotationGroups)
   for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
-assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 57, "snapshot lists every tool once");
+assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 60, "snapshot lists every tool once");
 
 // server instructions: a short digest, sent on initialize
 const instructions = client.getInstructions();
 assert.match(instructions, /song_get/);
 assert.match(instructions, /beats/);
-assert.ok(instructions.trim().split("\n").length <= 25, "instructions should stay a short digest");
+assert.ok(instructions.trim().split("\n").length <= 27, "instructions should stay a short digest");
+assert.match(instructions, /batch/);
+assert.match(instructions, /dialog_result/);
 
 // song_get with NO arguments key at all (spec-legal; regression for empty-shape validation)
 const noArgs = await client.callTool({ name: "song_get" });
@@ -1982,6 +1986,357 @@ assert.ok(statusMenus.every((m) => m.commandId === "ableton-live-mcp.status"));
 assert.equal(calls.menus.length, 14, "2 status entries + 12 selection entries");
 const dlg = await call("show_dialog", { html: "<b>hi</b>" });
 assert.equal(dlg.result, "mock-dialog-result");
+assert.deepEqual([dlg.status, dlg.dialog_id], ["closed", "dialog-2"], "the Status dialog was dialog-1");
+assert.equal(calls.dialogs.at(-1).url, `data:text/html,${encodeURIComponent("<b>hi</b>")}`);
+
+// --- show_dialog: url, form, non-blocking dialogs, dialog_result ---------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// until the call in flight has reached the server (a dialog is open in the mock)
+const until = async (cond, what) => {
+  for (let i = 0; i < 250; i++) {
+    if (cond()) return;
+    await sleep(20);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+};
+const dialogShown = () => until(() => fixtures.openDialogs().length === 1, "the dialog to open");
+const dialogCount = calls.dialogs.length;
+await usageError("show_dialog", {}, /Give exactly one of html, url and form/);
+await usageError("show_dialog", { html: "x", url: "https://example.com/" }, /exactly one of html, url and form/);
+for (const bad of ["http://example.com/form", "http://127.0.0.1:3000/", "javascript:alert(1)", "ftp://localhost/x"])
+  await usageError("show_dialog", { url: bad }, /url must be https:, file: or http:\/\/localhost/);
+await usageError("show_dialog", { url: "not a url" }, /Invalid url "not a url"/);
+// the form's own contradictions are refused before Live sees anything
+await usageError("show_dialog", { form: {} }, /form needs a title, a message or fields/);
+await usageError("show_dialog", { form: { fields: [{ name: "a" }, { name: "a" }] } }, /fields\[1\] \("a"\): the field name is used twice/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", type: "select" }] } }, /a select needs them/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", options: ["x"] }] } }, /options go with type "select"/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", type: "select", options: ["x"], default: "y" }] } }, /one of the options/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", type: "checkbox", default: "yes" }] } }, /checkbox field's default is a boolean/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", min: 1 }] } }, /only apply to type "number"/);
+await usageError("show_dialog", { form: { fields: [{ name: "a", type: "number", min: 5, max: 1 }] } }, /min 5 is above max 1/);
+await usageError("show_dialog", { form: { message: "x", choices: ["A", "A"] } }, /each button label once/);
+await usageError("show_dialog", { form: { fields: [{ name: "1st" }] } }, /Input validation error/);
+await usageError("show_dialog", { form: { message: "x", color: "red" } }, /Input validation error/);
+assert.equal(calls.dialogs.length, dialogCount, "refused dialogs never reach Live");
+for (const [given, opened] of [["https://example.com/form?x=1", "https://example.com/form?x=1"],
+  ["file:///tmp/My Report.html", "file:///tmp/My%20Report.html"], ["http://localhost:3000/ask", "http://localhost:3000/ask"]]) {
+  assert.equal((await call("show_dialog", { url: given })).result, "mock-dialog-result");
+  assert.equal(calls.dialogs.at(-1).url, opened);
+}
+
+// A form page as a webview runs it: the elements its script reads, built from
+// the HTML, and the message it posts to the host.
+function formPage(url) {
+  assert.ok(url.startsWith("data:text/html,"));
+  const html = decodeURIComponent(url.slice("data:text/html,".length));
+  const decode = (s) => s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+  const attrsOf = (src) =>
+    Object.fromEntries([...src.matchAll(/([\w-]+)(?:="([^"]*)")?/g)].map(([, k, v]) => [k, v === undefined ? "" : decode(v)]));
+  const elements = [];
+  for (const m of html.matchAll(/<(input|textarea|select|button)\b([^>]*)>/g)) {
+    const attrs = attrsOf(m[2]);
+    const rest = html.slice(m.index + m[0].length);
+    const el = { tag: m[1], attrs, listeners: {}, getAttribute: (k) => attrs[k] ?? null,
+      addEventListener: (type, fn) => { el.listeners[type] = fn; } };
+    if (m[1] === "textarea") el.value = decode(rest.slice(0, rest.indexOf("</textarea>")));
+    else if (m[1] === "select") {
+      const options = [...rest.slice(0, rest.indexOf("</select>")).matchAll(/<option\b([^>]*)>/g)].map((o) => attrsOf(o[1]));
+      el.options = options.map((o) => o.value);
+      el.value = (options.find((o) => "selected" in o) ?? options[0]).value;
+    } else if (m[1] === "button") el.label = decode(rest.slice(0, rest.indexOf("</button>")));
+    else if (attrs.type === "checkbox") el.checked = "checked" in attrs;
+    else el.value = attrs.value ?? "";
+    elements.push(el);
+  }
+  const posted = [];
+  const document = {
+    querySelectorAll: (sel) =>
+      sel === "[data-field]" ? elements.filter((e) => "data-field" in e.attrs)
+      : sel === "button[data-choice]" ? elements.filter((e) => e.tag === "button" && "data-choice" in e.attrs)
+      : assert.fail(`unexpected selector ${sel}`),
+  };
+  const window = { webkit: { messageHandlers: { live: { postMessage: (m) => posted.push(m) } } } };
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.equal(scripts.length, 1, "the page holds exactly the server's script");
+  vm.runInNewContext(scripts[0][1], { window, document });
+  const buttons = elements.filter((e) => e.tag === "button");
+  return {
+    html,
+    field: (name) => elements.find((e) => e.attrs["data-field"] === name),
+    buttons: buttons.map((b) => b.label),
+    // the user clicks button i: the page posts close_and_send
+    click(i) {
+      buttons[i].listeners.click();
+      const msg = posted.at(-1);
+      assert.deepEqual([Object.keys(msg), msg.method, typeof msg.params[0]], [["method", "params"], "close_and_send", "string"]);
+      return msg.params[0];
+    },
+  };
+}
+
+fixtures.holdDialogs(true);
+const evil = '<script>alert("x")</script>';
+const confirmForm = {
+  title: `Delete ${evil} clips?`,
+  message: "12 clips\non Drums & Bass",
+  fields: [
+    { name: "reason", label: "Why <b>?", default: "tidy", placeholder: '"quoted"' },
+    { name: "notes", type: "textarea", default: "</textarea><script>bad()</script>" },
+    { name: "count", type: "number", default: 4, min: 1, max: 16, step: 1 },
+    { name: "keep_empty", type: "checkbox", label: "Keep empty tracks", default: true },
+    { name: "mode", type: "select", options: ["Fast", 'Safe "mode"'], default: 'Safe "mode"' },
+  ],
+  choices: ["Delete <all>", "Cancel"],
+};
+const openedForm = await call("show_dialog", { form: confirmForm, wait: false, width: 520, height: 480 });
+assert.deepEqual([openedForm.status, openedForm.open_s], ["open", 0]);
+assert.match(openedForm.hint, new RegExp(`dialog_result \\{dialog_id: "${openedForm.dialog_id}"\\}`));
+assert.deepEqual([calls.dialogs.at(-1).w, calls.dialogs.at(-1).hgt], [520, 480]);
+const page = formPage(fixtures.openDialogs()[0]);
+// caller text is escaped into text and attribute values, never markup
+assert.ok(!page.html.includes(evil) && !page.html.includes("<b>?") && !page.html.includes("</textarea><script>"));
+assert.ok(page.html.includes("<h3>Delete &#60;script&#62;alert(&#34;x&#34;)&#60;/script&#62; clips?</h3>"));
+assert.deepEqual(page.buttons, ["Delete <all>", "Cancel"]);
+assert.equal(page.field("reason").value, "tidy");
+assert.equal(page.field("reason").attrs.placeholder, '"quoted"');
+assert.ok("autofocus" in page.field("reason").attrs, "the first field has the focus");
+assert.equal(page.field("notes").value, "</textarea><script>bad()</script>");
+assert.deepEqual([page.field("count").value, page.field("count").attrs.min, page.field("count").attrs.max], ["4", "1", "16"]);
+assert.equal(page.field("keep_empty").checked, true);
+assert.deepEqual([page.field("mode").options, page.field("mode").value], [["Fast", 'Safe "mode"'], 'Safe "mode"']);
+// Live shows one dialog at a time
+await usageError("show_dialog", { html: "<b>2</b>" },
+  new RegExp(`A dialog is already open in Live \\(dialog_id "${openedForm.dialog_id}", opened \\d+ s ago\\)`));
+// still open: dialog_result reports it at once, or after waiting
+let dres = await call("dialog_result", { dialog_id: openedForm.dialog_id, wait_s: 0 });
+assert.deepEqual([dres.status, dres.timed_out], ["open", undefined]);
+const waitStart2 = Date.now();
+dres = await call("dialog_result", { dialog_id: openedForm.dialog_id, wait_s: 1 });
+assert.deepEqual([dres.status, dres.timed_out], ["open", true]);
+assert.ok(Date.now() - waitStart2 >= 900, "waited wait_s");
+await usageError("dialog_result", { wait_s: 51 }, /Input validation error/);
+// the user edits the form and clicks "Delete <all>": a waiting dialog_result wakes up with the answer
+page.field("reason").value = "cleanup";
+page.field("count").value = " 8 ";
+page.field("keep_empty").checked = false;
+const answer = page.click(0);
+const pendingResult = call("dialog_result", { wait_s: 10 }); // default: the last dialog shown
+await sleep(100);
+fixtures.closeDialog(answer);
+dres = await pendingResult;
+const formResult = {
+  dialog_id: openedForm.dialog_id, status: "closed", choice: "Delete <all>", choice_index: 0,
+  values: { reason: "cleanup", notes: "</textarea><script>bad()</script>", count: 8, keep_empty: false, mode: 'Safe "mode"' },
+};
+assert.deepEqual(dres, formResult);
+assert.deepEqual(await call("dialog_result", { dialog_id: openedForm.dialog_id }), formResult, "answers are kept");
+
+// wait:true (the default) blocks until the dialog closes; default buttons OK / Cancel with fields, OK without
+const waitingForm = call("show_dialog", { form: { message: "How many bars?", fields: [{ name: "bars", type: "number" }] } });
+await dialogShown();
+const page2 = formPage(fixtures.openDialogs()[0]);
+assert.deepEqual(page2.buttons, ["OK", "Cancel"]);
+page2.field("bars").value = "abc"; // not a number: null
+fixtures.closeDialog(page2.click(1));
+const { dialog_id: barsId, ...bars } = await waitingForm;
+assert.match(barsId, /^dialog-\d+$/);
+assert.deepEqual(bars, { status: "closed", choice: "Cancel", choice_index: 1, values: { bars: null } });
+const waitingNote = call("show_dialog", { form: { title: "Done" } });
+await dialogShown();
+const page3 = formPage(fixtures.openDialogs()[0]);
+assert.deepEqual(page3.buttons, ["OK"]);
+fixtures.closeDialog(""); // closed without a button (if Live allows that)
+const noAnswer = await waitingNote;
+assert.deepEqual([noAnswer.choice, noAnswer.result, noAnswer.values], [null, "", undefined]);
+assert.match(noAnswer.problem, /without one of the form's buttons/);
+// html dialogs return the page's string as `result`
+const waitingHtml = call("show_dialog", { html: "<p>pick</p>" });
+await dialogShown();
+fixtures.closeDialog("picked: 3");
+const { dialog_id: pickId, ...pickedHtml } = await waitingHtml;
+assert.deepEqual([pickId.startsWith("dialog-"), pickedHtml], [true, { status: "closed", result: "picked: 3" }]);
+// a dialog Live cannot show
+const failing = client.callTool({ name: "show_dialog", arguments: { html: "x" } });
+await dialogShown();
+fixtures.failDialog();
+const failed = await failing;
+assert.equal(failed.isError, true);
+assert.match(failed.content[0].text, /Live could not show the dialog: Live rejected the dialog without details/);
+assert.doesNotMatch(failed.content[0].text, /stale/);
+const failedLater = await call("show_dialog", { html: "x", wait: false });
+fixtures.failDialog();
+assert.deepEqual(await call("dialog_result", { dialog_id: failedLater.dialog_id }),
+  { dialog_id: failedLater.dialog_id, status: "failed", error: "Live rejected the dialog without details" });
+// force: a dialog the user closed without Live reporting it does not block the next one forever
+const stuck = await call("show_dialog", { html: "<b>stuck</b>", wait: false });
+await usageError("show_dialog", { html: "x", wait: false }, /If the user already closed it, pass force:true/);
+const forced = await call("show_dialog", { html: "<b>forced</b>", wait: false, force: true });
+fixtures.closeDialog("first");
+fixtures.closeDialog("second");
+assert.equal((await call("dialog_result", { dialog_id: stuck.dialog_id })).result, "first");
+assert.equal((await call("dialog_result")).dialog_id, forced.dialog_id, "default: the last dialog shown");
+// the Status dialog counts as open too, but is never "the last dialog shown"
+await call("execute_command", { command_id: "ableton-live-mcp.status" });
+await usageError("show_dialog", { html: "x" }, /A dialog is already open in Live/);
+fixtures.closeDialog("ok");
+assert.equal((await call("dialog_result")).dialog_id, forced.dialog_id);
+// a client that goes away stops waiting; the dialog stays open and dialog_result still gets its answer
+const abortDialog = new AbortController();
+const cutOff = fetch(`http://127.0.0.1:${PORT}/mcp`, {
+  method: "POST", signal: abortDialog.signal,
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "show_dialog", arguments: { form: { message: "Still there?" } } } }),
+}).catch((e) => e.name);
+await dialogShown();
+abortDialog.abort();
+assert.equal(await cutOff, "AbortError");
+assert.equal(fixtures.openDialogs().length, 1, "the dialog stays open in Live");
+const lateAnswer = call("dialog_result", { wait_s: 10 });
+await sleep(50);
+fixtures.closeDialog(formPage(fixtures.openDialogs()[0]).click(0));
+assert.deepEqual([(await lateAnswer).status, (await lateAnswer).choice], ["closed", "OK"]);
+await usageError("dialog_result", { dialog_id: "dialog-999" }, /No dialog "dialog-999": answers are kept for 10 minutes/);
+
+// progress: a long call whose client asks for it gets notifications/progress on an SSE response
+const progressSeen = [];
+const withProgress = client.callTool({ name: "show_dialog", arguments: { form: { message: "progress?" } } }, undefined,
+  { onprogress: (p) => progressSeen.push(p), resetTimeoutOnProgress: true });
+await dialogShown();
+await until(() => progressSeen.length > 0, "a progress notification");
+await sleep(50);
+assert.equal(progressSeen.length, 1, "one progress notification right away");
+assert.equal(progressSeen[0].progress, 1);
+assert.match(progressSeen[0].message, /^Waiting for the user to close the dialog in Live \(0 s\)$/);
+fixtures.closeDialog(JSON.stringify({ choice_index: 0, values: {} }));
+const progressResult = await withProgress;
+assert.equal(JSON.parse(progressResult.content[0].text).choice, "OK");
+fixtures.holdDialogs(false);
+// closed answers expire: only the newest 20 are kept
+const oldest = await call("show_dialog", { html: "old" });
+for (let i = 0; i < 20; i++) await call("show_dialog", { html: `n${i}` });
+await usageError("dialog_result", { dialog_id: oldest.dialog_id }, /No dialog/);
+await call("dialog_result", { dialog_id: `dialog-${Number(oldest.dialog_id.slice(7)) + 1}` });
+
+// the response mode: JSON, except for a long tool called with a progressToken
+const rawToolCall = (name, args, meta) =>
+  fetch(`http://127.0.0.1:${PORT}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name, arguments: args, _meta: meta } }),
+  });
+const sseEvents = async (r) =>
+  (await r.text()).split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)));
+let modeRes = await rawToolCall("song_get", { include: [] }, { progressToken: "t1" });
+assert.match(modeRes.headers.get("content-type"), /^application\/json/, "not a long tool: JSON");
+assert.equal(typeof JSON.parse((await modeRes.json()).result.content[0].text).tempo, "number");
+modeRes = await rawToolCall("selection_wait", { timeout_s: 1 });
+assert.match(modeRes.headers.get("content-type"), /^application\/json/, "no progressToken: JSON");
+assert.equal(JSON.parse((await modeRes.json()).result.content[0].text).timed_out, true);
+modeRes = await rawToolCall("selection_wait", { timeout_s: 1 }, { progressToken: 7 });
+assert.match(modeRes.headers.get("content-type"), /^text\/event-stream/);
+let events = await sseEvents(modeRes);
+assert.deepEqual(events[0], { jsonrpc: "2.0", method: "notifications/progress",
+  params: { progressToken: 7, progress: 1, message: "Waiting for the user's selection in Live (0 of 1 s)" } });
+assert.deepEqual([events.length, events[1].id], [2, 21]);
+assert.equal(JSON.parse(events[1].result.content[0].text).timed_out, true);
+modeRes = await rawToolCall("render_track_audio", { track_name: "Drums", start_time: 0, end_time: 1 }, { progressToken: "r" });
+events = await sseEvents(modeRes);
+assert.match(events[0].params.message, /^Rendering "Drums" \(track_index 1, id \d+\) \(0 s\)$/);
+assert.ok(JSON.parse(events.at(-1).result.content[0].text).audio_path.endsWith(".wav"));
+
+// --- batch / batch_read ------------------------------------------------------------
+const tracksBeforeBatch = (await tracksNow()).map((t) => t.name);
+// a dependent chain no compound tool covers: a track, a clip on it, its notes, a mute
+const chain = await call("batch", { steps: [
+  { tool: "track_create", args: { type: "midi", name: "Batch Keys" }, as: "keys" },
+  { tool: "clip_create", args: { type: "midi", track_id: { $ref: "keys.id" }, start_time: 0, duration: 4, name: "Chords" } },
+  { tool: "midi_clip_set_notes", args: { clip_id: { $ref: "1.id" }, patterns: [{ note: "C3", steps: "x..." }], repeat: { length: 1 } } },
+  { tool: "track_set", args: { items: [{ track_id: { $ref: "keys.id" }, mute: true }] } },
+] });
+assert.deepEqual([chain.ok, chain.completed, chain.failed, chain.not_run], [true, 4, undefined, undefined]);
+assert.deepEqual(chain.results.map((r) => [r.step, r.tool, r.as]), [[0, "track_create", "keys"], [1, "clip_create", undefined],
+  [2, "midi_clip_set_notes", undefined], [3, "track_set", undefined]]);
+const keysId = chain.results[0].result.id;
+assert.equal(chain.results[1].result.name, "Chords");
+assert.equal((await call("midi_clip_get_notes", { clip_id: chain.results[1].result.id })).note_count, 4, "defaults applied (step 0.25, repeat)");
+assert.equal((await call("track_get", { track_id: keysId, include: [] })).mute, true);
+// batch_read: reads chained by $ref, also into arrays, and whole results
+const reads = await call("batch_read", { steps: [
+  { tool: "track_get", args: { track_name: "Batch Keys", include: ["arrangement_clips"] }, as: "t" },
+  { tool: "clip_get", args: { clip_id: { $ref: "t.arrangement_clips.0.id" } } },
+  { tool: "midi_clip_get_notes", args: { clip_id: { $ref: "1.id" }, format: "compact" } },
+  { tool: "session_grid", args: { tracks: [{ track_id: { $ref: "t.id" } }, { track_name: "Drums" }] } },
+] });
+assert.deepEqual([reads.ok, reads.completed], [true, 4]);
+assert.equal(reads.results[1].result.name, "Chords");
+assert.equal(reads.results[2].result.notes.length, 4);
+assert.deepEqual(reads.results[3].result.tracks.map((t) => t.name), ["Batch Keys", "Drums"]);
+// everything that can be checked is checked before the first step: nothing runs
+const txBatch = calls.transactions.all;
+const refusals = [
+  [{ steps: [{ tool: "track_set", args: { track_name: "Batch Keys", name: "X" } }, { tool: "nope" }] }, /steps\[1\]: no tool named "nope"/],
+  [{ steps: [{ tool: "track_set", args: { track_name: "Batch Keys", name: "X" } },
+    { tool: "track_set", args: { track_index: "zero" } }] }, /steps\[1\]: invalid arguments for track_set: track_index: Expected number, received string/],
+  [{ steps: [{ tool: "track_set", args: { track_name: "Batch Keys", name: "X" } },
+    { tool: "track_get", args: { track_id: { $ref: "2.id" } } }, { tool: "song_get" }] }, /steps\[1\]\.args\.track_id: \$ref "2\.id" names no earlier step/],
+  [{ steps: [{ tool: "track_set", args: { track_name: "Batch Keys", name: "X" }, as: "a" },
+    { tool: "track_get", args: { track_id: { $ref: "b.id" } } }] }, /\$ref "b\.id" names no earlier step/],
+  [{ steps: [{ tool: "track_get", args: { track_id: { $ref: "0.id" } } }] }, /names no earlier step: use the index of a step before step 0/],
+  [{ steps: [{ tool: "song_get", as: "a" }, { tool: "song_get", as: "a" }] }, /steps\[1\]: the name "a" is used by step 0/],
+  [{ steps: [{ tool: "song_get" }, { tool: "track_get", args: { track_id: { $ref: "0.tracks.0.id", x: 1 } } }] }, /a \$ref is \{"\$ref": "<step>\.<path>"\} with a string and no other keys/],
+  [{ steps: [{ tool: "song_get" }, { tool: "track_get", args: { track_id: { $ref: 0 } } }] }, /a \$ref is/],
+  [{ steps: [{ tool: "song_get" }, { tool: "track_get", args: { track_id: { $ref: "0..id" } } }] }, /empty path segment/],
+  [{ steps: [{ tool: "batch", args: { steps: [] } }] }, /steps\[0\]: batch cannot run inside batch/],
+  [{ steps: [{ tool: "show_dialog", args: { html: "x" } }] }, /show_dialog reaches outside the Live Set/],
+  [{ steps: [{ tool: "execute_command", args: { command_id: "ableton-live-mcp.status" } }] }, /execute_command reaches outside/],
+  [{ steps: [] }, /Input validation error/],
+  [{ steps: Array.from({ length: 51 }, () => ({ tool: "song_get" })) }, /Input validation error/],
+  [{ steps: [{ tool: "song_get", arguments: {} }] }, /Input validation error/],
+  [{ steps: [{ tool: "song_get", as: "1x" }] }, /Input validation error/],
+];
+for (const [args, pattern] of refusals) await usageError("batch", args, pattern);
+await usageError("batch_read", { steps: [{ tool: "song_get" }, { tool: "track_set", args: { track_name: "Batch Keys", mute: false } }] },
+  /steps\[1\]: track_set can change the Live Set; batch_read runs read-only tools only \(use batch\)/);
+await usageError("batch_read", { steps: [{ tool: "batch_read", args: { steps: [] } }] }, /batch_read cannot run inside batch_read/);
+assert.equal(calls.transactions.all, txBatch, "refused batches change nothing");
+assert.equal((await call("track_get", { track_id: keysId, include: [] })).name, "Batch Keys");
+// at run time: a failing step stops the batch (default), its error as a direct call reports it
+const stopped = await call("batch", { steps: [
+  { tool: "track_set", args: { track_id: keysId, name: "Batch Keys 2" } },
+  { tool: "track_set", args: { track_index: 99, name: "x" } },
+  { tool: "track_set", args: { track_id: keysId, name: "never" } },
+] });
+assert.deepEqual([stopped.ok, stopped.completed, stopped.failed, stopped.not_run], [false, 1, 1, [2]]);
+assert.match(stopped.results[1].error, /^track_index 99 out of range/);
+assert.doesNotMatch(stopped.results[1].error, /stale/, "argument errors carry no stale-id hint");
+assert.equal((await call("track_get", { track_id: keysId, include: [] })).name, "Batch Keys 2");
+assert.ok(errorLog.some((l) => /batch steps\[1\] \(track_set\) failed after \d+ ms: track_index 99/.test(l)), "step failures are logged");
+// host-side failures carry the stale-id hint; a $ref to a failed step or a missing field fails that step
+const continued = await call("batch", { on_error: "continue", steps: [
+  { tool: "track_get", args: { track_id: "999999" } },
+  { tool: "track_get", args: { track_id: { $ref: "0.id" } } },
+  { tool: "song_get", args: { include: [] } },
+  { tool: "track_get", args: { track_id: { $ref: "2.tracks.0.id" } } },
+  { tool: "track_set", args: { track_id: { $ref: "2.tempo" }, name: "x" } },
+] });
+assert.deepEqual([continued.ok, continued.completed, continued.failed, continued.not_run], [false, 1, 4, undefined]);
+assert.match(continued.results[0].error, /Unknown object id "999999".*stale/s);
+assert.match(continued.results[1].error, /steps\[1\]\.args\.track_id: \$ref "0\.id": step 0 failed, so it has no result/);
+assert.match(continued.results[3].error, /\$ref "2\.tracks\.0\.id": step 2's result has no "tracks"/);
+assert.match(continued.results[4].error, /steps\[4\]: invalid arguments for track_set: track_id: Expected string, received number/);
+// batch_read continues by default
+const readOn = await call("batch_read", { steps: [{ tool: "track_get", args: { track_index: 99 } }, { tool: "song_get", args: { include: [] } }] });
+assert.deepEqual([readOn.ok, readOn.completed, readOn.failed], [false, 1, 1]);
+// progress: one notification per step, with the total
+const batchProgress = [];
+const progressed = await client.callTool({ name: "batch_read", arguments: { steps: [{ tool: "song_get", args: { include: [] } },
+  { tool: "selection_get" }] } }, undefined, { onprogress: (p) => batchProgress.push(p) });
+assert.equal(JSON.parse(progressed.content[0].text).completed, 2);
+assert.deepEqual(batchProgress.map((p) => [p.progress, p.total]), [[0, 2], [1, 2], [2, 2]]);
+assert.equal(batchProgress[2].message, "steps[1] (selection_get) done");
+await call("track_delete", { track_id: keysId });
+assert.deepEqual((await tracksNow()).map((t) => t.name), tracksBeforeBatch);
 
 // error path: bogus id
 const bad = await client.callTool({ name: "track_get", arguments: { track_id: "999999" } });
@@ -2093,6 +2448,19 @@ const huge = await raw("POST", "/mcp", {
   "content-length": "16000001",
 });
 assert.equal(huge.status, 413);
+assert.equal(JSON.parse(huge.body).error.code, -32000);
+// so is an undeclared (chunked) one once it passes the transport's 4 MiB limit
+const chunked = await raw("POST", "/mcp", {
+  "content-type": "application/json", accept: "application/json, text/event-stream",
+}, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { pad: "x".repeat(4 * 1024 * 1024) } }));
+assert.equal(chunked.status, 413);
+assert.match(JSON.parse(chunked.body).error.message, /must not exceed 4194304 bytes/);
+// just under the limit is served
+const nearLimitBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { pad: "x".repeat(4 * 1024 * 1024 - 100) } });
+assert.ok(nearLimitBody.length <= 4 * 1024 * 1024);
+const nearLimit = await raw("POST", "/mcp", { "content-type": "application/json", accept: "application/json, text/event-stream" }, nearLimitBody);
+assert.equal(nearLimit.status, 200);
+assert.equal(JSON.parse(nearLimit.body).result.tools.length, tools.length);
 
 // a second instance on the same port fails to listen; its Status dialog says why
 const storageDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-test-"));
@@ -2112,6 +2480,35 @@ assert.match(failedPage, /EADDRINUSE/);
 assert.match(failedPage, new RegExp(`Port ${PORT} is already in use`));
 assert.ok(failedPage.includes(path.join(storageDir2, "config.json")), "failed status shows the config path");
 fs.rmSync(storageDir2, { recursive: true, force: true });
+
+// "progress_notifications": false in config.json: every response is JSON, also for long calls
+const PORT3 = PORT + 1;
+const storageDir3 = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-test-"));
+fs.writeFileSync(path.join(storageDir3, "config.json"), JSON.stringify({ port: PORT3, progress_notifications: false }));
+const third = { dialogs: [], commands: {}, menus: [] };
+const logged = [];
+const consoleLog = console.log;
+console.log = (...a) => { logged.push(a.map(String).join(" ")); consoleLog(...a); };
+activate(makeActivation(storageDir3, storageDir3, third));
+for (let i = 0; ; i++) {
+  try {
+    if ((await fetch(`http://127.0.0.1:${PORT3}/health`)).ok) break;
+  } catch {
+    if (i > 50) throw new Error("third instance did not start");
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+console.log = consoleLog;
+assert.ok(logged.some((l) => l.includes("progress notifications are off")), "the switch is logged");
+const noSse = await fetch(`http://127.0.0.1:${PORT3}/mcp`, {
+  method: "POST",
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "selection_wait", arguments: { timeout_s: 1 }, _meta: { progressToken: 1 } } }),
+});
+assert.match(noSse.headers.get("content-type"), /^application\/json/);
+assert.equal(JSON.parse((await noSse.json()).result.content[0].text).timed_out, true);
+fs.rmSync(storageDir3, { recursive: true, force: true });
 
 await client.close();
 fs.rmSync(storageDir, { recursive: true, force: true });

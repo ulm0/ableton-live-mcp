@@ -38,6 +38,18 @@ import {
   type NoteDescription,
   type WarpMarker,
 } from "@ableton-extensions/sdk";
+import {
+  DIALOG_BRIDGE,
+  DIALOG_RESULT_TTL_MS,
+  DialogStore,
+  checkDialogUrl,
+  dialogOutcome,
+  escapeHtml,
+  formAnswer,
+  formChoices,
+  formHtml,
+  type DialogRecord,
+} from "./dialogs.js";
 import { UsageError } from "./errors.js";
 import INSTRUCTIONS from "./instructions.md";
 import { renderNotes, type Region } from "./region.js";
@@ -140,6 +152,58 @@ const COMMAND: ToolAnnotations = {
 
 type ToolMeta = { title: string; annotations: ToolAnnotations };
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
+// Tools whose calls can run long: they wait for the user, render audio or run
+// many steps. A tools/call of one of them that carries a progressToken is
+// answered as an SSE stream, so that its notifications/progress reach the
+// client (see the HTTP handler); every other request keeps a JSON response.
+const PROGRESS_TOOLS: ReadonlySet<string> = new Set([
+  "show_dialog",
+  "dialog_result",
+  "selection_wait",
+  "render_track_audio",
+  "audio_track_consolidate",
+  "batch",
+  "batch_read",
+]);
+const PROGRESS_INTERVAL_MS = 10_000;
+
+// While `work` runs, a call whose client asked for progress (a progressToken)
+// sends notifications/progress: one at once, then one every
+// PROGRESS_INTERVAL_MS, so that a client resetting its timeout on progress
+// keeps waiting. `progress` counts the notifications (it must increase);
+// `message` says what the call is doing after that many seconds. Without a
+// token nothing is sent, and on a JSON response the transport drops them.
+async function withHeartbeat<T>(
+  extra: ToolExtra,
+  message: (seconds: number) => string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return work();
+  const started = Date.now();
+  let progress = 0;
+  const beat = () => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress: ++progress, message: message(seconds) },
+      })
+      .catch(() => {}); // the client went away: the call ends on its own
+  };
+  beat();
+  const timer = setInterval(beat, PROGRESS_INTERVAL_MS);
+  // a host call that never settles must not keep a timer for a client that is gone
+  const stop = () => clearInterval(timer);
+  extra.signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await work();
+  } finally {
+    stop();
+    extra.signal.removeEventListener("abort", stop);
+  }
+}
 
 // A MIDI pitch: 0-127, or a note name in Live's naming (C3 = 60), converted
 // with parsePitch. A fresh instance per use (see deviceStep).
@@ -788,12 +852,22 @@ function buildServer(
   hostApiVersion: string,
   port: number,
   selections: SelectionStore,
+  dialogs: DialogStore,
 ): McpServer {
   const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
   const song = () => context.application.song;
   // Transport-level failures (unparsable bodies, bad headers) are answered to
   // the client by the SDK; log them so they leave a trace in ExtensionHost.txt.
   server.server.onerror = (e) => console.error("[ableton-live-mcp] MCP error:", e.message);
+
+  // Every tool as registered: batch and batch_read validate each step with
+  // its tool's shape and call its handler directly.
+  type Registered = {
+    meta: ToolMeta;
+    shape: ZodRawShape;
+    handler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<unknown> | unknown;
+  };
+  const registry = new Map<string, Registered>();
 
   function tool<S extends ZodRawShape>(
     name: string,
@@ -805,6 +879,7 @@ function buildServer(
       extra: ToolExtra,
     ) => Promise<unknown> | unknown,
   ) {
+    registry.set(name, { meta, shape, handler: handler as Registered["handler"] });
     // A tools/call without `arguments` is validated as `{}` by the SDK, so the
     // plain shape works; `?? {}` only guards the handler contract.
     const config = { ...meta, description, inputSchema: shape as never };
@@ -5102,7 +5177,7 @@ function buildServer(
       analyze: z.boolean().default(false).describe("Return levels, clipping, silence and an envelope of the render"),
       persist: z.boolean().default(false).describe("Copy the render into the Live project (imported_path)"),
     },
-    async ({ start_time, end_time, tracks: list, analyze, persist, ...address }) => {
+    async ({ start_time, end_time, tracks: list, analyze, persist, ...address }, extra) => {
       if (!(end_time > start_time))
         throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
       if (list && hasTrackAddress(address))
@@ -5121,18 +5196,29 @@ function buildServer(
         if (analyze) Object.assign(result, await analysisOf(audioPath));
         return result;
       };
-      if (!list) return renderOne(targets[0]);
       const items: Record<string, unknown>[] = [];
-      for (const track of targets) {
-        const head = { track_id: remember(track), track_name: track.name };
-        try {
-          items.push({ ...head, ...(await renderOne(track)) });
-        } catch (e) {
-          // one track's failure does not lose the renders already made
-          items.push({ ...head, error: errorMessage(e) });
-        }
-      }
-      return { items };
+      let rendering = targets[0];
+      const what = () => `Rendering ${describeTrack(rendering)}`;
+      if (!list) return withHeartbeat(extra, (s) => `${what()} (${s} s)`, () => renderOne(targets[0]));
+      return withHeartbeat(
+        extra,
+        (s) => `${what()}, ${items.length + 1} of ${targets.length} (${s} s)`,
+        async () => {
+          for (const track of targets) {
+            // a render cannot be aborted, but a client that went away needs no more of them
+            if (extra.signal.aborted) break;
+            rendering = track;
+            const head = { track_id: remember(track), track_name: track.name };
+            try {
+              items.push({ ...head, ...(await renderOne(track)) });
+            } catch (e) {
+              // one track's failure does not lose the renders already made
+              items.push({ ...head, error: errorMessage(e) });
+            }
+          }
+          return { items };
+        },
+      );
     },
   );
 
@@ -5157,7 +5243,7 @@ function buildServer(
       name: z.string().optional().describe("Name of the new clip"),
       color: z.string().optional().describe("#RRGGBB"),
     },
-    async ({ start_time, end_time, name, color, ...address }) => {
+    async ({ start_time, end_time, name, color, ...address }, extra) => {
       if (!(end_time > start_time))
         throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
       const parsedColor = color !== undefined ? hexToColor(color) : undefined;
@@ -5165,11 +5251,19 @@ function buildServer(
       if (!clipsInRange(track.arrangementClips, start_time, end_time).length)
         throw new UsageError(`${describeTrack(track)} has no arrangement clips between ${start_time} and ${end_time}.`);
       // Render and import first: until the range is cleared nothing changes.
+      // Once started, the call runs to its end even if the client goes away,
+      // so that the set is never left with a cleared range and no clip.
       let rendered: string;
       let imported: string;
       try {
-        rendered = await context.resources.renderPreFxAudio(track, start_time, end_time);
-        imported = await context.resources.importIntoProject(rendered);
+        [rendered, imported] = await withHeartbeat(
+          extra,
+          (s) => `Rendering ${describeTrack(track)} (${s} s)`,
+          async () => {
+            const file = await context.resources.renderPreFxAudio(track, start_time, end_time);
+            return [file, await context.resources.importIntoProject(file)] as const;
+          },
+        );
       } catch (e) {
         throw new Error(`Could not render and import the range: ${errorMessage(e)} Nothing was changed.`);
       }
@@ -5410,7 +5504,11 @@ function buildServer(
     async ({ timeout_s, after_seq }, extra) => {
       // a seq that was never handed out would hide every capture until the timeout
       const after = Math.min(after_seq ?? Infinity, selections.latestSeq);
-      const sel = await selections.wait(after, timeout_s * 1000, extra.signal);
+      const sel = await withHeartbeat(
+        extra,
+        (s) => `Waiting for the user's selection in Live (${s} of ${timeout_s} s)`,
+        () => selections.wait(after, timeout_s * 1000, extra.signal),
+      );
       if (sel) return describeSelection(sel);
       return {
         captured: selections.latestSeq > 0,
@@ -5423,28 +5521,379 @@ function buildServer(
 
   // -- ui / commands ---------------------------------------------------------
 
+  // A form for show_dialog: the server builds the page (src/dialogs.ts).
+  const formSchema = z
+    .object({
+      title: z.string().max(200).optional().describe("Heading"),
+      message: z.string().max(10_000).optional().describe("Text under the heading; line breaks are kept"),
+      fields: z
+        .array(
+          z
+            .object({
+              name: z
+                .string()
+                .regex(/^[A-Za-z][A-Za-z0-9_]{0,63}$/)
+                .describe("Key of the field's value in `values` (letters, digits, _; starting with a letter)"),
+              label: z.string().max(200).optional().describe("Label shown; default the name"),
+              type: z.enum(["text", "textarea", "number", "checkbox", "select"]).default("text"),
+              default: z
+                .union([z.string(), z.number(), z.boolean()])
+                .optional()
+                .describe("Initial value: a string (text, textarea, select: one of options), number or boolean (checkbox)"),
+              options: z.array(z.string().max(200)).min(1).max(100).optional().describe("select: the choices"),
+              placeholder: z.string().max(200).optional(),
+              min: z.number().optional().describe("number only"),
+              max: z.number().optional().describe("number only"),
+              step: z.number().positive().optional().describe("number only"),
+            })
+            .strict(),
+        )
+        .max(20)
+        .optional()
+        .describe("Inputs; their values come back in `values` with every button"),
+      choices: z
+        .array(z.string().min(1).max(60))
+        .min(1)
+        .max(8)
+        .optional()
+        .describe(
+          'Button labels, the first one highlighted; default ["OK"], or ["OK", "Cancel"] with fields. ' +
+            "Enter never presses a button",
+        ),
+    })
+    .strict();
+
   tool(
     "show_dialog",
     { title: "Show dialog in Live", annotations: DIALOG },
-    "Show a modal HTML dialog inside Ableton Live and wait for the user to close " +
-      "it. The HTML can return a result by posting " +
-      "{method:'close_and_send', params:[resultString]} to " +
-      "window.webkit.messageHandlers.live (macOS) or window.chrome.webview " +
-      "(Windows). Useful to ask the user something or show a report. Blocks until " +
-      "closed. Dialogs keep no state between calls: each one starts from the " +
-      "given HTML, so include everything it needs.",
+    "Show a modal dialog inside Ableton Live; it blocks Live's UI until the user closes it. Give " +
+      "exactly one of: `form` {title?, message?, fields?, choices?} — the server builds the page " +
+      "(all text escaped) and returns the answer as JSON: `choice` (the button's label), " +
+      "`choice_index` and, with fields, `values` by field name (text, textarea, select: a string; " +
+      "number: a number or null; checkbox: a boolean). Use it to confirm a destructive edit (e.g. " +
+      'choices ["Delete 12 clips", "Cancel"]) or to ask for a few values. `html` — your own page, ' +
+      "which returns a string by posting {method:'close_and_send', params:[resultString]} to " +
+      "window.webkit.messageHandlers.live (macOS) or window.chrome.webview (Windows); the call " +
+      "returns it as `result`. `url` — an https:, file: or http://localhost page that posts " +
+      "close_and_send itself (`result`). By default the call waits until the dialog closes, but " +
+      "a client's request timeout (often 60 s) can end it first while the dialog stays open: " +
+      "for anything the user may think about, pass wait:false to get a `dialog_id` at once and " +
+      "poll dialog_result. One dialog at a time: while one is open (also the Status dialog), another is " +
+      "refused (dialog_result tells when it closed). Live cannot close a dialog from code, and " +
+      "dialogs keep no state between calls: each one starts from what you pass. Results carry " +
+      "`dialog_id` and `status` (closed or failed).",
     {
-      html: z.string(),
+      html: z.string().optional().describe("A page of your own (it must post close_and_send)"),
+      url: z
+        .string()
+        .optional()
+        .describe("Instead of html: load this https:, file: or http://localhost URL (the page posts close_and_send)"),
+      form: formSchema.optional().describe("Instead of html: a form the server builds and answers as JSON"),
       width: z.number().int().min(100).max(2000).default(480),
       height: z.number().int().min(80).max(1500).default(360),
+      wait: z
+        .boolean()
+        .default(true)
+        .describe("false: return a dialog_id at once (status open) and get the answer with dialog_result"),
+      force: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Open even though an earlier dialog is still reported open — only when the user says it is " +
+            "already closed (Live did not report it)",
+        ),
     },
-    async ({ html, width, height }) => ({
-      result: await context.ui.showModalDialog(
-        `data:text/html,${encodeURIComponent(html)}`,
-        width,
-        height,
+    async ({ html, url, form, width, height, wait, force }, extra) => {
+      const given = [html, url, form].filter((x) => x !== undefined).length;
+      if (given !== 1) throw new UsageError("Give exactly one of html, url and form.");
+      let page: string;
+      let answer: DialogRecord["answer"];
+      if (form) {
+        const choices = formChoices(form);
+        page = `data:text/html,${encodeURIComponent(formHtml(form, choices))}`;
+        answer = (raw) => formAnswer(form, choices, raw);
+      } else page = url !== undefined ? checkDialogUrl(url) : `data:text/html,${encodeURIComponent(html ?? "")}`;
+      const kind = form ? "form" : url !== undefined ? "url" : "html";
+      const record = dialogs.open(page, width, height, kind, { force, answer });
+      if (!wait)
+        return {
+          ...dialogOutcome(record),
+          hint: `Get the answer with dialog_result {dialog_id: ${JSON.stringify(record.id)}}.`,
+        };
+      // Live has no timeout for dialogs: wait until it closes, or until the
+      // client goes away (the dialog stays open; dialog_result still gets it).
+      await withHeartbeat(
+        extra,
+        (s) => `Waiting for the user to close the dialog in Live (${s} s)`,
+        () => dialogs.wait(record, Infinity, extra.signal),
+      );
+      if (record.status === "failed") throw new UsageError(`Live could not show the dialog: ${record.error}`);
+      return dialogOutcome(record);
+    },
+  );
+
+  const DIALOG_TTL_MIN = DIALOG_RESULT_TTL_MS / 60_000;
+
+  tool(
+    "dialog_result",
+    { title: "Get dialog result", annotations: READ },
+    "Get the answer of a dialog opened with show_dialog {wait:false}, or of one whose show_dialog " +
+      "call was cut off by a client timeout: `status` open (with `open_s`), closed with the answer " +
+      "— `result` (the string the page sent) or, for a form, `choice`, `choice_index` and `values` " +
+      "— or failed with `error`. An open dialog is waited for up to wait_s seconds; if it is " +
+      "still open then, the result has timed_out: true: call again (or tell the user the dialog " +
+      "is waiting). dialog_id defaults to the last dialog shown. Answers are kept for " +
+      `${DIALOG_TTL_MIN} minutes after the dialog closes.`,
+    {
+      dialog_id: z.string().optional().describe("From show_dialog; default the last dialog shown"),
+      wait_s: z
+        .number()
+        .min(0)
+        .max(50)
+        .default(30)
+        .describe("Seconds to wait for an open dialog, 0-50; keep it under the client's request timeout"),
+    },
+    async ({ dialog_id, wait_s }, extra) => {
+      const record = dialog_id !== undefined ? dialogs.get(dialog_id) : dialogs.latest();
+      if (!record)
+        throw new UsageError(
+          dialog_id !== undefined
+            ? `No dialog ${JSON.stringify(dialog_id)}: answers are kept for ${DIALOG_TTL_MIN} minutes ` +
+                "after the dialog closes (and are gone when Live restarts)."
+            : `No dialog was shown in the last ${DIALOG_TTL_MIN} minutes.`,
+        );
+      if (record.status === "open" && wait_s > 0)
+        await withHeartbeat(
+          extra,
+          (s) => `Waiting for the user to close the dialog in Live (${s} of ${wait_s} s)`,
+          () => dialogs.wait(record, wait_s * 1000, extra.signal),
+        );
+      const out = dialogOutcome(record);
+      return record.status === "open" ? { ...out, timed_out: wait_s > 0 ? true : undefined } : out;
+    },
+  );
+
+  // -- batch / batch_read ----------------------------------------------------
+
+  const MAX_BATCH_STEPS = 50;
+  const BATCH_TOOLS = new Set(["batch", "batch_read"]);
+  const STEP_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+  type Step = { tool: string; args?: Record<string, unknown>; as?: string };
+  type Outcome = { result: unknown } | { error: string };
+  type StepRef = { step: number; path: string[] };
+
+  // A fresh shape per tool (see deviceStep).
+  const batchShape = (readOnly: boolean) => ({
+    steps: z
+      .array(
+        z
+          .object({
+            tool: z.string().min(1).describe(readOnly ? "A read-only tool, e.g. track_get" : "Tool name, e.g. track_create"),
+            args: z
+              .record(z.unknown())
+              .optional()
+              .describe('The tool\'s arguments as in a direct call; {"$ref": "<step>.<path>"} takes a value from an earlier step\'s result'),
+            as: z
+              .string()
+              .regex(STEP_NAME)
+              .optional()
+              .describe("A name for this step's result in later $refs (letters, digits, _)"),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(MAX_BATCH_STEPS)
+      .describe(`1-${MAX_BATCH_STEPS} steps, run in order`),
+    on_error: z
+      .enum(["stop", "continue"])
+      .default(readOnly ? "continue" : "stop")
+      .describe(
+        "stop: no further steps after a failing one; continue: run the others (a step whose $ref " +
+          "points at a failed step fails too)",
       ),
-    }),
+  });
+
+  const isRefObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, "$ref");
+
+  // A {"$ref": "<step>.<path>"} value of step `current`: <step> is a 0-based
+  // index or an earlier step's `as`, <path> dot-separated keys and indexes.
+  function parseRef(value: Record<string, unknown>, where: string, names: Map<string, number>, current: number): StepRef {
+    const text = value.$ref;
+    if (typeof text !== "string" || Object.keys(value).length !== 1)
+      throw new UsageError(`${where}: a $ref is {"$ref": "<step>.<path>"} with a string and no other keys.`);
+    const [head, ...path] = text.split(".");
+    const step = /^\d+$/.test(head) ? Number(head) : names.get(head);
+    if (step === undefined || step >= current)
+      throw new UsageError(
+        `${where}: $ref ${quote(text)} names no earlier step: use the index of a step before step ` +
+          `${current}, or an earlier step's "as" name.`,
+      );
+    if (path.some((k) => k === "")) throw new UsageError(`${where}: $ref ${quote(text)} has an empty path segment.`);
+    return { step, path };
+  }
+
+  // Every $ref in a step's args, checked (in steps before it) before anything runs.
+  function countRefs(value: unknown, where: string, names: Map<string, number>, current: number): number {
+    if (isRefObject(value)) {
+      parseRef(value, where, names, current);
+      return 1;
+    }
+    if (Array.isArray(value)) return value.reduce((n: number, v, i) => n + countRefs(v, `${where}[${i}]`, names, current), 0);
+    if (typeof value === "object" && value !== null)
+      return Object.entries(value).reduce((n, [k, v]) => n + countRefs(v, `${where}.${k}`, names, current), 0);
+    return 0;
+  }
+
+  // The args with each $ref replaced by the value it points at.
+  function substitute(value: unknown, where: string, names: Map<string, number>, current: number, outcomes: Outcome[]): unknown {
+    if (isRefObject(value)) {
+      const { step, path } = parseRef(value, where, names, current);
+      const text = quote(String(value.$ref));
+      const outcome = outcomes[step];
+      if (!outcome || "error" in outcome)
+        throw new UsageError(`${where}: $ref ${text}: step ${step} failed, so it has no result.`);
+      let v: unknown = outcome.result;
+      for (const [i, key] of path.entries()) {
+        const next = Array.isArray(v)
+          ? /^\d+$/.test(key)
+            ? v[Number(key)]
+            : undefined
+          : typeof v === "object" && v !== null && Object.prototype.hasOwnProperty.call(v, key)
+            ? (v as Record<string, unknown>)[key]
+            : undefined;
+        if (next === undefined)
+          throw new UsageError(`${where}: $ref ${text}: step ${step}'s result has no ${quote(path.slice(0, i + 1).join("."))}.`);
+        v = next;
+      }
+      return v;
+    }
+    if (Array.isArray(value)) return value.map((v, i) => substitute(v, `${where}[${i}]`, names, current, outcomes));
+    if (typeof value === "object" && value !== null)
+      return Object.fromEntries(
+        Object.entries(value).map(([k, v]) => [k, substitute(v, `${where}.${k}`, names, current, outcomes)]),
+      );
+    return value;
+  }
+
+  // A step's args through its tool's own schema (defaults applied), as the
+  // SDK validates a direct call.
+  function stepArgs(schema: z.ZodTypeAny, args: unknown, where: string, name: string): Record<string, unknown> {
+    const parsed = schema.safeParse(args);
+    if (parsed.success) return parsed.data as Record<string, unknown>;
+    const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "args"}: ${i.message}`).join("; ");
+    throw new UsageError(`${where}: invalid arguments for ${name}: ${issues}`);
+  }
+
+  async function runBatch(readOnly: boolean, steps: Step[], onError: "stop" | "continue", extra: ToolExtra) {
+    const self = readOnly ? "batch_read" : "batch";
+    const names = new Map<string, number>();
+    // Before the first step runs: every tool, name and $ref, and the args of
+    // every step without a $ref (those are checked when they run).
+    const plan = steps.map((step, i) => {
+      const where = `steps[${i}]`;
+      const entry = registry.get(step.tool);
+      if (!entry) throw new UsageError(`${where}: no tool named ${quote(step.tool)}.`);
+      const hints = entry.meta.annotations;
+      if (BATCH_TOOLS.has(step.tool)) throw new UsageError(`${where}: ${step.tool} cannot run inside ${self}.`);
+      if (hints.openWorldHint)
+        throw new UsageError(`${where}: ${step.tool} reaches outside the Live Set, so it only runs on its own.`);
+      if (readOnly && !hints.readOnlyHint)
+        throw new UsageError(`${where}: ${step.tool} can change the Live Set; batch_read runs read-only tools only (use batch).`);
+      const schema = z.object(entry.shape);
+      const args = step.args ?? {};
+      const refs = countRefs(args, `${where}.args`, names, i);
+      if (step.as !== undefined) {
+        if (names.has(step.as)) throw new UsageError(`${where}: the name ${quote(step.as)} is used by step ${names.get(step.as)}.`);
+        names.set(step.as, i);
+      }
+      return { step, entry, schema, parsed: refs ? undefined : stepArgs(schema, args, where, step.tool) };
+    });
+    // Steps report no progress of their own: they would reuse the batch's token.
+    const stepExtra: ToolExtra = { ...extra, _meta: undefined };
+    const progressToken = extra._meta?.progressToken;
+    const progress = (done: number, message: string) => {
+      if (progressToken !== undefined)
+        extra
+          .sendNotification({
+            method: "notifications/progress",
+            params: { progressToken, progress: done, total: steps.length, message },
+          })
+          .catch(() => {});
+    };
+    progress(0, `${steps.length} steps`);
+    const outcomes: Outcome[] = [];
+    const results: Record<string, unknown>[] = [];
+    for (const [i, p] of plan.entries()) {
+      if (extra.signal.aborted) break; // the client went away: run no more steps
+      const head = { step: i, tool: p.step.tool, as: p.step.as };
+      const where = `steps[${i}]`;
+      const started = Date.now();
+      try {
+        const args =
+          p.parsed ??
+          stepArgs(p.schema, substitute(p.step.args ?? {}, `${where}.args`, names, i, outcomes), where, p.step.tool);
+        const result = await p.entry.handler(args, stepExtra);
+        outcomes.push({ result });
+        results.push({ ...head, result });
+      } catch (e) {
+        const msg = errorMessage(e);
+        // as the tool wrapper logs: never the arguments
+        console.error(`[ableton-live-mcp] ${self} ${where} (${p.step.tool}) failed after ${Date.now() - started} ms: ${msg}`);
+        const error = e instanceof UsageError ? msg : `${msg} ${STALE_HINT}`;
+        outcomes.push({ error });
+        results.push({ ...head, error });
+      }
+      progress(i + 1, `${where} (${p.step.tool}) done`);
+      if ("error" in outcomes[i] && onError === "stop") break;
+    }
+    const failed = outcomes.filter((o) => "error" in o).length;
+    return {
+      ok: failed === 0 && outcomes.length === steps.length,
+      completed: outcomes.length - failed,
+      failed: failed || undefined,
+      results,
+      not_run: outcomes.length < steps.length ? steps.slice(outcomes.length).map((_, k) => outcomes.length + k) : undefined,
+    };
+  }
+
+  const BATCH_REF_HELP =
+    'A value written as {"$ref": "<step>.<path>"} is taken from an earlier step\'s result: <step> is ' +
+    "the 0-based step index or the step's `as` name, <path> dot-separated keys and array indexes, " +
+    'e.g. {"$ref": "0.id"}, {"$ref": "bass.clip_slots.0.clip.id"}. ';
+
+  tool(
+    "batch",
+    { title: "Run tools in sequence", annotations: DESTRUCTIVE_CUMULATIVE },
+    `Run up to ${MAX_BATCH_STEPS} tool calls in order in one request: \`steps: [{tool, args, as?}]\`, ` +
+      "each `args` exactly as in a direct call of that tool. " +
+      BATCH_REF_HELP +
+      "For dependent chains no compound tool covers (create a track, then a clip on it, then " +
+      "set its notes). Prefer the compound tools and `items` batches where they fit: they check " +
+      "everything first and form one undo step. Before the first step runs, every tool name, " +
+      "every $ref and the args of every step without a $ref are checked against the tools' " +
+      "schemas; steps with a $ref are checked when they run. Each step is its own undo step(s): " +
+      'the batch is not atomic. on_error "stop" (default) ends the batch at the first failing ' +
+      'step, "continue" runs the rest. Returns `results` (per step `result` or `error`), ' +
+      "`completed`, `ok`, `failed` and `not_run` (step indexes). As destructive as its steps; " +
+      "batch, batch_read, show_dialog and execute_command cannot be steps.",
+    batchShape(false),
+    ({ steps, on_error }, extra) => runBatch(false, steps, on_error, extra),
+  );
+
+  tool(
+    "batch_read",
+    { title: "Run read-only tools in sequence", annotations: READ },
+    `Run up to ${MAX_BATCH_STEPS} read-only tool calls in order in one request (the *_get tools, ` +
+      "midi_clip_get_notes, session_grid, arrangement_get, parameter_find, sample_search, " +
+      "selection_wait, ...): `steps: [{tool, args, as?}]` as in batch. " +
+      BATCH_REF_HELP +
+      "E.g. find a track, then read its first clip's notes. Any step whose tool can change the " +
+      'set is refused before anything runs. on_error "continue" (default) runs every step. ' +
+      "Returns `results` (per step `result` or `error`), `completed`, `ok` and `failed`.",
+    batchShape(true),
+    ({ steps, on_error }, extra) => runBatch(true, steps, on_error, extra),
   );
 
   tool(
@@ -5473,24 +5922,27 @@ function configFilePath(context: Ctx): string | undefined {
   return dir ? path.join(dir, "config.json") : undefined;
 }
 
-function readConfig(context: Ctx): { port: number; file?: string } {
+// `progress`: config.json's "progress_notifications" (default true); false
+// answers every request as JSON, so long calls send no progress.
+function readConfig(context: Ctx): { port: number; file?: string; progress: boolean } {
   const dir = context.environment.storageDirectory;
   const fallback = { port: DEFAULT_PORT };
   const file = configFilePath(context);
-  if (!dir || !file) return fallback;
+  if (!dir || !file) return { ...fallback, progress: true };
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
     const port = (parsed as { port?: unknown }).port;
+    const progress = (parsed as { progress_notifications?: unknown }).progress_notifications !== false;
     if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
-      return { port, file };
+      return { port, file, progress };
     }
     console.error(`[ableton-live-mcp] invalid port in ${file}, using ${DEFAULT_PORT}`);
-    return { ...fallback, file };
+    return { ...fallback, file, progress };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
       // exists but unreadable/malformed — leave the user's file alone
       console.error(`[ableton-live-mcp] could not read ${file}, using defaults:`, e);
-      return { ...fallback, file };
+      return { ...fallback, file, progress: true };
     }
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -5498,7 +5950,7 @@ function readConfig(context: Ctx): { port: number; file?: string } {
     } catch {
       // storage dir not writable — run with defaults
     }
-    return { ...fallback, file };
+    return { ...fallback, file, progress: true };
   }
 }
 
@@ -5539,7 +5991,43 @@ function sendJsonRpcError(
   res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
 }
 
-const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+// Request bodies are read by the handler (not the transport) to pick the
+// response mode; the limit is the transport's default.
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+
+// The request body as text, or undefined when it is over MAX_BODY_BYTES (the
+// rest is still drained, so the connection stays usable).
+function readBody(req: http.IncomingMessage): Promise<string | undefined> {
+  if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) return Promise.resolve(undefined);
+  return new Promise((resolve, reject) => {
+    const decoder = new TextDecoder();
+    let text = "";
+    let size = 0;
+    req.on("data", (chunk: Uint8Array) => {
+      size += chunk.byteLength;
+      if (size <= MAX_BODY_BYTES) text += decoder.decode(chunk, { stream: true });
+    });
+    req.on("end", () => resolve(size > MAX_BODY_BYTES ? undefined : text + decoder.decode()));
+    req.on("error", reject);
+  });
+}
+
+// A single tools/call of a PROGRESS_TOOLS tool whose client asked for
+// progress: only that is answered as an SSE stream.
+function wantsProgress(message: unknown): boolean {
+  if (typeof message !== "object" || message === null || Array.isArray(message)) return false;
+  const { method, params } = message as {
+    method?: unknown;
+    params?: { name?: unknown; _meta?: { progressToken?: unknown } };
+  };
+  const token = params?._meta?.progressToken;
+  return (
+    method === "tools/call" &&
+    typeof params?.name === "string" &&
+    PROGRESS_TOOLS.has(params.name) &&
+    (typeof token === "string" || typeof token === "number")
+  );
+}
 
 type ServerState =
   | { kind: "starting" }
@@ -5553,6 +6041,7 @@ function registerStatus(
   port: number,
   configFile: string | undefined,
   state: () => ServerState,
+  dialogs: DialogStore,
 ) {
   const statusHtml = () => {
     const s = state();
@@ -5577,14 +6066,19 @@ function registerStatus(
       `<body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
       `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
       body +
-      `<button onclick="(window.webkit?.messageHandlers?.live??window.chrome?.webview).postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
+      `<button onclick="${DIALOG_BRIDGE}.postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
       `</body>`
     );
   };
+  // Through the dialog store, so that show_dialog opens no second dialog over
+  // it. It always opens itself (force): the diagnosis must work even if a
+  // dialog was never reported closed. Failures are logged by the store.
   context.commands.registerCommand("ableton-live-mcp.status", () => {
-    context.ui
-      .showModalDialog(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, 280)
-      .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
+    try {
+      dialogs.open(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, 280, "status", { force: true });
+    } catch (e) {
+      console.error("[ableton-live-mcp] status dialog:", e);
+    }
   });
   for (const scope of ["AudioTrack", "MidiTrack"] as const) {
     context.ui
@@ -5594,10 +6088,13 @@ function registerStatus(
 }
 
 export async function startServer(context: Ctx, hostApiVersion: string): Promise<void> {
-  const { port, file: configFile } = readConfig(context);
+  const { port, file: configFile, progress } = readConfig(context);
   let state: ServerState = { kind: "starting" };
+  // Dialogs outlive the per-request McpServer (show_dialog {wait:false}, then
+  // dialog_result), so the store lives here.
+  const dialogs = new DialogStore(context);
   try {
-    registerStatus(context, port, configFile, () => state);
+    registerStatus(context, port, configFile, () => state, dialogs);
   } catch (e) {
     // a convenience only: never let it keep the endpoint from starting
     console.error("[ableton-live-mcp] could not register the status command:", e);
@@ -5639,26 +6136,35 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
         });
         return;
       }
-      if (Number(req.headers["content-length"]) > 16_000_000) {
-        res.writeHead(413, { "content-type": "text/plain" });
-        res.end("Payload too large");
+      const body = await readBody(req);
+      if (body === undefined) {
+        sendJsonRpcError(res, 413, -32000, `Payload Too Large: Request body must not exceed ${MAX_BODY_BYTES} bytes`);
         return;
+      }
+      // Unparsable text is passed on as it is: the transport answers it with
+      // its spec-correct 400/-32700 (after its 406 and 415 checks).
+      let message: unknown = body;
+      try {
+        message = JSON.parse(body);
+      } catch {
+        // see above
       }
       // Stateless mode: a fresh server+transport per request. Object ids live in
       // the module-level store, so state survives across requests regardless.
+      // Responses are plain JSON, except for a long call that asked for
+      // progress: an SSE stream carries its notifications/progress, then the
+      // result (the SDK also sends a keep-alive comment every 15 s).
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
-        enableJsonResponse: true,
+        enableJsonResponse: !(progress && wantsProgress(message)),
       });
-      const mcp = buildServer(context, hostApiVersion, port, selections);
+      const mcp = buildServer(context, hostApiVersion, port, selections, dialogs);
       res.on("close", () => {
         void transport.close();
         void mcp.close();
       });
       await mcp.connect(transport);
-      // No pre-parsed body: the transport reads the stream itself and answers
-      // spec-correct 400/-32700 (parse error), 406, and 415 responses.
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, message);
     } catch (e) {
       console.error("[ableton-live-mcp] request error:", e);
       if (!res.headersSent) sendJsonRpcError(res, 500, -32603, "Internal server error");
@@ -5683,4 +6189,5 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
   // accept) is logged instead of crashing the host.
   httpServer.on("error", (e) => console.error("[ableton-live-mcp] server error:", e));
   console.log(`[ableton-live-mcp] MCP server listening on http://127.0.0.1:${port}/mcp`);
+  if (!progress) console.log(`[ableton-live-mcp] progress notifications are off (${configFile})`);
 }
