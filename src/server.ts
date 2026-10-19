@@ -177,6 +177,75 @@ const loopSettingsShape = z
       "Unwarped clips require looping=false and non-negative positions.",
   );
 
+// The host rejects most async operations with no error value at all — surface
+// something actionable instead of "undefined".
+function errorMessage(e: unknown): string {
+  return e instanceof Error
+    ? e.message
+    : e === undefined
+      ? "the Live host rejected the operation without details — check argument " +
+        "values (device name spelling, index ranges, file paths, clip overlaps)."
+      : String(e);
+}
+
+// Shared addressing: a tool that acts on one track takes any of track_id,
+// track_index and track_name, a scene tool any of scene_id, scene_index and
+// scene_name. When several are given they must name the same object.
+const trackAddress = {
+  track_id: z.string().optional().describe("Track id"),
+  track_index: z.number().int().min(0).optional().describe("0-based index among the regular tracks"),
+  track_name: z
+    .string()
+    .optional()
+    .describe("Track name, exact match first, then case-insensitive (regular, return and main tracks)"),
+};
+const sceneAddress = {
+  scene_id: z.string().optional().describe("Scene id"),
+  scene_index: z.number().int().min(0).optional().describe("0-based scene index"),
+  scene_name: z.string().optional().describe("Scene name, exact match first, then case-insensitive"),
+};
+// Destructive tools match names exactly: a case-insensitive guess must not delete.
+const exactTrackName = z.string().optional().describe("Exact track name (case-sensitive)");
+const exactSceneName = z.string().optional().describe("Exact scene name (case-sensitive)");
+
+type TrackAddress = { track_id?: string; track_index?: number; track_name?: string };
+type SceneAddress = { scene_id?: string; scene_index?: number; scene_name?: string };
+
+const given = (o: object, keys: readonly string[]) =>
+  keys.some((k) => (o as Record<string, unknown>)[k] !== undefined);
+const hasTrackAddress = (a: TrackAddress) => given(a, ["track_id", "track_index", "track_name"]);
+const hasSceneAddress = (a: SceneAddress) => given(a, ["scene_id", "scene_index", "scene_name"]);
+
+// Batch form of the *_set and create tools: `items`, one entry per object with
+// the same fields as the single form. Returns the entries to apply and whether
+// the call was a batch (batch results are wrapped in {items}).
+function entries<T extends object>(
+  args: T,
+  items: T[] | undefined,
+  fields: readonly string[],
+): { list: T[]; batch: boolean } {
+  if (items === undefined) return { list: [args], batch: false };
+  const top = fields.filter((k) => given(args, [k]));
+  if (top.length)
+    throw new UsageError(`Give either items or ${top.join(", ")} at the top level, not both.`);
+  return { list: items, batch: true };
+}
+
+const itemLabel = (batch: boolean, i: number) => (batch ? `items[${i}]` : undefined);
+
+// Runs one entry's validation and prefixes its errors with the entry's label
+// (a function when building it costs host calls). The error keeps its class,
+// so a UsageError stays one.
+function at<R>(label: string | (() => string) | undefined, fn: () => R): R {
+  try {
+    return fn();
+  } catch (e) {
+    if (label && e instanceof Error)
+      e.message = `${typeof label === "function" ? label() : label}: ${e.message}`;
+    throw e;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // tool registration
 
@@ -205,15 +274,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       try {
         return json(await handler(args ?? ({} as never), extra));
       } catch (e) {
-        // The host rejects most async operations with no error value at all —
-        // surface something actionable instead of "undefined".
-        const msg =
-          e instanceof Error
-            ? e.message
-            : e === undefined
-              ? "the Live host rejected the operation without details — check argument " +
-                "values (device name spelling, index ranges, file paths, clip overlaps)."
-              : String(e);
+        const msg = errorMessage(e);
         // Never log the arguments: they can carry the user's content.
         console.error(`[ableton-live-mcp] ${name} failed after ${Date.now() - started} ms: ${msg}`);
         // Argument errors the server detects itself have nothing to do with stale ids.
@@ -280,33 +341,139 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  // -- tracks ----------------------------------------------------------------
+  // -- addressing ------------------------------------------------------------
 
-  // Track addressing without a prior song_get: by index or (case-insensitive)
-  // name across regular, return, and main tracks.
-  function findTrack(args: { track_id?: string; track_index?: number; track_name?: string }) {
-    if (args.track_id !== undefined) return resolve(args.track_id, Track);
-    const s = song();
-    if (args.track_index !== undefined) {
-      const t = s.tracks[args.track_index];
-      if (!t)
-        throw new UsageError(`track_index ${args.track_index} out of range (0-${s.tracks.length - 1}).`);
-      return t;
-    }
-    if (args.track_name !== undefined) {
-      const all = [...s.tracks, ...s.returnTracks, s.mainTrack];
-      const exact = all.filter((t) => t.name === args.track_name);
-      const ci = exact.length
-        ? exact
-        : all.filter((t) => t.name.toLowerCase() === args.track_name!.toLowerCase());
-      if (ci.length === 1) return ci[0];
+  const outOfRange = (what: string, i: number, n: number) =>
+    new UsageError(`${what} ${i} out of range (${n ? `0-${n - 1}` : "there are none"}).`);
+
+  // Name lookup: exact match first, then case-insensitive unless `exact`. An
+  // ambiguous name lists only the candidates it matched, then `hint`.
+  function byName<T>(
+    what: string,
+    name: string,
+    all: T[],
+    nameOf: (x: T) => string,
+    describe: (x: T) => string,
+    { exact = false, hint = "" }: { exact?: boolean; hint?: string } = {},
+  ): T {
+    const exactHits = all.filter((x) => nameOf(x) === name);
+    const ciHits = all.filter((x) => nameOf(x).toLowerCase() === name.toLowerCase());
+    const hits = exactHits.length || exact ? exactHits : ciHits;
+    if (hits.length === 1) return hits[0];
+    const quoted = JSON.stringify(name);
+    if (hits.length)
       throw new UsageError(
-        (ci.length ? `Ambiguous track name` : `No track named`) +
-          ` "${args.track_name}". Tracks: ${all.map((t) => JSON.stringify(t.name)).join(", ")}.`,
+        `Ambiguous ${what} name ${quoted}: it matches ${hits.map(describe).join(", ")}.${hint && ` ${hint}`}`,
+      );
+    if (exact && ciHits.length)
+      throw new UsageError(
+        `No ${what} named exactly ${quoted} (this tool needs the exact name). ` +
+          `Did you mean ${ciHits.map(describe).join(", ")}?`,
+      );
+    const names = all.map((x) => JSON.stringify(nameOf(x)));
+    const more = names.length > 50 ? `, ... (${names.length - 50} more)` : "";
+    throw new UsageError(
+      `No ${what} named ${quoted}. Available: ${names.slice(0, 50).join(", ") || "none"}${more}.`,
+    );
+  }
+
+  // `"Drums" (track_index 2, id 15)`: enough for the caller to pick one.
+  function describeTrack(t: Track<"1.0.0">): string {
+    const s = song();
+    const i = s.tracks.findIndex((x) => x.handle.id === t.handle.id);
+    const where =
+      i >= 0 ? `track_index ${i}` : t.handle.id === s.mainTrack.handle.id ? "main track" : "return track";
+    return `${JSON.stringify(t.name)} (${where}, id ${remember(t)})`;
+  }
+
+  // Track addressing without a prior song_get: by id, by index (regular tracks)
+  // or by name across regular, return and main tracks. Several fields must
+  // agree, so a stale id cannot silently win over the name the caller meant.
+  function findTrack(a: TrackAddress, opts: { exactName?: boolean } = {}): Track<"1.0.0"> {
+    const s = song();
+    const found: Track<"1.0.0">[] = [];
+    if (a.track_id !== undefined) found.push(resolve(a.track_id, Track));
+    if (a.track_index !== undefined) {
+      const t = s.tracks[a.track_index];
+      if (!t) throw outOfRange("track_index", a.track_index, s.tracks.length);
+      found.push(t);
+    }
+    if (a.track_name !== undefined) {
+      const all = [...s.tracks, ...s.returnTracks, s.mainTrack];
+      found.push(
+        byName("track", a.track_name, all, (t) => t.name, describeTrack, {
+          exact: opts.exactName,
+          hint: "Use track_id or track_index.",
+        }),
       );
     }
-    throw new UsageError("Provide track_id, track_index, or track_name.");
+    if (!found.length) throw new UsageError("Provide track_id, track_index, or track_name.");
+    if (found.some((t) => t.handle.id !== found[0].handle.id))
+      throw new UsageError(
+        `track_id, track_index and track_name name different tracks: ${found.map(describeTrack).join(" vs ")}.`,
+      );
+    return found[0];
   }
+
+  const describeScene = (scene: Scene<"1.0.0">, index: number) =>
+    `${JSON.stringify(scene.name)} (scene_index ${index}, id ${remember(scene)})`;
+
+  // Scenes by id, index or name; returns the scene and its index.
+  function findScene(a: SceneAddress, opts: { exactName?: boolean } = {}) {
+    const scenes = song().scenes;
+    const found: number[] = [];
+    if (a.scene_id !== undefined) {
+      const scene = resolve(a.scene_id, Scene);
+      const i = scenes.findIndex((x) => x.handle.id === scene.handle.id);
+      // not a UsageError: a deleted scene's id is stale
+      if (i < 0) throw new Error(`Scene "${a.scene_id}" is no longer in the Live Set.`);
+      found.push(i);
+    }
+    if (a.scene_index !== undefined) {
+      if (a.scene_index >= scenes.length) throw outOfRange("scene_index", a.scene_index, scenes.length);
+      found.push(a.scene_index);
+    }
+    if (a.scene_name !== undefined) {
+      const indexed = scenes.map((scene, index) => ({ scene, index }));
+      const describe = (x: (typeof indexed)[number]) => describeScene(x.scene, x.index);
+      const options = { exact: opts.exactName, hint: "Use scene_id or scene_index." };
+      found.push(byName("scene", a.scene_name, indexed, (x) => x.scene.name, describe, options).index);
+    }
+    if (!found.length) throw new UsageError("Provide scene_id, scene_index, or scene_name.");
+    if (found.some((i) => i !== found[0]))
+      throw new UsageError(
+        `scene_id, scene_index and scene_name name different scenes: ` +
+          `${found.map((i) => describeScene(scenes[i], i)).join(" vs ")}.`,
+      );
+    return { scene: scenes[found[0]], index: found[0] };
+  }
+
+  // Tools that take a target_id (track, chain, slot, ...) accept a track
+  // address in its place.
+  function findTarget(a: { target_id?: string } & TrackAddress): DataModelObject<"1.0.0"> {
+    if (a.target_id === undefined) {
+      if (!hasTrackAddress(a))
+        throw new UsageError("Provide target_id, or a track via track_id, track_index or track_name.");
+      return findTrack(a);
+    }
+    if (hasTrackAddress(a))
+      throw new UsageError("Give target_id or track_id/track_index/track_name, not both.");
+    return resolve(a.target_id, DataModelObject);
+  }
+
+  function findMixer(a: { target_id?: string } & TrackAddress) {
+    const owner = findTarget(a);
+    const mixer =
+      owner instanceof Track || owner instanceof Chain
+        ? owner.mixer
+        : owner instanceof TrackMixer || owner instanceof ChainMixer
+          ? owner
+          : null;
+    if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(owner)}.`);
+    return { mixer, owner };
+  }
+
+  // -- tracks ----------------------------------------------------------------
 
   async function mixerDetail(mixer: TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">) {
     const returnNames = mixer instanceof TrackMixer ? song().returnTracks.map((t) => t.name) : [];
@@ -332,9 +499,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "by track_id, track_index (0-based, regular tracks only), or track_name. " +
       "Use `include` to fetch only some sections.",
     {
-      track_id: z.string().optional(),
-      track_index: z.number().int().min(0).optional(),
-      track_name: z.string().optional(),
+      ...trackAddress,
       include: z
         .array(z.enum(["clip_slots", "take_lanes", "arrangement_clips", "devices", "mixer"]))
         .optional()
@@ -356,48 +521,158 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  const trackProps = {
+    name: z.string().optional(),
+    mute: z.boolean().optional(),
+    solo: z.boolean().optional(),
+    arm: z.boolean().optional(),
+  };
+  const TRACK_PROPS = Object.keys(trackProps);
+
   tool(
     "track_set",
     { title: "Set track properties", annotations: SET },
-    "Set track properties (name, mute, solo, arm).",
+    "Set track properties (name, mute, solo, arm). Address the track by track_id, " +
+      "track_index or track_name, or pass `items` (one entry per track, same " +
+      "fields) to change many tracks at once, e.g. mute all but the vocals. All " +
+      "changes form one undo step; nothing is changed if any entry is invalid.",
     {
-      track_id: z.string(),
-      name: z.string().optional(),
-      mute: z.boolean().optional(),
-      solo: z.boolean().optional(),
-      arm: z.boolean().optional(),
+      ...trackAddress,
+      ...trackProps,
+      items: z
+        .array(z.object({ ...trackAddress, ...trackProps }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per track; returns {items}"),
     },
-    ({ track_id, name, mute, solo, arm }) => {
-      const track = resolve(track_id, Track);
-      if (name !== undefined) track.name = name;
-      if (mute !== undefined) track.mute = mute;
-      if (solo !== undefined) track.solo = solo;
-      if (arm !== undefined) track.arm = arm;
-      return trackSummary(track);
+    (args) => {
+      const { list, batch } = entries(args, args.items, [...Object.keys(trackAddress), ...TRACK_PROPS]);
+      // Validate every entry before the first setter runs.
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          const track = findTrack(it);
+          if (batch && !given(it, TRACK_PROPS))
+            throw new UsageError("nothing to set — give name, mute, solo and/or arm.");
+          return { track, it };
+        }),
+      );
+      if (plan.some(({ it }) => given(it, TRACK_PROPS)))
+        context.withinTransaction(() => {
+          for (const { track, it } of plan) {
+            if (it.name !== undefined) track.name = it.name;
+            if (it.mute !== undefined) track.mute = it.mute;
+            if (it.solo !== undefined) track.solo = it.solo;
+            if (it.arm !== undefined) track.arm = it.arm;
+          }
+        });
+      const out = plan.map(({ track }) => trackSummary(track));
+      return batch ? { items: out } : out[0];
     },
   );
+
+  // A device parameter by name: exact first, then case-insensitive.
+  function parameterByName(device: Device<"1.0.0">, name: string) {
+    return byName("parameter", name, device.parameters, (p) => p.name, (p) => JSON.stringify(p.name));
+  }
 
   tool(
     "track_create",
     { title: "Create track", annotations: CREATE },
-    "Create a new audio or MIDI track. Inserted after the last selected track, " +
-      "or appended if none is selected.",
-    { type: z.enum(["audio", "midi"]) },
-    async ({ type }) => {
+    "Create a new audio or MIDI track, optionally named and with built-in devices " +
+      "inserted in order (each a name, or {name, parameters:[{name, value}]} to set " +
+      "initial parameter values in internal units). The track is inserted after " +
+      "the last selected track in Live, or appended if none is selected, so the " +
+      "result carries its `index`. Once the track exists, a failing name or device " +
+      "does not fail the call: it is reported in `errors` (and on its `devices` " +
+      "entry) while the rest is still applied.",
+    {
+      type: z.enum(["audio", "midi"]),
+      name: z.string().optional(),
+      devices: z
+        .array(
+          z.union([
+            z.string().min(1).describe("Built-in device name, e.g. 'Operator', 'Reverb'"),
+            z.object({
+              name: z.string().min(1).describe("Built-in device name"),
+              parameters: z
+                .array(
+                  z.object({
+                    name: z.string().describe("Parameter name, exact match first, then case-insensitive"),
+                    value: z.number().describe("Internal units; quantized parameters take a value_items index"),
+                  }),
+                )
+                .optional(),
+            }),
+          ]),
+        )
+        .optional()
+        .describe("Devices to insert, in chain order"),
+    },
+    async ({ type, name, devices }) => {
       const track =
         type === "audio" ? await song().createAudioTrack() : await song().createMidiTrack();
-      return trackSummary(track);
+      // From here on the track exists: report failures instead of throwing.
+      const errors: string[] = [];
+      if (name !== undefined) {
+        try {
+          track.name = name;
+        } catch (e) {
+          errors.push(`name: ${errorMessage(e)}`);
+        }
+      }
+      const inserted: Record<string, unknown>[] = [];
+      for (const [i, spec] of (devices ?? []).entries()) {
+        const { name: deviceName, parameters } =
+          typeof spec === "string" ? { name: spec, parameters: [] } : spec;
+        let device: Device<"1.0.0">;
+        try {
+          device = await track.insertDevice(deviceName, track.devices.length);
+        } catch (e) {
+          const msg = errorMessage(e);
+          errors.push(`devices[${i}] (${deviceName}): ${msg}`);
+          inserted.push({ requested: deviceName, error: msg });
+          continue;
+        }
+        const entry: Record<string, unknown> = { requested: deviceName, ...deviceSummary(device) };
+        if (parameters?.length) {
+          try {
+            // all names first, then one undo step for the values
+            const values = parameters.map((p) => ({ param: parameterByName(device, p.name), value: p.value }));
+            await context.withinTransaction(() =>
+              Promise.all(values.map(({ param, value }) => param.setValue(value))),
+            );
+            entry.parameters = values.map(({ param, value }) => ({
+              id: remember(param),
+              name: param.name,
+              value,
+            }));
+          } catch (e) {
+            const msg = `parameters: ${errorMessage(e)}`;
+            errors.push(`devices[${i}] (${deviceName}): ${msg}`);
+            entry.error = msg;
+          }
+        }
+        inserted.push(entry);
+      }
+      return {
+        ...trackSummary(track),
+        index: song().tracks.findIndex((t) => t.handle.id === track.handle.id),
+        devices: devices ? inserted : undefined,
+        errors: errors.length ? errors : undefined,
+      };
     },
   );
 
   tool(
     "track_delete",
     { title: "Delete track", annotations: DESTRUCTIVE },
-    "Delete a track.",
-    { track_id: z.string() },
-    async ({ track_id }) => {
-      await song().deleteTrack(resolve(track_id, Track));
-      return { deleted: track_id };
+    "Delete a track, addressed by track_id, track_index or its exact track_name.",
+    { ...trackAddress, track_name: exactTrackName },
+    async (args) => {
+      const track = findTrack(args, { exactName: true });
+      const deleted = { deleted: remember(track), name: track.name };
+      await song().deleteTrack(track);
+      return deleted;
     },
   );
 
@@ -405,8 +680,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "track_duplicate",
     { title: "Duplicate track", annotations: CREATE },
     "Duplicate a track. The copy is inserted right after the original.",
-    { track_id: z.string() },
-    async ({ track_id }) => trackSummary(await song().duplicateTrack(resolve(track_id, Track))),
+    { ...trackAddress },
+    async (args) => trackSummary(await song().duplicateTrack(findTrack(args))),
   );
 
   tool(
@@ -414,9 +689,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     { title: "Clear arrangement clips in range", annotations: DESTRUCTIVE },
     "Delete all arrangement clips of a track within a beat range. Clips " +
       "overlapping a boundary are truncated to the range edge.",
-    { track_id: z.string(), start_time: z.number(), end_time: z.number() },
-    async ({ track_id, start_time, end_time }) => {
-      await resolve(track_id, Track).clearClipsInRange(start_time, end_time);
+    { ...trackAddress, start_time: z.number(), end_time: z.number() },
+    async ({ start_time, end_time, ...address }) => {
+      await findTrack(address).clearClipsInRange(start_time, end_time);
       return { cleared: [start_time, end_time] };
     },
   );
@@ -425,55 +700,169 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "take_lane_create",
     { title: "Create take lane", annotations: CREATE },
     "Create a new take lane on a track (appended after existing lanes).",
-    { track_id: z.string() },
-    async ({ track_id }) => takeLaneSummary(await resolve(track_id, Track).createTakeLane()),
+    { ...trackAddress },
+    async (args) => takeLaneSummary(await findTrack(args).createTakeLane()),
   );
 
   tool(
     "take_lane_set",
     { title: "Rename take lane", annotations: SET },
-    "Rename a take lane.",
-    { take_lane_id: z.string(), name: z.string() },
-    ({ take_lane_id, name }) => {
-      const lane = resolve(take_lane_id, TakeLane);
-      lane.name = name;
-      return takeLaneSummary(lane);
+    "Rename a take lane, or several with `items` (one undo step).",
+    {
+      take_lane_id: z.string().optional(),
+      name: z.string().optional(),
+      items: z
+        .array(z.object({ take_lane_id: z.string(), name: z.string() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per take lane; returns {items}"),
+    },
+    (args) => {
+      const { list, batch } = entries(args, args.items, ["take_lane_id", "name"]);
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.take_lane_id === undefined || it.name === undefined)
+            throw new UsageError("take_lane_id and name are required.");
+          return { lane: resolve(it.take_lane_id, TakeLane), name: it.name };
+        }),
+      );
+      context.withinTransaction(() => {
+        for (const { lane, name } of plan) lane.name = name;
+      });
+      const out = plan.map(({ lane }) => takeLaneSummary(lane));
+      return batch ? { items: out } : out[0];
     },
   );
 
   // -- scenes / cue points ---------------------------------------------------
 
+  const sceneIndexOf = (scene: Scene<"1.0.0">) =>
+    song().scenes.findIndex((s) => s.handle.id === scene.handle.id);
+
+  // Batch creation (scene_create / cue_point_create items): every create in one
+  // undo step, then every name in one more. Once something exists, failures
+  // are reported per entry instead of thrown.
+  async function createBatch<T extends Scene<"1.0.0"> | CuePoint<"1.0.0">>(
+    list: { name?: string }[],
+    create: (i: number) => Promise<T>,
+  ): Promise<Array<{ created: T; error?: string } | { created?: undefined; error: string }>> {
+    const settled = await context.withinTransaction(() =>
+      Promise.allSettled(list.map((_, i) => create(i))),
+    );
+    if (settled.every((r) => r.status === "rejected"))
+      throw new Error(`Nothing was created: ${errorMessage((settled[0] as PromiseRejectedResult).reason)}`);
+    const nameErrors: Array<string | undefined> = [];
+    if (list.some((it) => it.name !== undefined)) {
+      context.withinTransaction(() =>
+        settled.forEach((r, i) => {
+          const name = list[i].name;
+          if (r.status !== "fulfilled" || name === undefined) return;
+          try {
+            r.value.name = name;
+          } catch (e) {
+            nameErrors[i] = `name: ${errorMessage(e)}`;
+          }
+        }),
+      );
+    }
+    return settled.map((r, i) =>
+      r.status === "fulfilled"
+        ? { created: r.value, error: nameErrors[i] }
+        : { error: errorMessage(r.reason) },
+    );
+  }
+
+  const sceneCreateItem = {
+    index: z
+      .number()
+      .int()
+      .min(-1)
+      .optional()
+      .describe("0-based insert position; -1 or omitted = append at the end"),
+    name: z.string().optional(),
+  };
+
   tool(
     "scene_create",
     { title: "Create scene", annotations: CREATE },
-    "Create a scene at the given index (0-based). Pass -1 to append at the end.",
-    { index: z.number().int().min(-1) },
-    async ({ index }) => {
-      const scene = await song().createScene(index);
-      return sceneSummary(scene, song().scenes.findIndex((s) => s.handle.id === scene.handle.id));
+    "Create a scene at the given index (0-based; -1 or omitted appends at the end), " +
+      "optionally named. `items` creates several scenes in one call, in order: each " +
+      "entry's index refers to the scene list after the previous entries were " +
+      "inserted. A batch takes two undo steps (creates, then names) and reports a " +
+      "failed entry as {error} instead of failing the call.",
+    {
+      ...sceneCreateItem,
+      items: z
+        .array(z.object(sceneCreateItem))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per new scene; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["index", "name"]);
+      const count = song().scenes.length;
+      list.forEach((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.index !== undefined && it.index > count + i)
+            throw new UsageError(`index ${it.index} out of range (0-${count + i}, or -1 to append).`);
+        }),
+      );
+      if (!batch) {
+        const scene = await song().createScene(args.index ?? -1);
+        if (args.name !== undefined) scene.name = args.name;
+        return sceneSummary(scene, sceneIndexOf(scene));
+      }
+      // The host is expected to apply the creates in call order, which is what
+      // gives each index its "after the previous entries" meaning.
+      const results = await createBatch(list, (i) => song().createScene(list[i].index ?? -1));
+      return {
+        items: results.map((r) =>
+          r.created ? { ...sceneSummary(r.created, sceneIndexOf(r.created)), error: r.error } : r,
+        ),
+      };
     },
   );
 
   tool(
     "scene_set",
     { title: "Rename scene", annotations: SET },
-    "Rename a scene.",
-    { scene_id: z.string(), name: z.string() },
-    ({ scene_id, name }) => {
-      const scene = resolve(scene_id, Scene);
-      scene.name = name;
-      return { id: scene_id, name: scene.name };
+    "Rename a scene, addressed by scene_id, scene_index or scene_name; or rename " +
+      "several with `items` (one entry per scene). All renames form one undo step.",
+    {
+      ...sceneAddress,
+      name: z.string().optional().describe("New name (required unless items is given)"),
+      items: z
+        .array(z.object({ ...sceneAddress, name: z.string() }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per scene; returns {items}"),
+    },
+    (args) => {
+      const { list, batch } = entries(args, args.items, [...Object.keys(sceneAddress), "name"]);
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.name === undefined) throw new UsageError("name is required.");
+          return { ...findScene(it), name: it.name };
+        }),
+      );
+      context.withinTransaction(() => {
+        for (const { scene, name } of plan) scene.name = name;
+      });
+      const out = plan.map(({ scene, index }) => sceneSummary(scene, index));
+      return batch ? { items: out } : out[0];
     },
   );
 
   tool(
     "scene_delete",
     { title: "Delete scene", annotations: DESTRUCTIVE },
-    "Delete a scene.",
-    { scene_id: z.string() },
-    async ({ scene_id }) => {
-      await song().deleteScene(resolve(scene_id, Scene));
-      return { deleted: scene_id };
+    "Delete a scene, addressed by scene_id, scene_index or its exact scene_name.",
+    { ...sceneAddress, scene_name: exactSceneName },
+    async (args) => {
+      const { scene } = findScene(args, { exactName: true });
+      const deleted = { deleted: remember(scene), name: scene.name };
+      await song().deleteScene(scene);
+      return deleted;
     },
   );
 
@@ -481,30 +870,176 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "scene_duplicate",
     { title: "Duplicate scene", annotations: CREATE },
     "Duplicate a scene. The copy is inserted right after the original.",
-    { scene_id: z.string() },
-    async ({ scene_id }) => {
-      const scene = await song().duplicateScene(resolve(scene_id, Scene));
-      return sceneSummary(scene, song().scenes.findIndex((s) => s.handle.id === scene.handle.id));
+    { ...sceneAddress },
+    async (args) => {
+      const scene = await song().duplicateScene(findScene(args).scene);
+      return sceneSummary(scene, sceneIndexOf(scene));
     },
   );
 
   tool(
     "cue_point_create",
     { title: "Create cue point", annotations: CREATE },
-    "Create an arrangement cue point (locator) at a beat position.",
-    { time: z.number().describe("Position in the arrangement in beats") },
-    async ({ time }) => cuePointSummary(await song().createCuePoint(time)),
+    "Create an arrangement cue point (locator) at a beat position, optionally " +
+      "named. `items` creates several in one call (two undo steps: creates, then " +
+      "names) and reports a failed entry as {error} instead of failing the call.",
+    {
+      time: z
+        .number()
+        .optional()
+        .describe("Position in the arrangement in beats (required unless items is given)"),
+      name: z.string().optional(),
+      items: z
+        .array(
+          z.object({
+            time: z.number().describe("Position in the arrangement in beats"),
+            name: z.string().optional(),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per cue point; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["time", "name"]);
+      const times = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.time === undefined) throw new UsageError("time is required.");
+          if (list.findIndex((o) => o.time === it.time) !== i)
+            throw new UsageError(`time ${it.time} is given twice.`);
+          return it.time;
+        }),
+      );
+      if (!batch) {
+        const cue = await song().createCuePoint(times[0]);
+        if (args.name !== undefined) cue.name = args.name;
+        return cuePointSummary(cue);
+      }
+      const results = await createBatch(list, (i) => song().createCuePoint(times[i]));
+      return {
+        items: results.map((r) => (r.created ? { ...cuePointSummary(r.created), error: r.error } : r)),
+      };
+    },
   );
 
   tool(
     "cue_point_set",
-    { title: "Rename cue point", annotations: SET },
-    "Rename a cue point.",
-    { cue_point_id: z.string(), name: z.string() },
-    ({ cue_point_id, name }) => {
-      const cue = resolve(cue_point_id, CuePoint);
-      cue.name = name;
-      return cuePointSummary(cue);
+    { title: "Rename or move cue point", annotations: SET },
+    "Rename and/or move a cue point (locator), or several with `items`. Live " +
+      "cannot change a cue point's time, so a move creates a cue point at `time` " +
+      "with the same (or the given) name, then deletes the old one: the result " +
+      "carries the new id and `replaced_id` (the old id is gone). A move onto a " +
+      "beat where another cue point sits is refused. Renames form one undo step; " +
+      "moves take up to three (creates, names, deletes). If no replacement can be " +
+      "created, nothing is changed; if an old cue point cannot be deleted, its " +
+      "entry reports `error` next to the new cue point.",
+    {
+      cue_point_id: z.string().optional(),
+      name: z.string().optional(),
+      time: z.number().optional().describe("Move to this arrangement position in beats"),
+      items: z
+        .array(
+          z.object({
+            cue_point_id: z.string(),
+            name: z.string().optional(),
+            time: z.number().optional().describe("Move to this arrangement position in beats"),
+          }),
+        )
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per cue point; returns {items}"),
+    },
+    async (args) => {
+      const { list, batch } = entries(args, args.items, ["cue_point_id", "name", "time"]);
+      const existing = song().cuePoints.map((c) => ({ id: remember(c), time: num(c.time) }));
+      const plan = list.map((it, i) =>
+        at(itemLabel(batch, i), () => {
+          if (it.cue_point_id === undefined) throw new UsageError("cue_point_id is required.");
+          if (it.name === undefined && it.time === undefined)
+            throw new UsageError("nothing to set — give name and/or time.");
+          if (list.findIndex((o) => o.cue_point_id === it.cue_point_id) !== i)
+            throw new UsageError(`cue point ${it.cue_point_id} is given twice.`);
+          const cue = resolve(it.cue_point_id, CuePoint);
+          const moveTo = it.time !== undefined && it.time !== num(cue.time) ? it.time : undefined;
+          if (moveTo !== undefined) {
+            const taken = existing.find((c) => c.time === moveTo);
+            if (taken) throw new UsageError(`cue point ${taken.id} is already at beat ${moveTo}.`);
+            if (list.slice(0, i).some((o) => o.time === moveTo))
+              throw new UsageError(`time ${moveTo} is given twice.`);
+          }
+          return { id: it.cue_point_id, cue, name: it.name, oldName: cue.name, moveTo, i };
+        }),
+      );
+      const moves = plan.filter((p) => p.moveTo !== undefined);
+
+      // 1. Create the replacements in one undo step. If one fails, remove the
+      //    others again so the call changes nothing.
+      const replacement = new Map<(typeof plan)[number], CuePoint<"1.0.0">>();
+      if (moves.length) {
+        const known = new Set(existing.map((c) => c.id));
+        const settled = await context.withinTransaction(() =>
+          Promise.allSettled(moves.map((m) => song().createCuePoint(m.moveTo!))),
+        );
+        // A create that hands back an existing cue point did not create one;
+        // never rename or roll back (delete) the user's cue point for it.
+        const fresh = settled.map((r) =>
+          r.status === "fulfilled" && !known.has(remember(r.value)) ? r.value : null,
+        );
+        const bad = fresh.findIndex((c) => !c);
+        if (bad >= 0) {
+          const made = fresh.filter((c): c is CuePoint<"1.0.0"> => c !== null);
+          const undone = made.length
+            ? await context.withinTransaction(() =>
+                Promise.allSettled(made.map((c) => song().deleteCuePoint(c))),
+              )
+            : [];
+          const left = made.filter((_, k) => undone[k].status === "rejected").map((c) => remember(c));
+          const r = settled[bad];
+          const why =
+            r.status === "rejected"
+              ? errorMessage(r.reason)
+              : `Live returned the existing cue point ${remember(r.value)} instead of a new one`;
+          const where = itemLabel(batch, moves[bad].i);
+          throw new Error(
+            `${where ? `${where}: ` : ""}could not create a cue point at beat ${moves[bad].moveTo}: ${why}. ` +
+              (left.length
+                ? `The replacement cue points ${left.join(", ")} could not be removed again; ` +
+                  "nothing else was changed."
+                : "Nothing was changed."),
+          );
+        }
+        moves.forEach((m, k) => replacement.set(m, fresh[k]!));
+      }
+
+      // 2. Names: renames, and the moved cue points' names (one undo step).
+      const names = plan.flatMap((p) => {
+        const name = p.name ?? (p.moveTo !== undefined ? p.oldName : undefined);
+        return name === undefined ? [] : [{ target: replacement.get(p) ?? p.cue, name }];
+      });
+      if (names.length)
+        context.withinTransaction(() => {
+          for (const { target, name } of names) target.name = name;
+        });
+
+      // 3. Delete the moved originals (one undo step).
+      const deleted = moves.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(moves.map((m) => song().deleteCuePoint(m.cue))),
+          )
+        : [];
+      const out = plan.map((p) => {
+        const k = moves.indexOf(p);
+        if (k < 0) return cuePointSummary(p.cue);
+        const summary = cuePointSummary(replacement.get(p)!);
+        const r = deleted[k];
+        return r.status === "fulfilled"
+          ? { ...summary, replaced_id: p.id }
+          : {
+              ...summary,
+              error: `moved, but the old cue point ${p.id} could not be deleted: ${errorMessage(r.reason)}`,
+            };
+      });
+      return batch ? { items: out } : out[0];
     },
   );
 
@@ -525,8 +1060,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "clip_create",
     { title: "Create clip", annotations: CREATE },
     "Create a MIDI or audio clip. Target: a clip slot id (session view), a track " +
-      "id (arrangement — MidiTrack for midi, AudioTrack for audio; requires " +
-      "start_time — OR session view when scene_index is given), or a take lane id " +
+      "(target_id, or track_id/track_index/track_name; arrangement — MidiTrack for " +
+      "midi, AudioTrack for audio; requires start_time — OR the session slot of a " +
+      "scene when scene_index/scene_id/scene_name is given), or a take lane id " +
       "(requires start_time). MIDI clips require duration and can be created with " +
       "their notes inline (file_path, is_warped and loop_settings are rejected). " +
       "Audio clips require file_path; by default the file is first imported " +
@@ -534,13 +1070,22 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "after creation.",
     {
       type: z.enum(["midi", "audio"]),
-      target_id: z.string().describe("ClipSlot, Track, or TakeLane id"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("ClipSlot, Track, or TakeLane id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress,
       scene_index: z
         .number()
         .int()
         .min(0)
         .optional()
         .describe("With a track target: create in this session clip slot instead of the arrangement"),
+      scene_id: z.string().optional().describe("With a track target: the session clip slot of this scene"),
+      scene_name: z
+        .string()
+        .optional()
+        .describe("With a track target: the session clip slot of the scene with this name"),
       start_time: z.number().optional().describe("Arrangement position in beats (track/take-lane targets)"),
       duration: z.number().positive().optional().describe("Clip length in beats"),
       notes: z.array(z.object(noteShape)).optional().describe("MIDI only: initial notes"),
@@ -562,14 +1107,17 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         if (audioOnly.length)
           throw new UsageError(`MIDI clips take no ${audioOnly.join(", ")} (audio clips only).`);
       }
-      let target = resolve(args.target_id, DataModelObject);
-      if (args.scene_index !== undefined) {
+      let target = findTarget(args);
+      if (hasSceneAddress(args)) {
         if (!(target instanceof Track))
-          throw new UsageError(`scene_index requires a Track target, got ${classOf(target)}.`);
-        const slot = target.clipSlots[args.scene_index];
+          throw new UsageError(
+            `scene_index/scene_id/scene_name require a Track target, got ${classOf(target)}.`,
+          );
+        const { index } = findScene(args);
+        const slot = target.clipSlots[index];
         if (!slot)
           throw new UsageError(
-            `scene_index ${args.scene_index} out of range (track has ${target.clipSlots.length} slots).`,
+            `scene_index ${index} out of range (track has ${target.clipSlots.length} slots).`,
           );
         target = slot;
       }
@@ -647,36 +1195,126 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     ({ clip_id }) => clipSummary(resolve(clip_id, Clip), true),
   );
 
+  const clipProps = {
+    name: z.string().optional(),
+    color: z.string().optional().describe("#RRGGBB"),
+    muted: z.boolean().optional(),
+    looping: z.boolean().optional(),
+    warping: z.boolean().optional().describe("Audio clips only"),
+    warp_mode: z.enum(WARP_MODES).optional().describe("Audio clips only"),
+  };
+  const CLIP_PROPS = Object.keys(clipProps);
+  type ClipProps = z.objectOutputType<typeof clipProps, z.ZodTypeAny>;
+
+  // Validates one clip's changes and returns the setters, so that a batch can
+  // check every clip before the first write.
+  function clipWrites(clip: Clip<"1.0.0">, p: ClipProps): () => void {
+    const parsedColor = p.color !== undefined ? hexToColor(p.color) : undefined;
+    if ((p.warping !== undefined || p.warp_mode !== undefined) && !(clip instanceof AudioClip))
+      throw new UsageError("warping/warp_mode only apply to audio clips.");
+    return () => {
+      if (p.name !== undefined) clip.name = p.name;
+      if (parsedColor !== undefined) clip.color = parsedColor;
+      if (p.muted !== undefined) clip.muted = p.muted;
+      if (p.looping !== undefined) clip.looping = p.looping;
+      if (clip instanceof AudioClip) {
+        if (p.warping !== undefined) clip.warping = p.warping;
+        if (p.warp_mode !== undefined) clip.warpMode = WarpMode[p.warp_mode];
+      }
+    };
+  }
+
+  const CLIP_SCOPES = ["all", "session", "arrangement", "take_lanes"] as const;
+
+  // A track's clips in the given scope; a clip listed twice counts once.
+  function clipsOf(track: Track<"1.0.0">, scope: (typeof CLIP_SCOPES)[number], nameContains?: string) {
+    const want = (s: string) => scope === "all" || scope === s;
+    const all = [
+      ...(want("session") ? track.clipSlots.flatMap((s) => s.clip ?? []) : []),
+      ...(want("arrangement") ? track.arrangementClips : []),
+      ...(want("take_lanes") ? track.takeLanes.flatMap((l) => l.clips) : []),
+    ];
+    const seen = new Set<bigint>();
+    const q = nameContains?.toLowerCase();
+    return all.filter((c) => {
+      if (seen.has(c.handle.id)) return false;
+      seen.add(c.handle.id);
+      return q === undefined || c.name.toLowerCase().includes(q);
+    });
+  }
+
   tool(
     "clip_set",
     { title: "Set clip properties", annotations: SET },
     "Set clip properties. color is '#RRGGBB'. warping/warp_mode apply to audio " +
-      "clips only. Note: enabling looping on an unwarped audio clip enables warping.",
+      "clips only. Note: enabling looping on an unwarped audio clip enables warping. " +
+      "Address one clip by clip_id; several by `items` (one entry per clip, each " +
+      "with its own values); or every clip of one track by `select` {track_id | " +
+      "track_index | track_name, scope, name_contains} with the values at the top " +
+      "level, e.g. warp all clips of the Drums track. All changes form one undo " +
+      "step; nothing is changed if any clip is invalid.",
     {
-      clip_id: z.string(),
-      name: z.string().optional(),
-      color: z.string().optional(),
-      muted: z.boolean().optional(),
-      looping: z.boolean().optional(),
-      warping: z.boolean().optional(),
-      warp_mode: z.enum(WARP_MODES).optional(),
+      clip_id: z.string().optional(),
+      ...clipProps,
+      items: z
+        .array(z.object({ clip_id: z.string(), ...clipProps }))
+        .min(1)
+        .optional()
+        .describe("Batch form: one entry per clip; returns {items}"),
+      select: z
+        .object({
+          ...trackAddress,
+          scope: z
+            .enum(CLIP_SCOPES)
+            .default("all")
+            .describe("session slots, arrangement, take lanes, or all of them"),
+          name_contains: z
+            .string()
+            .optional()
+            .describe("Only clips whose name contains this (case-insensitive)"),
+        })
+        .optional()
+        .describe("Apply the top-level values to the matching clips of one track; returns {items}"),
     },
-    ({ clip_id, name, color, muted, looping, warping, warp_mode }) => {
-      const clip = resolve(clip_id, Clip);
-      // Validate everything before the first setter runs — each setter is its
-      // own host transaction, so a late throw would leave partial changes.
-      const parsedColor = color !== undefined ? hexToColor(color) : undefined;
-      if ((warping !== undefined || warp_mode !== undefined) && !(clip instanceof AudioClip))
-        throw new UsageError("warping/warp_mode only apply to audio clips.");
-      if (name !== undefined) clip.name = name;
-      if (parsedColor !== undefined) clip.color = parsedColor;
-      if (muted !== undefined) clip.muted = muted;
-      if (looping !== undefined) clip.looping = looping;
-      if (clip instanceof AudioClip) {
-        if (warping !== undefined) clip.warping = warping;
-        if (warp_mode !== undefined) clip.warpMode = WarpMode[warp_mode];
+    (args) => {
+      let plan: Array<{ clip: Clip<"1.0.0">; write: () => void }>;
+      let writes = true; // false only for a single clip_id with nothing to set
+      let batch: boolean;
+      if (args.select) {
+        if (args.clip_id !== undefined || args.items)
+          throw new UsageError("Give one of clip_id, items, or select.");
+        if (!given(args, CLIP_PROPS))
+          throw new UsageError(`Nothing to set — give ${CLIP_PROPS.join(", ")}.`);
+        const { scope, name_contains, ...address } = args.select;
+        batch = true;
+        plan = clipsOf(findTrack(address), scope, name_contains).map((clip) =>
+          at(() => `clip ${remember(clip)} (${JSON.stringify(clip.name)})`, () => ({
+            clip,
+            write: clipWrites(clip, args),
+          })),
+        );
+      } else {
+        const e = entries(args, args.items, ["clip_id", ...CLIP_PROPS]);
+        batch = e.batch;
+        plan = e.list.map((it, i) =>
+          at(itemLabel(batch, i), () => {
+            if (it.clip_id === undefined) throw new UsageError("Provide clip_id, items, or select.");
+            const clip = resolve(it.clip_id, Clip);
+            if (!given(it, CLIP_PROPS)) {
+              if (batch) throw new UsageError(`nothing to set — give ${CLIP_PROPS.join(", ")}.`);
+              writes = false;
+            }
+            return { clip, write: clipWrites(clip, it) };
+          }),
+        );
       }
-      return clipSummary(clip);
+      // Validation is done: apply every clip's setters as one undo step.
+      if (plan.length && writes)
+        context.withinTransaction(() => {
+          for (const { write } of plan) write();
+        });
+      const out = plan.map(({ clip }) => clipSummary(clip));
+      return batch ? { items: out } : out[0];
     },
   );
 
@@ -861,14 +1499,16 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "Insert a built-in Live device (by name, e.g. 'Reverb', 'Auto Filter', 'EQ " +
       "Eight', 'Compressor', 'Simpler', 'Drum Rack', 'Operator', 'Wavetable') into " +
       "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
-      "0-based position in the device chain; omitted = append at the end.",
+      "0-based position in the device chain; omitted = append at the end. The " +
+      "target is a Track or Chain id, or a track given by track_id/track_index/track_name.",
     {
-      target_id: z.string().describe("Track or Chain id"),
+      target_id: z.string().optional().describe("Track or Chain id"),
+      ...trackAddress,
       device_name: z.string(),
       index: z.number().int().min(0).optional(),
     },
-    async ({ target_id, device_name, index }) => {
-      const target = resolve(target_id, DataModelObject);
+    async ({ device_name, index, ...address }) => {
+      const target = findTarget(address);
       if (!(target instanceof Track) && !(target instanceof Chain))
         throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
       const device = await target.insertDevice(device_name, index ?? target.devices.length);
@@ -1002,56 +1642,199 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "mixer_get",
     { title: "Get mixer", annotations: READ },
     "Get the mixer of a track or rack chain: volume, panning, and sends with " +
-      "current values and parameter ids (settable via parameter_set).",
-    { target_id: z.string().describe("Track, Chain, or mixer id") },
-    async ({ target_id }) => {
-      const target = resolve(target_id, DataModelObject);
-      const mixer =
-        target instanceof Track || target instanceof Chain
-          ? target.mixer
-          : target instanceof TrackMixer || target instanceof ChainMixer
-            ? target
-            : null;
-      if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
-      return await mixerDetail(mixer);
-    },
+      "current values and parameter ids (settable via parameter_set). Address it " +
+      "by target_id, or the track by track_id/track_index/track_name.",
+    { target_id: z.string().optional().describe("Track, Chain, or mixer id"), ...trackAddress },
+    async (args) => await mixerDetail(findMixer(args).mixer),
   );
+
+  const mixerTarget = {
+    target_id: z.string().optional().describe("Track, Chain, or mixer id"),
+    ...trackAddress,
+  };
+  const mixerValues = {
+    volume: z.number().min(0).max(1).optional(),
+    panning: z.number().min(-1).max(1).optional(),
+    sends: z
+      .array(
+        z.object({
+          index: z.number().int().min(0).optional().describe("Send index; order matches the return tracks"),
+          return_name: z
+            .string()
+            .optional()
+            .describe("Instead of index: the return track's name (track mixers only)"),
+          value: z.number().min(0).max(1),
+        }),
+      )
+      .optional(),
+  };
+  type MixerValues = z.objectOutputType<typeof mixerValues, z.ZodTypeAny>;
+  type AnyMixer = TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">;
+
+  // Validates one mixer's values and returns its parameter writes.
+  function mixerWrites(mixer: AnyMixer, v: MixerValues): Array<() => Promise<void>> {
+    const writes: Array<() => Promise<void>> = [];
+    if (v.volume !== undefined) writes.push(() => mixer.volume.setValue(v.volume!));
+    if (v.panning !== undefined) writes.push(() => mixer.panning.setValue(v.panning!));
+    for (const send of v.sends ?? []) {
+      if ((send.index === undefined) === (send.return_name === undefined))
+        throw new UsageError("Each send takes exactly one of index or return_name.");
+      let index = send.index!;
+      if (send.return_name !== undefined) {
+        if (!(mixer instanceof TrackMixer))
+          throw new UsageError("return_name only applies to track mixers; address rack chain sends by index.");
+        const returns = song().returnTracks.map((track, i) => ({ track, i }));
+        const describe = (r: (typeof returns)[number]) => `${JSON.stringify(r.track.name)} (send ${r.i})`;
+        const hint = "Use the send index.";
+        index = byName("return track", send.return_name, returns, (r) => r.track.name, describe, { hint }).i;
+      }
+      const p = mixer.sends[index];
+      if (!p) throw new UsageError(`send index ${index} out of range (${mixer.sends.length} sends).`);
+      writes.push(() => p.setValue(send.value));
+    }
+    if (!writes.length) throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
+    return writes;
+  }
+
+  // all_tracks selection. Setting a group track already changes how its tracks
+  // sound, so only the top-most tracks are set: a track inside a group that is
+  // set is "covered" and left alone, so nothing is applied twice. Excluded
+  // tracks and everything inside an excluded group are left alone; a group that
+  // contains an excluded track is not set either (that would change the
+  // excluded track too) — its other tracks are set one by one instead.
+  function topmostTracks(exclude: TrackAddress[]) {
+    const excluded = new Set(exclude.map((a, i) => at(`exclude[${i}]`, () => findTrack(a)).handle.id));
+    const tracks = song().tracks.map((track) => {
+      const groups: Track<"1.0.0">[] = []; // innermost first
+      for (let g = track.groupTrack; g && groups.length < 64; g = g.groupTrack) groups.push(g);
+      return { track, groups };
+    });
+    const holdsExcluded = new Set(
+      tracks
+        .filter(({ track }) => excluded.has(track.handle.id))
+        .flatMap(({ groups }) => groups.map((g) => g.handle.id)),
+    );
+    const selected: Track<"1.0.0">[] = [];
+    const skipped: Array<{ track_id: string; name: string; reason: string }> = [];
+    for (const { track, groups } of tracks) {
+      const skip = (reason: string) => skipped.push({ track_id: remember(track), name: track.name, reason });
+      const excludedGroup = groups.find((g) => excluded.has(g.handle.id));
+      // groups that will be set, innermost first: those holding no excluded track
+      const setGroups = groups.filter((g) => !holdsExcluded.has(g.handle.id));
+      if (excluded.has(track.handle.id)) skip("excluded");
+      else if (excludedGroup) skip(`inside the excluded group ${JSON.stringify(excludedGroup.name)}`);
+      else if (holdsExcluded.has(track.handle.id))
+        skip("group containing an excluded track; its other tracks are set instead");
+      else if (setGroups.length)
+        skip(`covered by its group ${JSON.stringify(setGroups[setGroups.length - 1].name)}`);
+      else selected.push(track);
+    }
+    return { selected, skipped };
+  }
 
   tool(
     "mixer_set",
     { title: "Set mixer", annotations: SET },
-    "Set volume, panning, and/or sends of a track or rack chain mixer in one " +
-      "call (single undo step). Volume is normalized 0-1 (0.85 = 0 dB unity, " +
-      "1.0 = +6 dB); panning is -1..1; sends are addressed by index (order " +
-      "matches the return tracks).",
+    "Set volume, panning, and/or sends of track or rack chain mixers in one call " +
+      "(single undo step; nothing is changed if any target is invalid). Volume is " +
+      "normalized 0-1 (0.85 = 0 dB unity, 1.0 = +6 dB); panning is -1..1; each " +
+      "send is addressed by index (order matches the return tracks) or return_name. " +
+      "Choose the mixers with ONE of: target_id (Track, Chain, or mixer id) or " +
+      "track_id/track_index/track_name; `targets` (the same values on several); " +
+      "`all_tracks` (every regular track, minus `exclude`); or `items` (one entry " +
+      "per mixer with its own values). all_tracks sets the top-most tracks only: a " +
+      "group track covers the tracks inside it, which are left alone; tracks inside " +
+      "an excluded group are left alone, and a group holding an excluded track is " +
+      "not set itself — its other tracks are. A single target returns its mixer; " +
+      "the other forms return {items} (plus `skipped` for all_tracks).",
     {
-      target_id: z.string().describe("Track, Chain, or mixer id"),
-      volume: z.number().min(0).max(1).optional(),
-      panning: z.number().min(-1).max(1).optional(),
-      sends: z
-        .array(z.object({ index: z.number().int().min(0), value: z.number().min(0).max(1) }))
-        .optional(),
+      ...mixerTarget,
+      ...mixerValues,
+      targets: z
+        .array(z.object(mixerTarget))
+        .min(1)
+        .optional()
+        .describe("Several mixers that get the top-level values"),
+      all_tracks: z
+        .boolean()
+        .optional()
+        .describe("Apply the top-level values to every regular track (top-most only, see description)"),
+      exclude: z
+        .array(z.object(trackAddress))
+        .optional()
+        .describe("With all_tracks: tracks to leave alone, including everything inside an excluded group"),
+      items: z
+        .array(z.object({ ...mixerTarget, ...mixerValues }))
+        .min(1)
+        .optional()
+        .describe("One entry per mixer, each with its own values"),
     },
-    async ({ target_id, volume, panning, sends }) => {
-      const target = resolve(target_id, DataModelObject);
-      const mixer =
-        target instanceof Track || target instanceof Chain
-          ? target.mixer
-          : target instanceof TrackMixer || target instanceof ChainMixer
-            ? target
-            : null;
-      if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
-      const writes: Array<() => Promise<void>> = [];
-      if (volume !== undefined) writes.push(() => mixer.volume.setValue(volume));
-      if (panning !== undefined) writes.push(() => mixer.panning.setValue(panning));
-      for (const send of sends ?? []) {
-        const p = mixer.sends[send.index];
-        if (!p) throw new UsageError(`send index ${send.index} out of range (${mixer.sends.length} sends).`);
-        writes.push(() => p.setValue(send.value));
+    async (args) => {
+      const single = args.target_id !== undefined || hasTrackAddress(args);
+      const forms = [
+        single && "target_id/track_*",
+        args.targets && "targets",
+        args.all_tracks && "all_tracks",
+        args.items && "items",
+      ].filter(Boolean);
+      if (forms.length !== 1)
+        throw new UsageError(
+          forms.length
+            ? `Choose one way to address mixers, got ${forms.join(" + ")}.`
+            : "Provide target_id or track_id/track_index/track_name, targets, all_tracks, or items.",
+        );
+      if (args.exclude && !args.all_tracks) throw new UsageError("exclude only applies with all_tracks.");
+      const hasValues = given(args, Object.keys(mixerValues));
+      if (args.items && hasValues)
+        throw new UsageError("With items, give volume/panning/sends in each entry instead.");
+      if (!args.items && !hasValues)
+        throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
+
+      // Validate every target before the first write.
+      type Plan = { mixer: AnyMixer; owner: DataModelObject<"1.0.0">; writes: Array<() => Promise<void>> };
+      let plan: Plan[];
+      let skipped: ReturnType<typeof topmostTracks>["skipped"] | undefined;
+      if (args.items) {
+        plan = args.items.map((it, i) =>
+          at(`items[${i}]`, () => {
+            const { mixer, owner } = findMixer(it);
+            return { mixer, owner, writes: mixerWrites(mixer, it) };
+          }),
+        );
+      } else if (args.targets) {
+        plan = args.targets.map((t, i) =>
+          at(`targets[${i}]`, () => {
+            const { mixer, owner } = findMixer(t);
+            return { mixer, owner, writes: mixerWrites(mixer, args) };
+          }),
+        );
+      } else if (args.all_tracks) {
+        const sel = topmostTracks(args.exclude ?? []);
+        skipped = sel.skipped;
+        plan = sel.selected.map((track) =>
+          at(() => `track ${describeTrack(track)}`, () => ({
+            mixer: track.mixer,
+            owner: track,
+            writes: mixerWrites(track.mixer, args),
+          })),
+        );
+      } else {
+        const { mixer, owner } = findMixer(args);
+        plan = [{ mixer, owner, writes: mixerWrites(mixer, args) }];
       }
-      if (!writes.length) throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
-      await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
-      return await mixerDetail(mixer);
+      const writes = plan.flatMap((p) => p.writes);
+      if (writes.length) await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
+      if (single) return await mixerDetail(plan[0].mixer);
+      return {
+        items: await Promise.all(
+          plan.map(async ({ mixer, owner }) => ({
+            target_id: remember(owner),
+            name: owner instanceof Track ? owner.name : undefined,
+            ...(await mixerDetail(mixer)),
+          })),
+        ),
+        skipped,
+      };
     },
   );
 
@@ -1077,15 +1860,17 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "Live 12.4.15 the render is not normalized, so its levels are meaningful. " +
       "The file is written to the extension's temp directory, which may be " +
       "cleaned between sessions: pass it to import_file (or clip_create, which " +
-      "imports by default) to keep it. Audio tracks only.",
-    { track_id: z.string(), start_time: z.number(), end_time: z.number() },
-    async ({ track_id, start_time, end_time }) => ({
-      audio_path: await context.resources.renderPreFxAudio(
-        resolve(track_id, AudioTrack),
-        start_time,
-        end_time,
-      ),
-    }),
+      "imports by default) to keep it. Audio tracks only, addressed by track_id, " +
+      "track_index or track_name.",
+    { ...trackAddress, start_time: z.number(), end_time: z.number() },
+    async ({ start_time, end_time, ...address }) => {
+      const track = findTrack(address);
+      if (!(track instanceof AudioTrack))
+        throw new UsageError(
+          `Only audio tracks can be rendered; ${describeTrack(track)} is a ${classOf(track)}.`,
+        );
+      return { audio_path: await context.resources.renderPreFxAudio(track, start_time, end_time) };
+    },
   );
 
   // -- ui / commands ---------------------------------------------------------

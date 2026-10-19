@@ -75,10 +75,25 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 
 - Every Live object (track, clip, device, parameter, ...) is addressed by a stable **object id**
   discovered through listing tools (`song_get`, `track_get`, `device_get`, ...).
+- Tracks and scenes can also be addressed **by name or index**: every tool that acts on one
+  track takes `track_id`, `track_index` (regular tracks) or `track_name` (exact match first,
+  then case-insensitive; regular, return and main tracks), and the scene tools take `scene_id`,
+  `scene_index` or `scene_name`. When several are given they must name the same object. An
+  ambiguous name is an error that lists only the matching candidates; deletes need the exact
+  name.
 - Ids stay valid until the object is deleted or moved, or another Live Set is loaded. Stale ids
-  return an error telling the client to re-list.
+  return an error telling the client to re-list. Errors in the arguments themselves (unknown
+  name, index out of range, conflicting fields) come without that hint.
 - All times/positions are in **beats**; colors are `#RRGGBB`; MIDI pitches are 0–127.
-- Multi-value writes (`parameter_set`, `mixer_set`) are grouped into a single undo step in Live.
+- **Batched writes**: `track_set`, `scene_set`, `cue_point_set`, `clip_set`, `take_lane_set` and
+  `mixer_set` take `items: [{<address>, ...values}]` to change many objects in one call.
+  `clip_set` also takes `select: {track, scope, name_contains}` (e.g. every clip of the Drums
+  track), and `mixer_set` takes `targets` (same values on several mixers) or `all_tracks` with
+  `exclude`. Every entry is validated before the first write, and all of a call's changes form
+  **one undo step** in Live — as do the multi-value writes of `parameter_set` and `mixer_set`.
+- **Create with initial config**: `track_create` takes a `name` and `devices` (each a name or
+  `{name, parameters}`) and returns the new track's `index` (Live inserts it after the selected
+  track); `scene_create` and `cue_point_create` take a `name` or `items` for several at once.
 - On `initialize` the server sends short **instructions** (a digest of the
   [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
   and what the API cannot do. Clients that support server instructions (Claude Code) add them
@@ -117,26 +132,28 @@ The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`
 | Tool | Description |
 |------|-------------|
 | `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. |
-| `track_set` | Name / mute / solo / arm. |
-| `track_create` | New audio or MIDI track. |
-| `track_delete` | Delete track. |
+| `track_set` | Name / mute / solo / arm, by id, index or name; `items` changes many tracks in one undo step. |
+| `track_create` | New audio or MIDI track, optionally with a `name` and `devices` (names, or `{name, parameters}` with initial values). Returns the track's `index` (Live inserts it after the selected track); a failing device is reported in `errors` instead of failing the call. |
+| `track_delete` | Delete track (by id, index, or exact name). |
 | `track_duplicate` | Duplicate track. |
 | `track_clear_clips_in_range` | Delete/truncate arrangement clips in a beat range. |
 | `take_lane_create` | Add a take lane to a track. |
-| `take_lane_set` | Rename a take lane. |
+| `take_lane_set` | Rename take lanes (`items` for several, one undo step). |
+
+Every tool above except `take_lane_set` takes the track as `track_id`, `track_index` or `track_name`.
 
 ### Scenes & cue points
 | Tool | Description |
 |------|-------------|
-| `scene_create` / `scene_set` / `scene_delete` / `scene_duplicate` | Manage scenes. |
-| `cue_point_create` / `cue_point_set` / `cue_point_delete` | Manage arrangement locators. |
+| `scene_create` / `scene_set` / `scene_delete` / `scene_duplicate` | Manage scenes, addressed by `scene_id`, `scene_index` or `scene_name` (exact for delete). `scene_create` takes a `name`, or `items` to create several in order; `scene_set` renames many with `items` in one undo step. |
+| `cue_point_create` / `cue_point_set` / `cue_point_delete` | Manage arrangement locators. Create with a `name`, or several with `items`. `cue_point_set` renames (`items` for many) and moves: with `time` it re-creates the locator at the new position with its name, deletes the old one and returns the new id plus `replaced_id`. |
 
 ### Clips
 | Tool | Description |
 |------|-------------|
-| `clip_create` | Create MIDI or audio clips in a session slot (by id or track + `scene_index`), arrangement track, or take lane. MIDI clips take inline `notes` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
+| `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count). |
-| `clip_set` | Name, color, mute, looping, warping, warp mode. |
+| `clip_set` | Name, color, mute, looping, warping, warp mode — for one clip, several (`items`), or every clip of a track (`select: {track_name, scope, name_contains}`), in one undo step. |
 | `clip_delete` | Delete a session or arrangement clip. |
 | `midi_clip_get_notes` | Read all MIDI notes. |
 | `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top). |
@@ -146,7 +163,7 @@ The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`
 | Tool | Description |
 |------|-------------|
 | `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample. |
-| `device_insert` | Insert a built-in Live device into a track or rack chain. |
+| `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain. |
 | `device_delete` / `device_duplicate` | Remove or copy devices. |
 | `chain_get` | Rack chain detail: devices + chain mixer. |
 | `rack_insert_chain` | Add a chain to a rack. |
@@ -158,14 +175,14 @@ The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`
 |------|-------------|
 | `parameter_get` | Read device/mixer parameter values (batch). |
 | `parameter_set` | Write parameter values (batch, single undo step). |
-| `mixer_get` | Volume / pan / sends of a track or chain, with parameter ids and unit hints. |
-| `mixer_set` | Set volume / pan / sends of a track or chain in one call (single undo step). |
+| `mixer_get` | Volume / pan / sends of a track (by id, index or name) or chain, with parameter ids and unit hints. |
+| `mixer_set` | Set volume / pan / sends (by index or `return_name`) in one undo step: one track or chain, the same values on several (`targets`) or on every track (`all_tracks` minus `exclude`), or per-target values (`items`). `all_tracks` sets the top-most tracks only: a group covers its tracks, an excluded group keeps its tracks, and a group holding an excluded track is skipped while its other tracks are set; the result lists what was `skipped` and why. |
 
 ### Files & rendering
 | Tool | Description |
 |------|-------------|
 | `import_file` | Copy a file into the Live project. |
-| `render_track_audio` | Render the pre-FX audio of an audio track (clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — import it to keep it. Not normalized since Live 12.4.15. |
+| `render_track_audio` | Render the pre-FX audio of an audio track (by id, index or name; clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — import it to keep it. Not normalized since Live 12.4.15. |
 
 ### UI & commands
 | Tool | Description |

@@ -172,6 +172,47 @@ const lane = await call("take_lane_create", { track_id: midi.id });
 await call("take_lane_set", { take_lane_id: lane.id, name: "MCP Take" });
 step("scene, cue point, take lane: create/rename/delete OK");
 
+// --- names, batches, moves: host behaviour the mock can only assume ---------
+const named = await call("track_create", {
+  type: "midi", name: "MCP Smoke Named", devices: ["Operator", "MCP No Such Device"],
+});
+const tracksAfterCreate = (await call("song_get", { include: ["tracks"] })).tracks;
+assert.equal(named.index, tracksAfterCreate.findIndex((t) => t.id === named.id), "returned index is the track's position");
+assert.equal(named.devices[0].name, "Operator");
+assert.ok(named.devices[1].error && named.errors.length === 1, "unknown device reported, not thrown");
+await eventually(async () =>
+  assert.equal((await call("track_get", { track_name: "MCP Smoke Named", include: [] })).id, named.id));
+step(`track_create with name + devices landed at index ${named.index}; unknown device reported`);
+
+const scenesBefore = (await call("song_get", { include: ["scenes"] })).scenes.length;
+const madeScenes = await call("scene_create", { items: [{ name: "MCP S1" }, { index: 0, name: "MCP S0" }] });
+await eventually(async () => {
+  const scenes = (await call("song_get", { include: ["scenes"] })).scenes;
+  assert.equal(scenes.length, scenesBefore + 2);
+  assert.deepEqual([scenes[0].id, scenes[0].name], [madeScenes.items[1].id, "MCP S0"], "index 0 entry first");
+  assert.deepEqual([scenes.at(-1).id, scenes.at(-1).name], [madeScenes.items[0].id, "MCP S1"], "appended entry last");
+});
+for (const sc of madeScenes.items) await call("scene_delete", { scene_id: sc.id });
+step("scene_create items: creates applied in call order, then named");
+
+// odd beat positions so a user's own locators are never touched
+const cueToMove = await call("cue_point_create", { time: 997.25, name: "MCP Move" });
+const movedCue = await call("cue_point_set", { cue_point_id: cueToMove.id, time: 1001.75 });
+assert.equal(movedCue.replaced_id, cueToMove.id);
+await eventually(async () => {
+  const cues = (await call("song_get", { include: ["cue_points"] })).cue_points;
+  assert.ok(!cues.some((c) => c.id === cueToMove.id || c.time === 997.25), "old cue point deleted");
+  const now = cues.find((c) => c.id === movedCue.id);
+  assert.deepEqual([now?.time, now?.name], [1001.75, "MCP Move"]);
+});
+await call("cue_point_delete", { cue_point_id: movedCue.id });
+step("cue_point_set time: re-created at the new beat with its name, old one deleted");
+
+const batchMix = await call("mixer_set", { targets: [{ track_id: midi.id }, { track_name: "MCP Smoke Named" }], panning: 0.25 });
+assert.equal(batchMix.items.length, 2);
+await call("mixer_set", { targets: [{ track_id: midi.id }, { track_id: named.id }], panning: 0 });
+step("mixer_set targets: two tracks in one call, restored");
+
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;
 await call("song_set", { tempo: origTempo + 5 });
@@ -185,6 +226,7 @@ await call("track_delete", { track_id: dup.id });
 await call("track_delete", { track_id: midi.id });
 await call("track_delete", { track_id: drumTrack.id });
 await call("track_delete", { track_id: audio.id });
+await call("track_delete", { track_id: named.id });
 fs.rmSync(wavPath, { force: true });
 step("duplicated + deleted all smoke tracks (cleanup)");
 

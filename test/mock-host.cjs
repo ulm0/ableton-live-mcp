@@ -68,6 +68,15 @@ const midiClip = make(["MidiClip", "Clip"], {
 function makeSlot(clip) {
   return make(["ClipSlot"], { clip: clip ?? null });
 }
+// A regular track has one clip slot per scene (index-aligned with Song.scenes).
+const sceneSlots = () => songObj.scenes.map(() => makeSlot(null));
+function makeTrack(classes, name, extra = {}) {
+  return make(classes, {
+    name, mute: false, solo: false, arm: false,
+    slots: sceneSlots(), takeLanes: [], arrClips: [], devices: [],
+    mixer: makeMixer("MixerDevice", songObj.returns.length), group: null, ...extra,
+  });
+}
 const midiSlots = [makeSlot(midiClip), makeSlot(null)];
 const midiTrack = make(["MidiTrack", "Track"], {
   name: "Bass", mute: false, solo: false, arm: false,
@@ -101,6 +110,29 @@ songObj.scenes = [
 ];
 songObj.cues = [make(["CuePoint"], { name: "Start", time: 0 })];
 
+// Built-in device names the mock can insert, with their parameters.
+const deviceOn = () => makeParam("Device On", { quantized: true, value: 1, valueItems: [
+  { name: "Off", shortName: "Off" }, { name: "On", shortName: "On" }] });
+const BUILTIN_DEVICES = {
+  "Operator": () => [deviceOn(), makeParam("Osc-A Level")],
+  "Reverb": () => [deviceOn(), makeParam("Dry/Wet")],
+  "Auto Filter": () => [
+    deviceOn(), makeParam("Frequency", { min: 20, max: 135, value: 135 }), makeParam("Resonance"),
+  ],
+  "Compressor": () => [deviceOn(), makeParam("Threshold")],
+  "EQ Eight": () => [deviceOn()],
+  "Utility": () => [deviceOn(), makeParam("Gain")],
+  "Drum Rack": () => [deviceOn()],
+  "Instrument Rack": () => [deviceOn()],
+  "Simpler": () => [deviceOn()],
+};
+
+let selectedTrack = null;
+function insertAfterSelection(song, track) {
+  const i = selectedTrack ? song.tracks.indexOf(selectedTrack) : -1;
+  i < 0 ? song.tracks.push(track) : song.tracks.splice(i + 1, 0, track);
+}
+
 // --- api modules -----------------------------------------------------------
 // What the extension asked the host to do. `transactions.outer` counts
 // outermost withinTransaction calls — the undo steps a user would see, since
@@ -132,48 +164,49 @@ const dataModel = {
   songGetScaleIntervals: (h) => get(h).scaleIntervals,
   songGetScenes: (h) => get(h).scenes.map((s) => s.handle),
   songGetCuePoints: (h) => get(h).cues.map((c) => c.handle),
+  // "Inserted after the last selected track, or appended if no track is
+  // selected" (Song.createMidiTrack): tests select a track via selectTrack().
   songCreateMidiTrack: (h, ok) => {
-    const t = make(["MidiTrack", "Track"], {
-      name: "New MIDI", mute: false, solo: false, arm: false,
-      slots: [makeSlot(null), makeSlot(null)], takeLanes: [], arrClips: [], devices: [],
-      mixer: makeMixer("MixerDevice", 1), group: null,
-    });
-    get(h).tracks.push(t);
+    const t = makeTrack(["MidiTrack", "Track"], "New MIDI");
+    insertAfterSelection(get(h), t);
     ok(t.handle);
   },
   songCreateAudioTrack: (h, ok) => {
-    const t = make(["AudioTrack", "Track"], {
-      name: "New Audio", mute: false, solo: false, arm: false,
-      slots: [makeSlot(null), makeSlot(null)], takeLanes: [], arrClips: [], devices: [],
-      mixer: makeMixer("MixerDevice", 1), group: null,
-    });
-    get(h).tracks.push(t);
+    const t = makeTrack(["AudioTrack", "Track"], "New Audio");
+    insertAfterSelection(get(h), t);
     ok(t.handle);
   },
+  // Deleting a group track deletes the tracks inside it too, as in Live.
   songDeleteTrack: (h, th, ok) => {
     const s = get(h);
-    s.tracks = s.tracks.filter((t) => t.handle.id !== th.id);
-    objects.delete(th.id.toString());
+    const inside = (t) => t.handle.id === th.id || (t.group !== null && inside(t.group));
+    for (const t of s.tracks.filter(inside)) objects.delete(t.handle.id.toString());
+    s.tracks = s.tracks.filter((t) => !inside(t));
     ok();
   },
-  songCreateScene: (h, index, ok) => {
-    const sc = make(["Scene"], { name: "New Scene", tempo: 120, sigN: 4, sigD: 4 });
+  // Scenes and the tracks' clip slots stay index-aligned, as in Live.
+  songCreateScene: (h, index, ok, err) => {
     const s = get(h);
     const i = Number(index);
-    i < 0 ? s.scenes.push(sc) : s.scenes.splice(i, 0, sc);
+    if (i < -1 || i > s.scenes.length) return err(); // the host rejects without details
+    const sc = make(["Scene"], { name: "", tempo: 120, sigN: 4, sigD: 4 });
+    const at = i < 0 ? s.scenes.length : i;
+    s.scenes.splice(at, 0, sc);
+    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null));
     ok(sc.handle);
   },
   songDeleteScene: (h, sh, ok) => {
     const s = get(h);
-    s.scenes = s.scenes.filter((x) => x.handle.id !== sh.id);
+    const at = s.scenes.findIndex((x) => x.handle.id === sh.id);
+    s.scenes.splice(at, 1);
+    for (const t of s.tracks) t.slots.splice(at, 1);
+    objects.delete(sh.id.toString());
     ok();
   },
   songDuplicateTrack: (h, th, ok) => {
     const src = get(th);
-    const t = make([...src.classes], {
-      name: src.name + " Copy", mute: src.mute, solo: src.solo, arm: src.arm,
-      slots: [makeSlot(null), makeSlot(null)], takeLanes: [], arrClips: [], devices: [],
-      mixer: makeMixer("MixerDevice", 1), group: null,
+    const t = makeTrack([...src.classes], src.name + " Copy", {
+      mute: src.mute, solo: src.solo, arm: src.arm, group: src.group,
     });
     const s = get(h);
     s.tracks.splice(s.tracks.findIndex((x) => x.handle.id === th.id) + 1, 0, t);
@@ -183,10 +216,15 @@ const dataModel = {
     const src = get(sh);
     const sc = make(["Scene"], { name: src.name + " Copy", tempo: src.tempo, sigN: src.sigN, sigD: src.sigD });
     const s = get(h);
-    s.scenes.splice(s.scenes.findIndex((x) => x.handle.id === sh.id) + 1, 0, sc);
+    const at = s.scenes.findIndex((x) => x.handle.id === sh.id) + 1;
+    s.scenes.splice(at, 0, sc);
+    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null));
     ok(sc.handle);
   },
-  songCreateCuePoint: (h, time, ok) => {
+  // Arrangement positions start at 0: the mock rejects earlier ones (without
+  // an error value, like most host rejections).
+  songCreateCuePoint: (h, time, ok, err) => {
+    if (time < 0) return err();
     const c = make(["CuePoint"], { name: "Locator", time });
     get(h).cues.push(c);
     ok(c.handle);
@@ -194,6 +232,7 @@ const dataModel = {
   songDeleteCuePoint: (h, ch, ok) => {
     const s = get(h);
     s.cues = s.cues.filter((x) => x.handle.id !== ch.id);
+    objects.delete(ch.id.toString());
     ok();
   },
   trackGetName: (h) => get(h).name,
@@ -205,7 +244,7 @@ const dataModel = {
   trackGetMutedViaSolo: () => false,
   trackGetArm: (h) => get(h).arm,
   trackSetArm: (h, v) => { get(h).arm = v; },
-  trackGetGroupTrack: () => null,
+  trackGetGroupTrack: (h) => (get(h).group ? get(h).group.handle : null),
   trackGetClipSlots: (h) => get(h).slots.map((s) => s.handle),
   trackGetTakeLanes: (h) => get(h).takeLanes.map((l) => l.handle),
   trackGetArrangementClips: (h) => get(h).arrClips.map((c) => c.handle),
@@ -237,13 +276,16 @@ const dataModel = {
     get(h).arrClips.push(c);
     ok(c.handle);
   },
-  trackInsertDevice: (h, name, index, ok) => {
+  // Like Live, only known built-in device names insert; anything else is
+  // rejected without an error value.
+  trackInsertDevice: (h, name, index, ok, err) => {
+    if (!BUILTIN_DEVICES[name]) return err();
     const classes =
       name === "Drum Rack" ? ["DrumRackDevice", "RackDevice", "Device"]
       : name === "Instrument Rack" ? ["RackDevice", "Device"]
       : name === "Simpler" ? ["Simpler", "Device"]
       : ["Device"];
-    const d = make(classes, { name, params: [makeParam("Device On", { quantized: true })] });
+    const d = make(classes, { name, params: BUILTIN_DEVICES[name]() });
     if (classes.includes("RackDevice")) d.chains = [];
     if (classes.includes("Simpler")) d.sample = null;
     d.parentObj = get(h);
@@ -363,7 +405,7 @@ const dataModel = {
   },
   chainGetDevices: (h) => get(h).devices.map((d) => d.handle),
   chainGetMixerDevice: (h) => get(h).mixer.handle,
-  chainInsertDevice: (h, name, index, ok) => dataModel.trackInsertDevice(h, name, index, ok),
+  chainInsertDevice: (h, name, index, ok, err) => dataModel.trackInsertDevice(h, name, index, ok, err),
   chainDeleteDevice: (h, dh, ok) => dataModel.trackDeleteDevice(h, dh, ok),
   chainDuplicateDevice: (h, dh, ok) => ok(dh),
   rackdeviceGetChains: (h) => get(h).chains.map((c) => c.handle),
@@ -435,7 +477,22 @@ function makeActivation(storageDir, tempDir, sink = calls) {
   };
 }
 
-module.exports = { makeActivation, calls, ids: {
+// Test fixtures for what the extension cannot do itself (Live's UI can).
+const fixtures = {
+  // Add a regular track at the end; kind "group" makes a group track that
+  // others join with `group: <its id>`.
+  addTrack: ({ kind, name, group }) => {
+    const classes =
+      kind === "midi" ? ["MidiTrack", "Track"] : kind === "audio" ? ["AudioTrack", "Track"] : ["Track"];
+    const t = makeTrack(classes, name, { group: group ? objects.get(group) : null });
+    songObj.tracks.push(t);
+    return t.handle.id.toString();
+  },
+  // The track Live would insert new tracks after (null = none selected).
+  selectTrack: (id) => { selectedTrack = id ? objects.get(id) : null; },
+};
+
+module.exports = { makeActivation, calls, fixtures, ids: {
   midiTrack: midiTrack.handle.id.toString(),
   audioTrack: audioTrack.handle.id.toString(),
   midiClip: midiClip.handle.id.toString(),
