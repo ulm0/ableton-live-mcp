@@ -2,13 +2,14 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z, type ZodRawShape } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type {
-  ServerNotification,
-  ServerRequest,
-  ToolAnnotations,
+import {
+  ErrorCode,
+  type ServerNotification,
+  type ServerRequest,
+  type ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   AudioClip,
@@ -50,8 +51,11 @@ import {
   formHtml,
   type DialogRecord,
 } from "./dialogs.js";
+import { bearerMatches, configFilePath, lock, readConfig, type Config } from "./config.js";
 import { UsageError } from "./errors.js";
 import INSTRUCTIONS from "./instructions.md";
+import SKILL from "../skills/ableton-live/SKILL.md";
+import { PROMPTS, type PromptEnv } from "./prompts.js";
 import { renderNotes, type Region } from "./region.js";
 import { AUDIO_EXTENSIONS, configRoots, libraryRoots, searchSamples } from "./samples.js";
 import { SelectionStore, registerSelectionMenus, type Selection } from "./selection.js";
@@ -83,27 +87,29 @@ type Ctx = ExtensionContext<"1.0.0">;
 
 declare const __EXT_VERSION__: string | undefined;
 
-const DEFAULT_PORT = 8722;
 const SERVER_INFO = {
   name: "ableton-live",
   version: typeof __EXT_VERSION__ !== "undefined" ? __EXT_VERSION__ : "dev",
 };
+
+// live://guide: the skill without its front matter.
+const GUIDE = SKILL.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n+/, "");
 
 const WARP_MODES = ["Beats", "Tones", "Texture", "Repitch", "Complex", "ComplexPro"] as const;
 
 // ---------------------------------------------------------------------------
 // helpers
 
+const toJson = (data: unknown) => JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
+
 function json(data: unknown) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
-      },
-    ],
-  };
+  return { content: [{ type: "text" as const, text: toJson(data) }] };
 }
+
+// An error a resource or prompt handler throws to answer with this JSON-RPC
+// code (the SDK sends a thrown error's numeric `code` and `message`; McpError
+// would put "MCP error <code>:" into the message twice).
+const rpcError = (code: ErrorCode, message: string) => Object.assign(new Error(message), { code });
 
 const STALE_HINT =
   "If this object was deleted or moved, or the Live Set changed, its id is stale — re-fetch ids via song_get / track_get.";
@@ -847,27 +853,39 @@ function presetStore(storageDirectory: string | undefined) {
 // ---------------------------------------------------------------------------
 // tool registration
 
+// Which tools the servers expose: decided once at startup from config.json's
+// read_only and disabled_tools (see startServer). Without `allowed`, every
+// tool; `note` is added to the instructions.
+type Exposure = { allowed?: ReadonlySet<string>; note?: string };
+
+// A tool as registered: batch and batch_read validate each step with its
+// tool's shape and call its handler directly.
+type Registered = {
+  meta: ToolMeta;
+  shape: ZodRawShape;
+  handler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<unknown> | unknown;
+};
+
 function buildServer(
   context: Ctx,
   hostApiVersion: string,
   port: number,
   selections: SelectionStore,
   dialogs: DialogStore,
-): McpServer {
-  const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
+  exposure: Exposure = {},
+): { server: McpServer; tools: ReadonlyMap<string, Registered> } {
+  const server = new McpServer(SERVER_INFO, {
+    instructions: exposure.note ? `${INSTRUCTIONS.trimEnd()}\n${exposure.note}\n` : INSTRUCTIONS,
+  });
   const song = () => context.application.song;
   // Transport-level failures (unparsable bodies, bad headers) are answered to
   // the client by the SDK; log them so they leave a trace in ExtensionHost.txt.
   server.server.onerror = (e) => console.error("[ableton-live-mcp] MCP error:", e.message);
 
-  // Every tool as registered: batch and batch_read validate each step with
-  // its tool's shape and call its handler directly.
-  type Registered = {
-    meta: ToolMeta;
-    shape: ZodRawShape;
-    handler: (args: Record<string, unknown>, extra: ToolExtra) => Promise<unknown> | unknown;
-  };
+  // The tools this server exposes, and the names of all of them (also those
+  // config.json switches off, which are not registered at all).
   const registry = new Map<string, Registered>();
+  const known = new Set<string>();
 
   function tool<S extends ZodRawShape>(
     name: string,
@@ -879,6 +897,8 @@ function buildServer(
       extra: ToolExtra,
     ) => Promise<unknown> | unknown,
   ) {
+    known.add(name);
+    if (exposure.allowed && !exposure.allowed.has(name)) return;
     registry.set(name, { meta, shape, handler: handler as Registered["handler"] });
     // A tools/call without `arguments` is validated as `{}` by the SDK, so the
     // plain shape works; `?? {}` only guards the handler contract.
@@ -5339,7 +5359,7 @@ function buildServer(
       time_limit_s: z.number().min(0.1).max(20).default(5).describe("Stop searching after this long"),
     },
     async ({ query, extensions, roots: only, limit, max_depth, time_limit_s }) => {
-      const config = configRoots(configFilePath(context));
+      const config = configRoots(configFilePath(context.environment.storageDirectory));
       let roots = [...config.roots, ...libraryRoots()];
       if (only) {
         const unknown = only.filter((o) => !roots.some((r) => r.name.toLowerCase() === o.toLowerCase() || r.path === o));
@@ -5366,7 +5386,7 @@ function buildServer(
         hint: found.roots.some((r) => r.exists)
           ? undefined
           : 'No sample folder exists: add folders to "sample_roots" in the extension\'s config.json ' +
-            `(${configFilePath(context) ?? "no storage directory"}), e.g. {"port": 8722, "sample_roots": ["/Users/me/Samples"]}.`,
+            `(${configFilePath(context.environment.storageDirectory) ?? "no storage directory"}), e.g. {"port": 8722, "sample_roots": ["/Users/me/Samples"]}.`,
       };
     },
   );
@@ -5795,7 +5815,12 @@ function buildServer(
     const plan = steps.map((step, i) => {
       const where = `steps[${i}]`;
       const entry = registry.get(step.tool);
-      if (!entry) throw new UsageError(`${where}: no tool named ${quote(step.tool)}.`);
+      if (!entry)
+        throw new UsageError(
+          known.has(step.tool)
+            ? `${where}: ${step.tool} is switched off on this server (read_only / disabled_tools in config.json).`
+            : `${where}: no tool named ${quote(step.tool)}.`,
+        );
       const hints = entry.meta.annotations;
       if (BATCH_TOOLS.has(step.tool)) throw new UsageError(`${where}: ${step.tool} cannot run inside ${self}.`);
       if (hints.openWorldHint)
@@ -5911,49 +5936,170 @@ function buildServer(
     },
   );
 
-  return server;
+  // -- resources ---------------------------------------------------------------
+
+  // Read-only views for clients that attach context instead of calling tools:
+  // the same data as song_get and track_get, offered only while those tools
+  // are. No subscriptions: the server is stateless and Live reports no
+  // changes, so a client reads again for fresh data.
+  const viaTool = async (name: string, args: Record<string, unknown>, extra: ToolExtra) => {
+    const entry = registry.get(name)!;
+    return entry.handler(z.object(entry.shape).parse(args), extra);
+  };
+  // A JSON resource read. Failures are logged like tool calls (by resource
+  // name, never the URI: it can carry a track name) and reach the client as
+  // JSON-RPC errors, argument errors as invalid params.
+  async function readJson(resource: string, uri: URL, read: () => Promise<unknown>) {
+    const started = Date.now();
+    try {
+      return { contents: [{ uri: uri.href, mimeType: "application/json", text: toJson(await read()) }] };
+    } catch (e) {
+      const msg = errorMessage(e);
+      console.error(`[ableton-live-mcp] resource ${resource} failed after ${Date.now() - started} ms: ${msg}`);
+      throw rpcError(e instanceof UsageError ? ErrorCode.InvalidParams : ErrorCode.InternalError, msg);
+    }
+  }
+
+  if (registry.has("song_get"))
+    server.registerResource(
+      "song",
+      "live://song",
+      {
+        title: "Live Set",
+        description:
+          "The Live Set as song_get returns it without arguments: tempo, scale, grid, tracks with ids, " +
+          "return and main tracks, scenes, cue points, environment. Read it again for fresh data.",
+        mimeType: "application/json",
+      },
+      (uri, extra) => readJson("song", uri, () => viaTool("song_get", {}, extra)),
+    );
+
+  // Names of all tracks (regular, return, main) for completions; none when
+  // the set cannot be read.
+  const trackNames = (): string[] => {
+    try {
+      const s = song();
+      return [...new Set([...s.tracks, ...s.returnTracks, s.mainTrack].map((t) => t.name))];
+    } catch {
+      return [];
+    }
+  };
+  // A track's URI: its name percent-encoded as one path segment, so that "/"
+  // or "," in a name cannot break the template match.
+  const trackUri = (name: string) => `live://tracks/${encodeURIComponent(name)}`;
+  // A URI per track whose name reads back as that track: names shared by
+  // several tracks (ambiguous) and "." / ".." (dot segments, which URL
+  // parsing removes) are left out; track_get reaches those by index or id.
+  function trackResources() {
+    try {
+      const s = song();
+      const all = [
+        ...s.tracks.map((t, i) => ({ t, where: `${trackKind(t, s.tracks)} track, track_index ${i}` })),
+        ...s.returnTracks.map((t, i) => ({ t, where: `return track, send_index ${i}` })),
+        { t: s.mainTrack, where: "main track" },
+      ];
+      const uses = new Map<string, number>();
+      for (const { t } of all) uses.set(t.name, (uses.get(t.name) ?? 0) + 1);
+      return all
+        .filter(({ t }) => uses.get(t.name) === 1 && !["", ".", ".."].includes(t.name))
+        .map(({ t, where }) => ({ uri: trackUri(t.name), name: t.name, description: where, mimeType: "application/json" }));
+    } catch (e) {
+      console.error(`[ableton-live-mcp] could not list the track resources: ${errorMessage(e)}`);
+      return [];
+    }
+  }
+  const decodedPrefix = (value: string) => {
+    try {
+      return decodeURIComponent(value).toLowerCase();
+    } catch {
+      return value.toLowerCase();
+    }
+  };
+
+  if (registry.has("track_get"))
+    server.registerResource(
+      "track",
+      new ResourceTemplate("live://tracks/{track}", {
+        list: () => ({ resources: trackResources() }),
+        complete: {
+          track: (value) =>
+            trackNames()
+              .filter((n) => n.toLowerCase().startsWith(decodedPrefix(value)))
+              .map(encodeURIComponent),
+        },
+      }),
+      {
+        title: "Track",
+        description:
+          "One track as track_get returns it (clip slots, take lanes, arrangement clips, devices, mixer). " +
+          "{track} is the track's name, percent-encoded (encodeURIComponent: a \"/\" in a name is %2F), " +
+          "matched like track_name: exactly first, then ignoring case; regular, return and main tracks.",
+        mimeType: "application/json",
+      },
+      (uri, variables, extra) =>
+        readJson("track", uri, async () => {
+          const raw = String(variables.track);
+          let name: string;
+          try {
+            name = decodeURIComponent(raw);
+          } catch {
+            throw new UsageError(`${quote(raw)} is not a percent-encoded track name (encode it with encodeURIComponent).`);
+          }
+          return viaTool("track_get", { track_name: name }, extra);
+        }),
+    );
+
+  // The full agent guide (the skill the instructions digest), without the
+  // skill's front matter.
+  server.registerResource(
+    "guide",
+    "live://guide",
+    {
+      title: "Ableton Live MCP guide",
+      description:
+        "How to use this server well: workflows, units, batching, what Live's API cannot do. The full " +
+        "version of the server instructions (skills/ableton-live/SKILL.md).",
+      mimeType: "text/markdown",
+    },
+    (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: GUIDE }] }),
+  );
+
+  // -- prompts -----------------------------------------------------------------
+
+  // Step-by-step instructions for common jobs (src/prompts.ts), offered only
+  // when every tool a prompt uses is exposed.
+  const promptEnv: PromptEnv = {
+    scale: () => {
+      try {
+        const s = song();
+        return { root: num(s.rootNote), intervals: s.scaleIntervals.map(num), name: s.scaleName };
+      } catch {
+        return undefined;
+      }
+    },
+    trackNames,
+  };
+  for (const p of PROMPTS) {
+    if (!p.tools.every((t) => registry.has(t))) continue;
+    server.registerPrompt(
+      p.name,
+      { title: p.title, description: p.description, argsSchema: p.args(promptEnv) },
+      (args) => {
+        try {
+          const text = p.render(args as Record<string, string | undefined>, promptEnv);
+          return { description: p.title, messages: [{ role: "user", content: { type: "text", text } }] };
+        } catch (e) {
+          throw e instanceof UsageError ? rpcError(ErrorCode.InvalidParams, `${p.name}: ${e.message}`) : e;
+        }
+      },
+    );
+  }
+
+  return { server, tools: registry };
 }
 
 // ---------------------------------------------------------------------------
 // http server (stateless streamable-http MCP endpoint)
-
-// The extension's config.json, in its storage directory.
-function configFilePath(context: Ctx): string | undefined {
-  const dir = context.environment.storageDirectory;
-  return dir ? path.join(dir, "config.json") : undefined;
-}
-
-// `progress`: config.json's "progress_notifications" (default true); false
-// answers every request as JSON, so long calls send no progress.
-function readConfig(context: Ctx): { port: number; file?: string; progress: boolean } {
-  const dir = context.environment.storageDirectory;
-  const fallback = { port: DEFAULT_PORT };
-  const file = configFilePath(context);
-  if (!dir || !file) return { ...fallback, progress: true };
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-    const port = (parsed as { port?: unknown }).port;
-    const progress = (parsed as { progress_notifications?: unknown }).progress_notifications !== false;
-    if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
-      return { port, file, progress };
-    }
-    console.error(`[ableton-live-mcp] invalid port in ${file}, using ${DEFAULT_PORT}`);
-    return { ...fallback, file, progress };
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-      // exists but unreadable/malformed — leave the user's file alone
-      console.error(`[ableton-live-mcp] could not read ${file}, using defaults:`, e);
-      return { ...fallback, file, progress: true };
-    }
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
-    } catch {
-      // storage dir not writable — run with defaults
-    }
-    return { ...fallback, file, progress: true };
-  }
-}
 
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
 
@@ -6037,15 +6183,18 @@ type ServerState =
 
 // In-Live status dialog, reachable from track context menus. Registered before
 // listen so that a failed start (e.g. EADDRINUSE) can be seen from inside Live.
+// `notes`: plain-text lines about config.json (switches, problems).
 function registerStatus(
   context: Ctx,
   port: number,
   configFile: string | undefined,
   state: () => ServerState,
   dialogs: DialogStore,
+  notes: () => string[] = () => [],
 ) {
   const statusHtml = () => {
     const s = state();
+    const lines = notes();
     const config = configFile
       ? `<code>${escapeHtml(configFile)}</code>`
       : "the extension's config.json (no storage directory available)";
@@ -6061,12 +6210,16 @@ function registerStatus(
               : "") +
             `<p>Set another <code>"port"</code> in ${config}, then restart Live.</p>`
           : `<p>The MCP server is starting on port ${port}...</p>`;
+    const notesHtml = lines.length
+      ? `<ul style="font-size:smaller;padding-left:18px">${lines.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>`
+      : "";
     return (
       // charset: the config path or error text may be non-ASCII
       `<!doctype html><meta charset="utf-8">` +
       `<body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
       `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
       body +
+      notesHtml +
       `<button onclick="${DIALOG_BRIDGE}.postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
       `</body>`
     );
@@ -6076,7 +6229,8 @@ function registerStatus(
   // dialog was never reported closed. Failures are logged by the store.
   context.commands.registerCommand("ableton-live-mcp.status", () => {
     try {
-      dialogs.open(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, 280, "status", { force: true });
+      const height = Math.min(560, 280 + 40 * notes().length);
+      dialogs.open(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, height, "status", { force: true });
     } catch (e) {
       console.error("[ableton-live-mcp] status dialog:", e);
     }
@@ -6088,14 +6242,41 @@ function registerStatus(
   }
 }
 
+// The instructions line that tells the agent which tools config.json switched
+// off, so that it says so instead of looking for workarounds.
+function exposureNote(config: Config, all: ReadonlyMap<string, Registered>, allowed: ReadonlySet<string>) {
+  const off = [...all.keys()].filter((n) => !allowed.has(n));
+  if (!off.length) return undefined;
+  const reads = off.filter((n) => all.get(n)!.meta.annotations.readOnlyHint);
+  const what = config.readOnly
+    ? "This server is read-only (read_only in config.json): every tool that changes the Live Set is switched " +
+      `off${reads.length ? `, and so are ${reads.join(", ")}` : ""}`
+    : `Switched off on this server (disabled_tools in config.json): ${off.join(", ")}`;
+  return `- ${what}. Tell the user when a request needs them; don't look for workarounds.`;
+}
+
+// The Status dialog's lines about config.json. Never the token.
+function configNotes(config: Config, all: ReadonlyMap<string, Registered>, allowed: ReadonlySet<string>) {
+  const notes: string[] = [];
+  if (config.locked) notes.push(`Every request is refused: ${config.locked}. Fix config.json, then restart Live.`);
+  if (config.readOnly) notes.push(`Read-only: ${allowed.size} of ${all.size} tools are on (read_only).`);
+  const disabled = config.disabledTools.filter((n) => all.has(n));
+  if (disabled.length) notes.push(`Switched off (disabled_tools): ${disabled.join(", ")}.`);
+  if (config.tokenDigest) notes.push("Requests need the bearer token (auth_token in config.json).");
+  return [...notes, ...config.problems.map((p) => `config.json: ${p}`)];
+}
+
 export async function startServer(context: Ctx, hostApiVersion: string): Promise<void> {
-  const { port, file: configFile, progress } = readConfig(context);
+  const config = readConfig(context.environment.storageDirectory);
+  const { port, file: configFile, progress } = config;
+  for (const p of config.problems) console.error(`[ableton-live-mcp] config: ${p}`);
   let state: ServerState = { kind: "starting" };
+  let notes: string[] = config.problems.map((p) => `config.json: ${p}`);
   // Dialogs outlive the per-request McpServer (show_dialog {wait:false}, then
   // dialog_result), so the store lives here.
   const dialogs = new DialogStore(context);
   try {
-    registerStatus(context, port, configFile, () => state, dialogs);
+    registerStatus(context, port, configFile, () => state, dialogs, () => notes);
   } catch (e) {
     // a convenience only: never let it keep the endpoint from starting
     console.error("[ableton-live-mcp] could not register the status command:", e);
@@ -6109,6 +6290,34 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
     console.error("[ableton-live-mcp] could not register the selection menu entries:", e);
   }
 
+  // The tools every per-request server exposes, decided once here from a
+  // catalog of all of them: read_only keeps the readOnlyHint ones,
+  // disabled_tools drops the ones it names. A name that is no tool is
+  // probably a typo of one the user wants off, so it locks the endpoint.
+  let catalog: ReadonlyMap<string, Registered>;
+  try {
+    catalog = buildServer(context, hostApiVersion, port, selections, dialogs).tools;
+  } catch (e) {
+    state = { kind: "failed", error: errorMessage(e) };
+    throw e;
+  }
+  const unknownTools = config.disabledTools.filter((n) => !catalog.has(n));
+  if (unknownTools.length)
+    lock(config, `disabled_tools in config.json names no tool: ${unknownTools.map((n) => JSON.stringify(n)).join(", ")}`);
+  const disabled = new Set(config.disabledTools);
+  const allowed: ReadonlySet<string> = new Set(
+    [...catalog]
+      .filter(([name, t]) => !disabled.has(name) && (!config.readOnly || t.meta.annotations.readOnlyHint === true))
+      .map(([name]) => name),
+  );
+  const exposure: Exposure = {
+    allowed: allowed.size < catalog.size ? allowed : undefined,
+    note: exposureNote(config, catalog, allowed),
+  };
+  notes = configNotes(config, catalog, allowed);
+  if (config.locked) console.error(`[ableton-live-mcp] every /mcp request is refused: ${config.locked} (${configFile})`);
+  let listeningSince = Date.now();
+
   const httpServer = http.createServer(async (req, res) => {
     try {
       // Before routing, so a rebinding page can't even probe /health.
@@ -6120,13 +6329,42 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
       }
       const pathname = (req.url ?? "").split("?")[0];
       if (pathname === "/health") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, ...SERVER_INFO }));
+        // Unauthenticated: only what any local client may know (no paths, no
+        // config details, never the token). 503 while config.json locks /mcp.
+        res.writeHead(config.locked ? 503 : 200, { "content-type": "application/json", "cache-control": "no-store" });
+        res.end(
+          JSON.stringify({
+            ok: !config.locked,
+            ...SERVER_INFO,
+            host_api_version: hostApiVersion,
+            tool_count: allowed.size,
+            read_only: config.readOnly,
+            auth_required: config.tokenDigest !== undefined,
+            uptime_s: Math.floor((Date.now() - listeningSince) / 1000),
+            error: config.locked
+              ? "config.json has an invalid security setting: every /mcp request is refused (the Status dialog in Live says why)"
+              : undefined,
+          }),
+        );
         return;
       }
       if (pathname !== "/mcp") {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("Not found. MCP endpoint: POST /mcp");
+        return;
+      }
+      // Before anything else about /mcp, and before the body is read: an
+      // unauthenticated client learns nothing and gets nothing buffered.
+      if (config.tokenDigest && !bearerMatches(req.headers.authorization, config.tokenDigest)) {
+        const sent = req.headers.authorization !== undefined;
+        console.error(`[ableton-live-mcp] refused request: ${sent ? "invalid" : "missing"} bearer token`);
+        sendJsonRpcError(res, 401, -32000, "Unauthorized: this server needs the header Authorization: Bearer <token>", {
+          "www-authenticate": `Bearer realm="ableton-live-mcp"${sent ? ', error="invalid_token"' : ""}`,
+        });
+        return;
+      }
+      if (config.locked) {
+        sendJsonRpcError(res, 503, -32000, `Service unavailable: ${config.locked}. Fix config.json, then restart Live.`);
         return;
       }
       if (req.method !== "POST") {
@@ -6159,7 +6397,7 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
         sessionIdGenerator: undefined,
         enableJsonResponse: !(progress && wantsProgress(message)),
       });
-      const mcp = buildServer(context, hostApiVersion, port, selections, dialogs);
+      const { server: mcp } = buildServer(context, hostApiVersion, port, selections, dialogs, exposure);
       res.on("close", () => {
         void transport.close();
         void mcp.close();
@@ -6186,9 +6424,16 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
     throw e;
   }
   state = { kind: "listening" };
+  listeningSince = Date.now();
   // Keep a persistent handler so a later server 'error' (e.g. EMFILE on
   // accept) is logged instead of crashing the host.
   httpServer.on("error", (e) => console.error("[ableton-live-mcp] server error:", e));
   console.log(`[ableton-live-mcp] MCP server listening on http://127.0.0.1:${port}/mcp`);
   if (!progress) console.log(`[ableton-live-mcp] progress notifications are off (${configFile})`);
+  if (exposure.allowed)
+    console.log(
+      `[ableton-live-mcp] ${allowed.size} of ${catalog.size} tools exposed ` +
+        `(${config.readOnly ? "read_only" : "disabled_tools"} in ${configFile})`,
+    );
+  if (config.tokenDigest) console.log(`[ableton-live-mcp] requests need the bearer token (auth_token in ${configFile})`);
 }

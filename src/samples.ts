@@ -32,7 +32,7 @@ export function configRoots(configFile: string | undefined): { roots: SampleRoot
   if (!configFile) return { roots: [], problems };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(configFile, "utf8"));
+    parsed = JSON.parse(fs.readFileSync(configFile, "utf8").replace(/^\uFEFF/, "")); // a BOM, as config.ts
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT")
       problems.push(`${configFile} could not be read: ${(e as Error).message}`);

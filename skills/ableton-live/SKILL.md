@@ -7,7 +7,10 @@ description: Control Ableton Live via the ableton-live MCP server — compose MI
 
 The `ableton-live` MCP server (streamable HTTP, `http://127.0.0.1:8722/mcp`) controls a running
 Ableton Live 12. If tools fail to connect: Live is not running, the extension is not installed,
-or the port was changed in the extension's `config.json` (default 8722).
+or the port was changed in the extension's `config.json` (default 8722). HTTP 401 means the
+user set an `auth_token` in config.json and the client must send `Authorization: Bearer
+<token>`; 503 means config.json has an invalid security setting (the error says which, and the
+Status dialog in Live too). Ask the user to fix their client or config; never guess a token.
 
 ## Core workflow
 
@@ -34,6 +37,26 @@ or the port was changed in the extension's `config.json` (default 8722).
    out of range, missing or conflicting fields) come without the stale-id hint: fix the call
    instead.
 5. Writes apply asynchronously: a read right after a write can still return the old value.
+6. The user can switch tools off in config.json: `read_only` leaves only the tools that read the
+   set, `disabled_tools` drops the ones it names. A switched-off tool is not listed at all (a
+   batch step naming it fails with "switched off"); the server instructions say which. Tell the
+   user that the action is switched off on their server instead of looking for a workaround.
+
+## Resources and prompts
+
+- Resources, for clients that attach context: `live://song` (what `song_get` returns without
+  arguments), `live://tracks/{track}` (what `track_get` returns; `{track}` is the track name
+  percent-encoded with encodeURIComponent, so "Drums/Bus" is `live://tracks/Drums%2FBus`; names
+  that several tracks share are not listed — use `track_get` with an index or id) and
+  `live://guide` (this guide). They are snapshots: read again for fresh data, there are no
+  subscriptions.
+- Prompts the user can pick in the client, each expanding into steps with exact tool calls:
+  `song_skeleton {sections?, tempo?, beats_per_bar?, tracks?}` (scenes and locators per section,
+  e.g. sections "Intro:8, Verse:16, Chorus:16"), `chord_progression {progression?, key?,
+  bars_per_chord?, octave?, voicing?, track?}` (Roman numerals in a key — default Live's current
+  scale — or chord names, voiced by the server) and `drum_beat {style?, bars?, track?, tempo?,
+  swing?}` (house, techno, hip_hop, trap, dnb, breakbeat, rock, reggaeton). Follow their steps;
+  values written as "<...>" are yours to fill in.
 
 ## Reading the whole set
 
@@ -223,7 +246,8 @@ or the port was changed in the extension's `config.json` (default 8722).
   sample) in one call; drum chains report `receiving_note` and `receiving_note_name` (`"C1"`).
   `drum_chain_set` maps a pad to a MIDI note (`receiving_note: 38` or `"D1"`), and pads in
   device paths take names too (`["Drum Rack", {pad:"C1"}, "Simpler"]`);
-  `simpler_replace_sample` swaps samples.
+  `simpler_replace_sample` swaps samples. `rack_insert_chain {rack_device_id, index}` adds an empty
+  chain to a rack (fill it with `device_insert {target_id:<chain id>, device_name}`).
 - **A kit from sample files is one call**: `drum_kit_build {track_name:"Drums", pads:[{note:"C1",
   sample_path:"/abs/kick.wav"}, {note:"D1", sample_path:"/abs/snare.wav", volume:0.7},
   {note:"F#1", sample_path:"/abs/hat.wav", panning:0.2}]}`. It uses the track's Drum Rack (or
@@ -301,8 +325,10 @@ or the port was changed in the extension's `config.json` (default 8722).
 
 ## Song structure
 
+- Tempo: `song_set {tempo}` (BPM; the only song-level property Live lets extensions write).
 - Scenes: `scene_create {items:[{name:"Intro"}, {name:"Verse"}, {name:"Chorus"}]}` appends
   them in order (an entry's `index` refers to the list after the previous entries).
+  `scene_duplicate {scene_name}` duplicates a scene; the copy lands right after the original.
 - Locators: `cue_point_create {items:[{time:0, name:"Intro"}, {time:32, name:"Verse"}]}`.
 - Moving a locator: `cue_point_set {cue_point_id, time}`. Live cannot change a cue point's
   time, so it is re-created at the new time with its name and the old one is deleted: use the

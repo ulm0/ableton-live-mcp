@@ -1,6 +1,6 @@
 // Smoke test against a REAL running Ableton Live with the extension loaded.
 // Creates its own tracks/scenes, verifies behavior, and cleans up after itself.
-// Usage: node test/live-smoke.mjs
+// Usage: node test/live-smoke.mjs (MCP_TOKEN=<auth_token> when config.json sets one)
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -10,7 +10,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 const URL_ = process.env.MCP_URL ?? "http://127.0.0.1:8722/mcp";
 const client = new Client({ name: "live-smoke", version: "1.0.0" });
-await client.connect(new StreamableHTTPClientTransport(new URL(URL_)));
+const headers = process.env.MCP_TOKEN ? { Authorization: `Bearer ${process.env.MCP_TOKEN}` } : undefined;
+await client.connect(new StreamableHTTPClientTransport(new URL(URL_), { requestInit: { headers } }));
 
 const call = async (name, args = {}) => {
   const res = await client.callTool({ name, arguments: args });
@@ -413,6 +414,22 @@ const chained = await call("batch", { steps: [
 ] });
 assert.deepEqual([chained.ok, chained.completed], [true, 3], JSON.stringify(chained));
 step("batch: create, clip by $ref, delete");
+
+// --- resources and prompts ----------------------------------------------------
+const songResource = JSON.parse((await client.readResource({ uri: "live://song" })).contents[0].text);
+assert.equal(songResource.tracks.length, song.tracks.length);
+const firstName = song.tracks[0].name;
+const trackResource = await client.readResource({ uri: `live://tracks/${encodeURIComponent(firstName)}` }).catch((e) => e);
+// a name several tracks share is ambiguous: an error that lists them
+assert.ok(trackResource.contents || /Ambiguous/.test(trackResource.message), String(trackResource.message));
+assert.match((await client.readResource({ uri: "live://guide" })).contents[0].text, /^# Ableton Live via MCP/);
+const chordPrompt = (await client.getPrompt({ name: "chord_progression", arguments: {} })).messages[0].content.text;
+assert.match(chordPrompt, /Key: .*Live's current scale/, "the prompt reads Live's scale");
+// the prompt's default instrument, which the API only takes by name
+const driftTrack = await call("track_create", { type: "midi", name: "MCP Smoke Drift", devices: ["Drift"] });
+assert.equal(driftTrack.errors, undefined, `Drift could not be inserted: ${JSON.stringify(driftTrack.errors)}`);
+await call("track_delete", { track_id: driftTrack.id });
+step(`resources live://song, live://tracks/..., live://guide; chord_progression in ${song.scale.name}; Drift inserts`);
 
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;

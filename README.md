@@ -28,7 +28,8 @@ npm run package        # builds and produces Ableton-Live-MCP-<version>.ablx
 ```
 
 Then drag the `.ablx` file onto **Settings → Extensions** in Live. The MCP endpoint starts with
-Live at `http://127.0.0.1:8722/mcp` (`GET /health` for a quick check).
+Live at `http://127.0.0.1:8722/mcp` (`GET /health` for a quick check: version, host API version,
+tool count, uptime).
 
 ### Development mode
 
@@ -62,14 +63,59 @@ Claude Desktop (or any stdio-only client) via `mcp-remote`:
 }
 ```
 
+With an `auth_token` in `config.json` (see [Security](#security)), the client sends it as a
+bearer token:
+
+```bash
+claude mcp add --transport http ableton-live http://127.0.0.1:8722/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+```json
+{
+  "mcpServers": {
+    "ableton-live": {
+      "command": "npx",
+      "args": ["mcp-remote", "http://127.0.0.1:8722/mcp", "--header", "Authorization:${AUTH_HEADER}"],
+      "env": { "AUTH_HEADER": "Bearer <token>" }
+    }
+  }
+}
+```
+
 ### Configuration
 
-The port is stored in `config.json` inside the extension's storage directory (created on first
-run; the path is reported by `song_get` under `environment.storage_directory`). Default:
+Settings live in `config.json` inside the extension's storage directory (created on first run
+with the port; the path is reported by `song_get` under `environment.storage_directory` and by
+the Status dialog in Live). It is read once, when the extension starts (`sample_roots` excepted):
+restart Live after a change. Default:
 
 ```json
 { "port": 8722 }
 ```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `port` | `8722` | TCP port on 127.0.0.1 |
+| `progress_notifications` | `true` | `false` answers every request as plain JSON (no progress for long calls) |
+| `sample_roots` | `[]` | Folders `sample_search` searches (read on every search) |
+| `read_only` | `false` | `true` registers only the tools that read the Live Set (`readOnlyHint`) |
+| `disabled_tools` | `[]` | Tool names not to register, e.g. `["execute_command", "show_dialog"]` |
+| `auth_token` | `null` | Require `Authorization: Bearer <token>` on `/mcp` (16+ visible ASCII characters) |
+
+Every value is validated at startup. Problems are logged to `ExtensionHost.txt` (prefixed
+`[ableton-live-mcp] config:`) and listed in the Status dialog: a `port` or
+`progress_notifications` of the wrong type falls back to its default, unknown keys are ignored.
+The security settings never fall back to something less safe: an invalid `read_only`,
+`disabled_tools` or `auth_token`, a `disabled_tools` entry that names no tool (probably a typo),
+or a file that cannot be parsed but mentions one of them, makes `/mcp` refuse every request
+with `503` and the reason until the file is fixed. A switched-off tool is not listed at all;
+`batch` steps naming it fail with "switched off", the server instructions tell the agent which
+tools are off, and a prompt is only offered when every tool it uses is on.
+
+For example `{ "port": 8722, "read_only": true }`,
+`{ "port": 8722, "disabled_tools": ["execute_command", "track_delete", "scene_delete"] }` or
+`{ "port": 8722, "auth_token": "<a long random string>" }`.
 
 `sample_roots` lists the folders `sample_search` may search for audio files (absolute paths, or
 `~/...`), in addition to Live's default User Library and Factory Packs folders
@@ -210,6 +256,20 @@ deleting a file deletes the preset.
   multi-track renders and batches start no further render or step (a dialog stays open in Live:
   `dialog_result` gets it). A `notifications/cancelled` cannot reach a running call: the server is
   stateless, so it arrives in a request of its own.
+- **Resources** (read-only snapshots for clients that attach context): `live://song` is
+  `song_get` without arguments, `live://tracks/{track}` is `track_get` for the track named
+  `{track}` — percent-encoded with `encodeURIComponent`, so a `/` in a name cannot break the
+  match (`live://tracks/Drums%2FBus`); `resources/list` has one entry per uniquely named track
+  and completions for the names — and `live://guide` is the full [skill](#skills). There are no
+  subscriptions: the server is stateless and Live reports no changes, so read again for fresh
+  data. They follow their tools: with `song_get` or `track_get` switched off, theirs are gone.
+- **Prompts** the user picks in the client, each expanding into step-by-step instructions with
+  exact tool calls: `song_skeleton` (scenes and locators per section, positions computed from
+  the bar counts, optional tempo and tracks), `chord_progression` (Roman numerals in a key —
+  default Live's current scale — or chord names, voiced and timed by the server into one
+  `clip_create` call) and `drum_beat` (a style's step patterns as one `clip_create`, with a kit
+  from `sample_search` + `drum_kit_build` when the pads are empty). Arguments are optional;
+  `style`, `voicing` and track names have completions.
 - On `initialize` the server sends short **instructions** (a digest of the
   [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
   and what the API cannot do. Clients that support server instructions (Claude Code) add them
@@ -232,15 +292,33 @@ deleting a file deletes the preset.
 
 ## Security
 
-The endpoint binds to `127.0.0.1` only and has no authentication. To stop web pages from
-reaching it through DNS rebinding, every request is checked before routing: the `Host` header
-must be `127.0.0.1`, `localhost` or `[::1]` (any port), and an `Origin` header, if sent, must
-be an `http(s)` origin on one of those hosts (`Origin: null` is refused). Anything else gets
-`403` with a JSON-RPC error. MCP clients such as Claude Code and `mcp-remote` send a loopback
-`Host` and no `Origin`, so they are unaffected.
+The endpoint binds to `127.0.0.1` only, so other computers cannot reach it; every program on
+this computer can. Requests go through these checks, in order:
 
-The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`,
-`Allow: POST`), plus `GET /health`. Request bodies over 4 MiB are refused with `413`.
+1. **Host and Origin** (DNS rebinding): the `Host` header must be `127.0.0.1`, `localhost` or
+   `[::1]` (any port), and an `Origin` header, if sent, must be an `http(s)` origin on one of
+   those hosts (`Origin: null` is refused). Anything else gets `403` with a JSON-RPC error, on
+   every path. MCP clients such as Claude Code and `mcp-remote` send a loopback `Host` and no
+   `Origin`, so they are unaffected.
+2. `GET /health` answers without a token: `ok`, `name`, `version`, `host_api_version`,
+   `tool_count`, `read_only`, `auth_required` and `uptime_s` — no paths, no settings beyond
+   those, never the token (`503` and `ok: false` while config.json locks `/mcp`).
+3. **Bearer token** (optional, `auth_token` in config.json): `/mcp` then answers `401` with
+   `WWW-Authenticate: Bearer` unless the request carries `Authorization: Bearer <token>` — before
+   anything else about the request is looked at, its method and body included. The server keeps
+   only the token's SHA-256 digest and compares digests with `crypto.timingSafeEqual`. The token
+   itself is stored **in plaintext** in `config.json`: anyone who can read that file (your user
+   account) can use it, so treat the file like a password, and pick a long random token (at
+   least 16 visible ASCII characters). It keeps out other users and programs that can reach the
+   port but not your files.
+4. A `config.json` with an invalid security setting answers `503` with the reason (see
+   [Configuration](#configuration)).
+5. `/mcp` only serves `POST` (`GET`/`DELETE` answer `405`, `Allow: POST`; the server is
+   stateless); request bodies over 4 MiB are refused with `413`.
+
+To limit what a connected agent can do at all, set `read_only` or `disabled_tools` (see
+[Configuration](#configuration)): switched-off tools are not registered, so neither a direct
+call nor `batch` can reach them.
 
 ## Tools
 
@@ -338,6 +416,20 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `batch` | Run up to 50 tool calls in order (`steps: [{tool, args, as?}]`); `{"$ref": "<step>.<path>"}` passes an earlier step's result on. Names, `$ref`s and ref-free arguments are checked first; each step is its own undo step; `on_error` stop (default) or continue. Not for `show_dialog`, `execute_command` or the batch tools. |
 | `batch_read` | The same for read-only tools only (any other step is refused); continues after a failed step by default. |
 
+### Resources
+| URI | Content |
+|-----|---------|
+| `live://song` | JSON: `song_get` without arguments (tempo, scale, grid, tracks, return/main tracks, scenes, cue points, environment). |
+| `live://tracks/{track}` | JSON: `track_get` for the track named `{track}` (percent-encoded; exact name first, then case-insensitive; regular, return and main tracks). Listed per uniquely named track, with name completions. |
+| `live://guide` | Markdown: the full agent guide (`skills/ableton-live/SKILL.md`). |
+
+### Prompts
+| Prompt | Arguments (all optional) | Produces |
+|--------|--------------------------|----------|
+| `song_skeleton` | `sections` (`"Intro:8, Verse:16, Chorus"`), `tempo`, `beats_per_bar`, `tracks` (`"Drums, Vox:audio"`) | `song_get` check, `song_set`, one `scene_create` and one `cue_point_create` with computed positions, `track_create` per track, then `session_grid` / `arrangement_get` to verify. |
+| `chord_progression` | `progression` (`"ii7 V7 Imaj7"`, `"Am F C/E"`), `key` (default Live's scale), `bars_per_chord`, `beats_per_bar`, `octave`, `voicing` (`close`/`root`), `track` | The chords spelled and voiced, a track with an instrument if needed, and one `clip_create` with every note. |
+| `drum_beat` | `style` (house, techno, hip_hop, trap, dnb, breakbeat, rock, reggaeton), `bars`, `track`, `tempo`, `swing` | The pattern per pad, `sample_search` + `drum_kit_build` for empty pads, one `clip_create` with step `patterns` and `repeat`, swing for swung styles. |
+
 ## Skills
 
 `skills/ableton-live/SKILL.md` is an installable [agent skill](https://docs.claude.com/en/docs/claude-code/skills)
@@ -394,9 +486,15 @@ Typical things you can ask a connected assistant to do:
 
 ```bash
 npm test                  # E2E against a mock Extension Host: MCP client ↔ HTTP ↔ all tools,
+                          # resources and prompts, extra instances for the config.json switches,
                           # then the bundle loaded in a bare VM context (test/vm-context.mjs)
 node test/live-smoke.mjs  # against a real running Live with the extension loaded
+                          # (MCP_TOKEN=<token> when config.json sets an auth_token)
 ```
+
+The prompts' tool calls are checked by running them: every `` `tool {json}` `` in a prompt's text
+without a `"<...>"` placeholder is called against the mock, and every tool in `tools/list` must
+appear in README.md's tool tables and in the skill.
 
 `test/vm-context.mjs` evaluates `dist/extension.cjs` the way the Extension Host does (no
 `global`, no web globals), so a broken `build.ts` banner fails CI instead of failing in Live. It
@@ -441,13 +539,20 @@ Also: if the dev Extension Host crashes, Live may refuse the next control-channe
   startup, so restart Live afterwards.
 - **403 Forbidden**: the request's `Host` or `Origin` is not a loopback address (see
   [Security](#security)). Connect to `http://127.0.0.1:<port>/mcp` or `http://localhost:<port>/mcp`.
+- **401 Unauthorized**: `config.json` has an `auth_token` and the client did not send it as
+  `Authorization: Bearer <token>` (see [Connect a client](#connect-a-client)).
+- **503 Service unavailable**: a security setting in `config.json` (`read_only`,
+  `disabled_tools`, `auth_token`) is invalid, or the file cannot be parsed and mentions one; the
+  error and the Status dialog say which. Fix it and restart Live.
+- **A tool is missing**: `read_only` or `disabled_tools` in `config.json` switched it off.
 - **"A dialog is already open in Live"**: the server shows one dialog at a time. `dialog_result`
   returns the open one's answer once the user closes it; if the user did close it and Live
   never reported it, `show_dialog {force: true}` opens the next one anyway.
 - **Failed tool calls** are logged to `ExtensionHost.txt` with the tool name, duration and
   error message (never the arguments).
 - **Changed config.json but nothing happened**: config is only read when the extension
-  starts. Restart Live (or the dev Extension Host).
+  starts (`sample_roots` excepted). Restart Live (or the dev Extension Host). Invalid values are
+  logged with the prefix `[ableton-live-mcp] config:` and listed in the Status dialog.
 
 ## License
 

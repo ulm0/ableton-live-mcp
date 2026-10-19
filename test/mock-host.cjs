@@ -125,6 +125,8 @@ const items = (...names) => names.map((name) => ({ name, shortName: name.slice(0
 const deviceOn = () => makeParam("Device On", { quantized: true, value: 1, def: 1, max: 1, valueItems: items("Off", "On") });
 const BUILTIN_DEVICES = {
   "Operator": () => [deviceOn(), makeParam("Osc-A Level")],
+  // a built-in instrument in every Live 12 edition (the chord_progression prompt's default)
+  "Drift": () => [deviceOn(), makeParam("Volume", { value: 0.7, def: 0.7 })],
   "Reverb": () => [deviceOn(), makeParam("Dry/Wet")],
   "Auto Filter": () => [
     deviceOn(), makeParam("Frequency", { min: 20, max: 135, value: 135, def: 135 }), makeParam("Resonance"),

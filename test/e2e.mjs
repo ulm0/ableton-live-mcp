@@ -105,6 +105,18 @@ for (const [expected, names] of annotationGroups)
   for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
 assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 60, "snapshot lists every tool once");
 
+// docs: every registered tool is in README.md's tool tables and in the skill
+const readmeText = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+const skillText = fs.readFileSync(new URL("../skills/ableton-live/SKILL.md", import.meta.url), "utf8");
+const toolRows = readmeText.split("\n").filter((l) => l.startsWith("| `"));
+for (const { name } of tools) {
+  assert.ok(toolRows.some((r) => r.includes(`\`${name}\``)), `README.md's tool tables lack ${name}`);
+  assert.match(skillText, new RegExp(`\\b${name}\\b`), `SKILL.md never mentions ${name}`);
+}
+for (const name of ["song_skeleton", "chord_progression", "drum_beat", "live://song", "live://tracks/{track}", "live://guide",
+  "read_only", "disabled_tools", "auth_token"])
+  assert.ok(readmeText.includes(name) && skillText.includes(name), `README.md and SKILL.md document ${name}`);
+
 // server instructions: a short digest, sent on initialize
 const instructions = client.getInstructions();
 assert.match(instructions, /song_get/);
@@ -2338,6 +2350,166 @@ assert.equal(batchProgress[2].message, "steps[1] (selection_get) done");
 await call("track_delete", { track_id: keysId });
 assert.deepEqual((await tracksNow()).map((t) => t.name), tracksBeforeBatch);
 
+// --- resources and prompts ---------------------------------------------------
+// capabilities: resources (no subscriptions: Live reports no changes), prompts, completions
+const caps = client.getServerCapabilities();
+assert.ok(caps.resources && caps.prompts && caps.completions, JSON.stringify(caps));
+assert.equal(caps.resources.subscribe, undefined, "no resource subscriptions");
+// an MCP error with its JSON-RPC code (the message carries the "MCP error" prefix only once)
+const rpcFailure = async (promise, code, pattern) => {
+  const e = await promise.then(() => assert.fail("expected an MCP error"), (err) => err);
+  assert.equal(e.code, code, e.message);
+  assert.match(e.message, pattern);
+  assert.doesNotMatch(e.message, /MCP error -?\d+: MCP error/);
+  return e;
+};
+const tracksBeforeResources = await tracksNow();
+const slashTrack = await call("track_create", { type: "midi", name: "Drums/Bus" });
+const twins = [await call("track_create", { type: "midi", name: "Twin" }), await call("track_create", { type: "audio", name: "Twin" })];
+const dotTrack = await call("track_create", { type: "midi", name: "." });
+// one URI per track, the name percent-encoded; ambiguous names and dot segments left out
+const { resources } = await client.listResources();
+const uris = resources.map((r) => r.uri);
+assert.ok(uris.includes("live://song") && uris.includes("live://guide"), uris.join(" "));
+assert.ok(uris.includes("live://tracks/Drums%2FBus"), "a / in a name is encoded");
+const firstTrack = tracksBeforeResources[0]; // "Bass 2" by now: a space is %20
+assert.ok([`live://tracks/${encodeURIComponent(firstTrack.name)}`, "live://tracks/A-Reverb", "live://tracks/Main"].every((u) => uris.includes(u)));
+assert.ok(!resources.some((r) => r.name === "Twin" || r.name === dotTrack.name), "duplicate names and dot segments are not listed");
+const firstEntry = resources.find((r) => r.uri === `live://tracks/${encodeURIComponent(firstTrack.name)}`);
+assert.deepEqual([firstEntry.name, firstEntry.mimeType, firstEntry.description], [firstTrack.name, "application/json", "midi track, track_index 0"]);
+const { resourceTemplates } = await client.listResourceTemplates();
+assert.deepEqual(resourceTemplates.map((t) => t.uriTemplate), ["live://tracks/{track}"]);
+// live://song is song_get without arguments, live://tracks/{track} track_get by name
+const songResource = await client.readResource({ uri: "live://song" });
+assert.equal(songResource.contents[0].mimeType, "application/json");
+assert.deepEqual(JSON.parse(songResource.contents[0].text), await call("song_get"));
+const slashUri = `live://tracks/${encodeURIComponent("Drums/Bus")}`;
+const trackResource = await client.readResource({ uri: slashUri });
+assert.equal(trackResource.contents[0].uri, slashUri);
+assert.deepEqual(JSON.parse(trackResource.contents[0].text), await call("track_get", { track_id: slashTrack.id }));
+assert.equal(JSON.parse((await client.readResource({ uri: "live://tracks/drums%2Fbus" })).contents[0].text).id, slashTrack.id,
+  "names match like track_name: case-insensitively after exactly");
+assert.equal(JSON.parse((await client.readResource({ uri: "live://tracks/Main" })).contents[0].text).type, "other");
+await rpcFailure(client.readResource({ uri: "live://tracks/Twin" }), -32602, new RegExp(`Ambiguous track name "Twin".*id ${twins[0].id}.*id ${twins[1].id}`));
+await rpcFailure(client.readResource({ uri: "live://tracks/Nope" }), -32602, /No track named "Nope"/);
+await rpcFailure(client.readResource({ uri: "live://tracks/%E0%A4%A" }), -32602, /not a percent-encoded track name/);
+// (the SDK's own not-found error, whose message does repeat the prefix)
+assert.equal((await client.readResource({ uri: "live://nothing" }).catch((e) => e)).code, -32602);
+assert.ok(errorLog.some((l) => /resource track failed after \d+ ms: No track named "Nope"/.test(l)), "failed reads are logged");
+assert.ok(!errorLog.some((l) => l.includes("live://tracks/Nope")), "the log names the resource, never the URI");
+// live://guide: the skill without its front matter
+const guide = (await client.readResource({ uri: "live://guide" })).contents[0];
+assert.equal(guide.mimeType, "text/markdown");
+assert.ok(guide.text.startsWith("# Ableton Live via MCP"), guide.text.slice(0, 40));
+assert.equal(guide.text, fs.readFileSync(new URL("../skills/ableton-live/SKILL.md", import.meta.url), "utf8").replace(/^---\n[\s\S]*?\n---\n+/, ""));
+// completions: track names, percent-encoded for the template
+const completeTrack = async (value) =>
+  (await client.complete({ ref: { type: "ref/resource", uri: "live://tracks/{track}" }, argument: { name: "track", value } })).completion.values;
+assert.deepEqual(await completeTrack("drums%2F"), ["Drums%2FBus"]);
+assert.deepEqual(await completeTrack("dr"), ["Drums", "Drums%2FBus"]);
+
+// prompts: all arguments optional strings; each renders steps with real tool calls
+const { prompts } = await client.listPrompts();
+assert.deepEqual(prompts.map((p) => p.name), ["song_skeleton", "chord_progression", "drum_beat"]);
+for (const p of prompts) {
+  assert.ok(p.title && p.description && p.arguments.length, p.name);
+  assert.ok(p.arguments.every((a) => a.required === false && a.description), `${p.name}: optional, described arguments`);
+}
+// The `tool {json}` calls of a prompt's text: every one names an exposed tool with JSON
+// args; those without a "<...>" placeholder are complete calls.
+const promptCalls = (text) =>
+  [...text.matchAll(/`([a-z_]+) (\{[^`]*\})`/g)].map(([, tool, args]) => {
+    assert.ok(toolByName[tool], `prompt calls an unknown tool: ${tool}`);
+    return { tool, args: JSON.parse(args), placeholder: args.includes('"<') };
+  });
+const getPrompt = async (name, args) => {
+  const r = await client.getPrompt({ name, arguments: args });
+  assert.equal(r.messages.length, 1);
+  assert.equal(r.messages[0].role, "user");
+  return r.messages[0].content.text;
+};
+const runPromptCalls = async (text) => {
+  const results = [];
+  for (const c of promptCalls(text)) if (!c.placeholder) results.push({ ...c, result: await call(c.tool, c.args) });
+  return results;
+};
+// every prompt renders with no arguments at all
+for (const p of prompts) assert.ok(promptCalls(await getPrompt(p.name, {})).length >= 4, p.name);
+
+// song_skeleton: positions from the bar counts (8 bars without a count), run as written
+const scenesBefore = await scenesNow();
+const cueIdsBefore = (await call("song_get", { include: ["cue_points"] })).cue_points.map((c) => c.id);
+const skeleton = await getPrompt("song_skeleton", { sections: "Intro:8, Verse:16, Chorus", tempo: "128", tracks: "Keys2, Vox2:audio" });
+assert.match(skeleton, /3\. Chorus: 8 bars from bar 25, beats 96-128/);
+assert.match(skeleton, /Total: 32 bars = 128 beats\./);
+const skeletonRun = await runPromptCalls(skeleton);
+assert.deepEqual(skeletonRun.map((c) => c.tool),
+  ["song_get", "song_set", "scene_create", "cue_point_create", "track_create", "track_create", "session_grid", "arrangement_get"]);
+assert.equal((await call("song_get", { include: [] })).tempo, 128);
+assert.deepEqual((await scenesNow()).map((s) => s.name), [...scenesBefore.map((s) => s.name), "Intro", "Verse", "Chorus"]);
+const skeletonCues = (await call("song_get", { include: ["cue_points"] })).cue_points;
+for (const [time, name] of [[32, "Verse"], [96, "Chorus"]]) assert.ok(skeletonCues.some((c) => c.time === time && c.name === name), `cue ${name} at ${time}`);
+assert.deepEqual(skeletonRun.filter((c) => c.tool === "track_create").map((c) => [c.result.name, c.result.type]), [["Keys2", "midi"], ["Vox2", "audio"]]);
+await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { sections: "Intro:0" } }), -32602, /song_skeleton: sections: the bars of "Intro"/);
+await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { tracks: "Pad:video" } }), -32602, /"midi" or "audio"/);
+
+// chord_progression: Roman numerals in a key, spelled in it, close voicing; the clip as written
+const chordsText = await getPrompt("chord_progression", { progression: "ii7 V7 Imaj7", key: "Bb major", track: "Chords1" });
+assert.match(chordsText, /Key: Bb major \(as given\)\./);
+assert.match(chordsText, /1\. ii7 = Cm7: C3 Eb3 G3 Bb3 \(beat 0\)/);
+assert.match(chordsText, /2\. V7 = F7: C3 Eb3 F3 A3 \(beat 4\)/);
+assert.match(chordsText, /3\. Imaj7 = Bbmaj7: Bb2 D3 F3 A3 \(beat 8\)/);
+const chordsRun = await runPromptCalls(chordsText);
+assert.deepEqual(chordsRun.map((c) => c.tool), ["song_get", "track_create", "device_insert", "session_grid", "clip_create"]);
+assert.equal(chordsRun[1].result.devices[0].name, "Drift");
+const chordClip = chordsRun.at(-1).result;
+const chordNotes = (await call("midi_clip_get_notes", { clip_id: chordClip.id })).notes;
+assert.deepEqual(chordNotes.map((n) => [n.start_time, n.pitch]).sort((a, b) => a[0] - b[0] || a[1] - b[1]),
+  [[0, 60], [0, 63], [0, 67], [0, 70], [4, 60], [4, 63], [4, 65], [4, 69], [8, 58], [8, 62], [8, 65], [8, 69]]);
+assert.equal(chordClip.name, "ii7-V7-Imaj7");
+// the default key is Live's current scale (the mock: C Major); chord names need no key; root voicing; slash bass
+assert.match(await getPrompt("chord_progression", {}), /Key: C Major \(Live's current scale\)\.\n.*\n1\. I = C: C3 E3 G3[^]*2\. V = G: B2 D3 G3/);
+const named = await getPrompt("chord_progression", { progression: "Am, F | C/E", voicing: "root", octave: "2" });
+assert.match(named, /Key: none needed/);
+assert.match(named, /1\. Am: A2 C3 E3/);
+assert.match(named, /3\. C\/E: E1 C2 E2 G2/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { progression: "I H7" } }), -32602, /"H7" is not a chord/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { key: "X major" } }), -32602, /is not a key/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { octave: "7", progression: "B9", voicing: "root" } }), -32602, /outside the MIDI range/);
+
+// drum_beat: a style's patterns in one clip_create; the swing step only for a swung style
+const beatText = await getPrompt("drum_beat", { style: "Hip-Hop", bars: "1", track: "Beat" });
+assert.match(beatText, /Program a hip hop drum beat/);
+assert.match(beatText, /- Kick \(C1\): x\.\.\.\|\.\.\.x\|\.\.x\.\|\.\.\.\./);
+assert.ok(promptCalls(beatText).some((c) => c.tool === "drum_kit_build" && c.placeholder), "the kit step has placeholders");
+assert.ok(promptCalls(beatText).some((c) => c.tool === "midi_clip_edit_notes" && c.args.swing.amount === 0.55));
+const beatRun = await runPromptCalls(beatText);
+assert.deepEqual(beatRun.map((c) => c.tool), ["song_get", "track_create", "sample_search", "sample_search", "sample_search", "song_set", "clip_create"]);
+const promptBeatNotes = (await call("midi_clip_get_notes", { clip_id: beatRun.at(-1).result.id })).notes;
+assert.deepEqual([36, 38, 42].map((p) => promptBeatNotes.filter((n) => n.pitch === p).length), [3, 2, 8]);
+assert.ok(!promptCalls(await getPrompt("drum_beat", { style: "house" })).some((c) => c.tool === "midi_clip_edit_notes"));
+await rpcFailure(client.getPrompt({ name: "drum_beat", arguments: { style: "polka" } }), -32602, /style: one of house, techno/);
+await rpcFailure(client.getPrompt({ name: "drum_beat", arguments: { bars: "1.5" } }), -32602, /bars: expected a whole number/);
+// names of Object.prototype members are no styles, chords or modes
+await rpcFailure(client.getPrompt({ name: "drum_beat", arguments: { style: "constructor" } }), -32602, /style: one of/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { progression: "Cconstructor" } }), -32602, /is not a chord/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { key: "C toString" } }), -32602, /is not a key/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { progression: "vtoString" } }), -32602, /is not a chord/);
+// argument completions
+const completePrompt = async (name, argName, value) =>
+  (await client.complete({ ref: { type: "ref/prompt", name }, argument: { name: argName, value } })).completion.values;
+assert.deepEqual(await completePrompt("drum_beat", "style", "t"), ["techno", "trap"]);
+assert.deepEqual(await completePrompt("chord_progression", "voicing", "R"), ["root"]);
+assert.ok((await completePrompt("chord_progression", "track", "bea")).includes("Beat"));
+
+// clean up: the tracks, scenes and cue points made here
+for (const t of await tracksNow())
+  if (!tracksBeforeResources.some((b) => b.id === t.id)) await call("track_delete", { track_id: t.id });
+for (const s of (await scenesNow()).slice(scenesBefore.length)) await call("scene_delete", { scene_id: s.id });
+for (const c of (await call("song_get", { include: ["cue_points"] })).cue_points)
+  if (!cueIdsBefore.includes(c.id)) await call("cue_point_delete", { cue_point_id: c.id });
+assert.deepEqual((await tracksNow()).map((t) => t.id), tracksBeforeResources.map((t) => t.id));
+
 // error path: bogus id
 const bad = await client.callTool({ name: "track_get", arguments: { track_id: "999999" } });
 assert.equal(bad.isError, true);
@@ -2432,6 +2604,21 @@ for (const headers of [
 // exact routing; the query string is ignored
 assert.equal((await raw("GET", "/health?x=1")).status, 200);
 assert.equal(JSON.parse((await raw("GET", "/health")).body).ok, true);
+// /health: version, host API version, tool count, uptime; nothing a local client may not know
+const healthRes = await raw("GET", "/health");
+const health = JSON.parse(healthRes.body);
+assert.deepEqual(Object.keys(health).sort(),
+  ["auth_required", "host_api_version", "name", "ok", "read_only", "tool_count", "uptime_s", "version"]);
+assert.equal(healthRes.headers["cache-control"], "no-store");
+const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const pkgLock = JSON.parse(fs.readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"));
+const manifest = JSON.parse(fs.readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
+assert.deepEqual([health.version, manifest.version, pkgLock.version, pkgLock.packages[""].version], Array(4).fill(pkg.version),
+  "package.json, package-lock.json, manifest.json and the server agree on the version");
+assert.deepEqual([health.name, health.host_api_version, health.tool_count, health.read_only, health.auth_required],
+  ["ableton-live", "1.0.0", tools.length, false, false]);
+assert.ok(Number.isInteger(health.uptime_s) && health.uptime_s >= 0);
+assert.equal(client.getServerVersion().version, pkg.version);
 assert.equal((await rpc({}, "/mcp?x=1")).status, 200);
 assert.equal((await rpc({}, "/mcpfoo")).status, 404);
 assert.equal((await raw("GET", "/healthz")).status, 404);
@@ -2509,6 +2696,164 @@ const noSse = await fetch(`http://127.0.0.1:${PORT3}/mcp`, {
 assert.match(noSse.headers.get("content-type"), /^application\/json/);
 assert.equal(JSON.parse((await noSse.json()).result.content[0].text).timed_out, true);
 fs.rmSync(storageDir3, { recursive: true, force: true });
+
+// --- config.json switches: read_only, disabled_tools, auth_token; validation --
+// Another extension instance with its own config.json (the same mock Live Set).
+const startInstance = async (port, config) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-test-"));
+  fs.writeFileSync(path.join(dir, "config.json"), config);
+  const sink = { dialogs: [], commands: {}, menus: [] };
+  activate(makeActivation(dir, dir, sink));
+  for (let i = 0; port; i++) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      break;
+    } catch {
+      if (i > 50) throw new Error(`instance on ${port} did not start`);
+      await sleep(50);
+    }
+  }
+  const status = () => {
+    sink.dialogs.length = 0;
+    sink.commands["ableton-live-mcp.status"]();
+    return decodeURIComponent(sink.dialogs[0].url);
+  };
+  return { dir, status };
+};
+const rawAt = (port, method, urlPath, headers = {}, body) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port, method, path: urlPath, agent: false, headers: { connection: "close", ...headers } },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+      },
+    );
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+const listBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+const rpcHeaders = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+const clientAt = async (port, headers) => {
+  const c = new Client({ name: "e2e-config", version: "1.0.0" });
+  await c.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
+  return c;
+};
+const logged2 = [];
+console.log = (...a) => { logged2.push(a.map(String).join(" ")); consoleLog(...a); };
+
+// read_only: only the readOnlyHint tools are registered; disabled_tools drops more.
+// The file starts with a BOM, as some editors write it.
+const PORT4 = PORT + 2;
+const ro = await startInstance(PORT4, `﻿${JSON.stringify({ port: PORT4, read_only: true, disabled_tools: ["sample_search"] })}`);
+const roClient = await clientAt(PORT4);
+const roTools = (await roClient.listTools()).tools;
+const readTools = annotationGroups[0][1].filter((n) => n !== "sample_search");
+assert.deepEqual(roTools.map((t) => t.name).sort(), [...readTools].sort());
+assert.ok(roTools.every((t) => t.annotations.readOnlyHint === true));
+assert.match(roClient.getInstructions(), /read-only \(read_only in config\.json\).*and so are sample_search/);
+const roWrite = await roClient.callTool({ name: "song_set", arguments: { tempo: 99 } });
+assert.equal(roWrite.isError, true, "a switched-off tool cannot be called");
+assert.match(roWrite.content[0].text, /Tool song_set not found/);
+assert.notEqual((await call("song_get", { include: [] })).tempo, 99);
+const roBatch = await roClient.callTool({ name: "batch_read", arguments: { steps: [{ tool: "sample_search" }] } });
+assert.match(roBatch.content[0].text, /steps\[0\]: sample_search is switched off on this server/);
+assert.equal(roClient.getServerCapabilities().prompts, undefined, "every prompt needs a write tool");
+assert.ok((await roClient.listResources()).resources.some((r) => r.uri === "live://song"), "resources only read");
+const roHealth = JSON.parse((await rawAt(PORT4, "GET", "/health")).body);
+assert.deepEqual([roHealth.tool_count, roHealth.read_only], [readTools.length, true]);
+assert.ok(logged2.some((l) => l.includes(`${readTools.length} of ${tools.length} tools exposed (read_only in`)), "the switch is logged");
+const roStatus = ro.status();
+assert.ok(roStatus.includes(`Read-only: ${readTools.length} of ${tools.length} tools are on`), roStatus);
+assert.ok(roStatus.includes("Switched off (disabled_tools): sample_search."));
+await roClient.close();
+
+// disabled_tools and a bearer token: no token, a wrong one or another scheme get 401
+// before the method or the body is looked at; /health stays open and tells nothing secret
+const PORT5 = PORT + 3;
+const TOKEN = "e2e-token-0123456789abcdef";
+const authed = await startInstance(PORT5, JSON.stringify({ port: PORT5, disabled_tools: ["execute_command", "track_get"], auth_token: TOKEN }));
+const unauthorized = (r, invalid, what) => {
+  assert.equal(r.status, 401, `${what}: expected 401, got ${r.status}`);
+  assert.equal(r.headers["www-authenticate"], `Bearer realm="ableton-live-mcp"${invalid ? ', error="invalid_token"' : ""}`);
+  const b = JSON.parse(r.body);
+  assert.deepEqual([b.error.code, b.id], [-32000, null]);
+  assert.ok(!r.body.includes(TOKEN));
+};
+unauthorized(await rawAt(PORT5, "POST", "/mcp", rpcHeaders, listBody), false, "no token");
+unauthorized(await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, authorization: `Bearer ${TOKEN}x` }, listBody), true, "wrong token");
+unauthorized(await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, authorization: `Bearer ${TOKEN.slice(0, -1)}` }, listBody), true, "token prefix");
+unauthorized(await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, authorization: `Basic ${TOKEN}` }, listBody), true, "other scheme");
+unauthorized(await rawAt(PORT5, "GET", "/mcp", { accept: "text/event-stream" }), false, "GET without token");
+unauthorized(await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, "content-length": "16000001" }), false, "huge body without token");
+for (const scheme of ["Bearer", "bearer", "BEARER"]) {
+  const r = await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, authorization: `${scheme} ${TOKEN}` }, listBody);
+  assert.equal(r.status, 200, `${scheme}: ${r.body}`);
+}
+// the Host/Origin check still comes first
+assert.equal((await rawAt(PORT5, "POST", "/mcp", { ...rpcHeaders, host: "evil.example", authorization: `Bearer ${TOKEN}` }, listBody)).status, 403);
+const authHealth = await rawAt(PORT5, "GET", "/health");
+assert.equal(authHealth.status, 200);
+assert.equal(JSON.parse(authHealth.body).auth_required, true);
+assert.ok(!authHealth.body.includes(TOKEN) && !authHealth.body.includes(authed.dir), "/health leaks neither the token nor paths");
+assert.ok(errorLog.some((l) => l.includes("refused request: missing bearer token")));
+assert.ok(errorLog.some((l) => l.includes("refused request: invalid bearer token")));
+assert.ok(!errorLog.some((l) => l.includes(TOKEN)), "the token is never logged");
+assert.ok(!authed.status().includes(TOKEN), "nor shown in Live");
+assert.ok(authed.status().includes("Requests need the bearer token (auth_token in config.json)."));
+const authClient = await clientAt(PORT5, { Authorization: `Bearer ${TOKEN}` });
+const authTools = (await authClient.listTools()).tools.map((t) => t.name);
+assert.equal(authTools.length, tools.length - 2);
+assert.ok(!authTools.includes("track_get") && !authTools.includes("execute_command"));
+assert.equal(JSON.parse((await rawAt(PORT5, "GET", "/health")).body).tool_count, tools.length - 2);
+assert.match(authClient.getInstructions(), /Switched off on this server \(disabled_tools in config\.json\): track_get, execute_command\./);
+const offBatch = await authClient.callTool({ name: "batch", arguments: { steps: [{ tool: "execute_command", args: { command_id: "x" } }] } });
+assert.match(offBatch.content[0].text, /execute_command is switched off on this server/);
+// live://tracks/{track} goes with track_get; the prompts use neither tool
+assert.deepEqual((await authClient.listResourceTemplates()).resourceTemplates, []);
+assert.deepEqual((await authClient.listResources()).resources.map((r) => r.uri), ["live://song", "live://guide"]);
+assert.equal((await authClient.listPrompts()).prompts.length, 3);
+await authClient.close();
+
+// invalid values: plain settings fall back to their default (logged); invalid security
+// settings and unknown tool names lock /mcp (503) instead of serving more than the user meant
+const PORT6 = PORT + 4;
+const SHORT = "tooShort9";
+const locked = await startInstance(PORT6, JSON.stringify({ port: PORT6, auth_token: SHORT, read_only: "yes",
+  disabled_tools: ["execute_comand"], progress_notifications: "no", readonly: true }));
+const lockedHealth = await rawAt(PORT6, "GET", "/health");
+assert.equal(lockedHealth.status, 503);
+assert.equal(JSON.parse(lockedHealth.body).ok, false);
+assert.match(JSON.parse(lockedHealth.body).error, /invalid security setting/);
+const lockedMcp = await rawAt(PORT6, "POST", "/mcp", { ...rpcHeaders, authorization: `Bearer ${SHORT}` }, listBody);
+assert.equal(lockedMcp.status, 503);
+const lockedMessage = JSON.parse(lockedMcp.body).error.message;
+assert.match(lockedMessage, /"auth_token" in config\.json must be null, or a string of at least 16/);
+assert.match(lockedMessage, /"read_only" in config\.json must be true or false/);
+assert.match(lockedMessage, /disabled_tools in config\.json names no tool: "execute_comand"/);
+assert.ok(locked.status().includes("Every request is refused: "));
+for (const pattern of [/config: invalid "progress_notifications" .*\(got "no"\): expected true or false, using the default/,
+  /config: unknown setting\(s\) in .* ignored: "readonly"/, /config: invalid "auth_token" in [^(]*: expected null/,
+  /every \/mcp request is refused: /])
+  assert.ok(errorLog.some((l) => pattern.test(l)), `logged: ${pattern}`);
+for (const text of [lockedHealth.body, lockedMcp.body, locked.status(), ...errorLog])
+  assert.ok(!text.includes(SHORT), "an invalid token is never echoed");
+// with a valid token, a locked server tells only authenticated clients why
+const PORT7 = PORT + 5;
+const lockedAuthed = await startInstance(PORT7, JSON.stringify({ port: PORT7, auth_token: TOKEN, read_only: 1 }));
+unauthorized(await rawAt(PORT7, "POST", "/mcp", rpcHeaders, listBody), false, "locked, no token");
+const lockedAuthedMcp = await rawAt(PORT7, "POST", "/mcp", { ...rpcHeaders, authorization: `Bearer ${TOKEN}` }, listBody);
+assert.equal(lockedAuthedMcp.status, 503);
+assert.match(JSON.parse(lockedAuthedMcp.body).error.message, /"read_only" in config\.json must be true or false/);
+// a file that cannot be parsed but names a security setting locks too (the port falls
+// back to the default, so only the Status dialog is checked here)
+const unparsable = await startInstance(undefined, '{ "port": 8722, "read_only": true, }');
+assert.ok(unparsable.status().includes("Every request is refused: config.json names a security setting but could not be parsed"));
+console.log = consoleLog;
+for (const dir of [ro.dir, authed.dir, locked.dir, lockedAuthed.dir, unparsable.dir]) fs.rmSync(dir, { recursive: true, force: true });
 
 await client.close();
 fs.rmSync(storageDir, { recursive: true, force: true });

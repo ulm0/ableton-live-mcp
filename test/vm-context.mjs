@@ -23,7 +23,9 @@ const require = createRequire(import.meta.url);
 const { makeActivation } = require("./mock-host.cjs");
 
 const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-vm-"));
-fs.writeFileSync(path.join(storageDir, "config.json"), JSON.stringify({ port: PORT }));
+// a bearer token: its check (node:crypto) runs inside the context too
+const TOKEN = "vm-token-0123456789abcdef";
+fs.writeFileSync(path.join(storageDir, "config.json"), JSON.stringify({ port: PORT, auth_token: TOKEN }));
 
 const logs = [];
 const sandbox = {
@@ -73,15 +75,22 @@ for (let i = 0; ; i++) {
 assert.ok(logs.some((l) => l.includes(`listening on http://127.0.0.1:${PORT}/mcp`)));
 
 // one full MCP round trip through the SDK running inside the context
+const rpcHeaders = { "content-type": "application/json", accept: "application/json, text/event-stream" };
 const post = async (body) => {
   const r = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    headers: { ...rpcHeaders, authorization: `Bearer ${TOKEN}` },
     body: JSON.stringify(body),
   });
   assert.equal(r.status, 200);
   return r.json();
 };
+const wrongToken = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+  method: "POST",
+  headers: { ...rpcHeaders, authorization: "Bearer wrong-token-0123456789" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "tools/list" }),
+});
+assert.equal(wrongToken.status, 401);
 const init = await post({
   jsonrpc: "2.0", id: 1, method: "initialize",
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "vm", version: "1" } },
@@ -104,7 +113,7 @@ assert.ok(Array.isArray((await toolCall(4, "sample_search", { limit: 1, time_lim
 // TextEncoder and timers inside the context): a progress notification, then the result
 const sse = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
   method: "POST",
-  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  headers: { ...rpcHeaders, authorization: `Bearer ${TOKEN}` },
   body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call",
     params: { name: "selection_wait", arguments: { timeout_s: 1 }, _meta: { progressToken: "vm" } } }),
 });
@@ -119,6 +128,13 @@ assert.equal((await toolCall(6, "show_dialog", { form: { message: "?" } })).prob
 const read = await toolCall(7, "batch_read", { steps: [{ tool: "song_get", args: { include: ["tracks"] }, as: "s" },
   { tool: "track_get", args: { track_id: { $ref: "s.tracks.1.id" }, include: [] } }] });
 assert.deepEqual([read.ok, read.results[1].result.name], [true, "Drums"]);
+// resources and prompts (the skill text bundled by the .md loader)
+const songResource = await post({ jsonrpc: "2.0", id: 8, method: "resources/read", params: { uri: "live://song" } });
+assert.equal(typeof JSON.parse(songResource.result.contents[0].text).tempo, "number");
+const guide = await post({ jsonrpc: "2.0", id: 9, method: "resources/read", params: { uri: "live://guide" } });
+assert.match(guide.result.contents[0].text, /^# Ableton Live via MCP/);
+const beat = await post({ jsonrpc: "2.0", id: 10, method: "prompts/get", params: { name: "drum_beat", arguments: { style: "techno" } } });
+assert.match(beat.result.messages[0].content.text, /`clip_create \{/);
 
 fs.rmSync(storageDir, { recursive: true, force: true });
 console.log("OK — bundle activates and serves MCP in a bare VM context");
