@@ -60,7 +60,7 @@ const usageError = async (name, args, pattern) => {
 
 // tools/list
 const { tools } = await client.listTools();
-assert.equal(tools.length, 40, `expected exactly 40 tools, got ${tools.length}`);
+assert.equal(tools.length, 46, `expected exactly 46 tools, got ${tools.length}`);
 
 // every tool has a title and explicit hints — the spec defaults
 // (destructiveHint/openWorldHint true) must never apply by omission
@@ -78,21 +78,24 @@ const write = (destructive, idempotent) => ({
 });
 const annotationGroups = [
   [{ readOnlyHint: true, openWorldHint: false }, ["song_get", "track_get", "clip_get",
-    "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get", "render_track_audio"]],
+    "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get", "render_track_audio",
+    "parameter_find", "device_preset_list"]],
   [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
-    "clip_set", "drum_chain_set", "parameter_set", "mixer_set"]],
+    "clip_set", "drum_chain_set", "parameter_set", "mixer_set", "device_set"]],
   [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
     "scene_duplicate", "cue_point_create", "clip_create", "device_insert", "device_duplicate",
     "rack_insert_chain", "import_file"]],
+  // device_preset_save may overwrite a preset (overwrite:true)
   [write(true, true), ["track_delete", "scene_delete", "clip_delete", "cue_point_delete",
-    "device_delete", "track_clear_clips_in_range", "simpler_replace_sample"]],
-  [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes"]],
+    "device_delete", "track_clear_clips_in_range", "simpler_replace_sample", "device_preset_save"]],
+  // device_copy move deletes the original; device_preset_load replaces a Simpler's sample
+  [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes", "device_copy", "device_preset_load"]],
   [{ ...write(false, false), openWorldHint: true }, ["show_dialog"]],
   [{ ...write(true, false), openWorldHint: true }, ["execute_command"]],
 ];
 for (const [expected, names] of annotationGroups)
   for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
-assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 40, "snapshot lists the 40 original tools once");
+assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 46, "snapshot lists every tool once");
 
 // server instructions: a short digest, sent on initialize
 const instructions = client.getInstructions();
@@ -641,6 +644,358 @@ for (const c of cues.filter((x) => x.name !== "Start")) await call("cue_point_de
 for (const id of [padA, padB, drumBus, vocals]) await call("track_delete", { track_id: id });
 assert.equal((await tracksNow()).length, 2);
 await call("clip_delete", { clip_id: loopClip.id });
+
+// --- parameters by name, device on/off, parameter_find ----------------------
+// track_create: initial values by value_item and substring; every entry is checked first
+await usageError("track_create", { type: "midi", name: "Never", devices: [{ name: "Auto Filter",
+  parameters: [{ name: "Frequency", value: 80, reset: true }] }] },
+  /devices\[0\]\.parameters\[0\]: give only one of value, value_item, reset and delta, got value \+ reset/);
+assert.equal((await tracksNow()).length, 2, "an invalid initial value creates no track");
+const synth = await call("track_create", {
+  type: "midi", name: "Synth",
+  devices: [{ name: "Auto Filter", parameters: [{ name: "filter type", value_item: "high" }, { name: "freq", value: 90 }] },
+    "Compressor", "Switch Fx"],
+});
+assert.equal(synth.errors, undefined);
+assert.deepEqual(synth.devices[0].parameters.map((p) => [p.name, p.value]), [["Filter Type", 1], ["Frequency", 90]]);
+const [filterId, compId, switchId] = synth.devices.map((d) => d.id);
+
+// parameter_get by device + name (exact, case-insensitive, unique substring), ids first
+let byDevice = await call("parameter_get", {
+  parameter_ids: [paramId],
+  parameters: [
+    { track_name: "synth", device: "Auto Filter", parameter: "type" },
+    { track_name: "Synth", device: 0, parameter: "Frequency" },
+    { device_id: compId, parameter: "RATIO" },
+    { parameter_id: paramId },
+  ],
+});
+assert.deepEqual(byDevice.map((p) => [p.name, p.value, p.value_item, p.device_name]), [
+  ["Filter Freq", 90, undefined, undefined], ["Filter Type", 1, "Highpass", "Auto Filter"],
+  ["Frequency", 90, undefined, "Auto Filter"], ["Ratio", 4, undefined, "Compressor"], ["Filter Freq", 90, undefined, undefined]]);
+assert.equal(byDevice[1].device_id, filterId);
+
+// parameter_set: value_item, delta (clamped), value, reset — one undo step
+let pset = await undoSteps(() => call("parameter_set", { values: [
+  { track_name: "Synth", device: "auto filter", parameter: "Filter Type", value_item: "band" },
+  { track_name: "Synth", device: "Auto Filter", parameter: "Frequency", delta: -40 },
+  { device_id: filterId, parameter: "Resonance", value: 0.9 },
+  { device_id: compId, parameter: "Ratio", delta: 1000 },
+] }));
+assert.equal(pset.steps, 1, "parameter_set by name: one undo step");
+assert.deepEqual(pset.result.map((p) => [p.name, p.value, p.value_item]),
+  [["Filter Type", 2, "Bandpass"], ["Frequency", 50, undefined], ["Resonance", 0.9, undefined], ["Ratio", 100, undefined]]);
+pset = await call("parameter_set", { values: [
+  { device_id: filterId, parameter: "Resonance", reset: true }, { device_id: filterId, parameter: "Filter Type", delta: -1 }] });
+assert.deepEqual(pset.map((p) => [p.value, p.value_item]), [[0.5, undefined], [1, "Highpass"]]);
+
+// argument errors: nothing is written when any entry is invalid
+const filterFreq = async () => (await call("parameter_get", { parameters: [{ device_id: filterId, parameter: "Frequency" }] }))[0].value;
+const setOne = (entry) => ({ values: [{ device_id: filterId, ...entry }] });
+await usageError("parameter_set", { values: [{ device_id: filterId, parameter: "Frequency", value: 60 },
+  { device_id: filterId, parameter: "Resonance", value: 7 }] }, /values\[1\]: value 7 is out of range for "Resonance" \(0 to 1\)/);
+assert.equal(await filterFreq(), 50, "an invalid entry changes nothing");
+await usageError("parameter_set", setOne({ parameter: "Frequency", value: 60, delta: 1 }),
+  /values\[0\]: give only one of value, value_item, reset and delta, got value \+ delta/);
+await usageError("parameter_set", setOne({ parameter: "Frequency", reset: false }), /give one of value, value_item, reset \(true\) or delta/);
+await usageError("parameter_set", setOne({ parameter: "Frequency", value_item: "x" }), /"Frequency" is not quantized/);
+await usageError("parameter_set", setOne({ parameter: "Filter Type", value: 1.5 }), /"Filter Type" is quantized/);
+await usageError("parameter_set", setOne({ parameter: "Filter Type", delta: 0.5 }), /delta must be a whole number/);
+await usageError("parameter_set", setOne({ parameter: "Filter Type", value_item: "shelf" }),
+  /No value item "shelf" for "Filter Type"\. Items: "Lowpass" \(0\), "Highpass" \(1\)/);
+await usageError("parameter_set", setOne({ parameter: "Filter Type", value_item: "pass" }), /Ambiguous value_item "pass"/);
+await usageError("parameter_set", setOne({ parameter: "e", value: 0 }), /Ambiguous parameter "e" on "Auto Filter" .*"Device On" \(index 0/);
+await usageError("parameter_set", setOne({ parameter: "Cutoff", value: 0 }),
+  /No parameter named "Cutoff" \(or containing it\) on "Auto Filter" .*parameter_find/);
+await usageError("parameter_set", { values: [{ track_name: "Synth", device: "Phaser", parameter: "x", value: 0 }] },
+  /values\[0\]: device on track "Synth" .*: No device named "Phaser"\. Available: "Auto Filter", "Compressor", "Switch Fx"/);
+await usageError("parameter_set", { values: [{ parameter_id: paramId, device_id: filterId, value: 0 }] },
+  /parameter_id, or a device and parameter, not both/);
+await usageError("parameter_set", { values: [{ device_id: filterId, parameter: "Frequency", value: 60 },
+  { track_name: "Synth", device: 0, parameter: "freq", delta: 1 }] },
+  /values\[1\]: parameter "Frequency" \(id \d+\) is set twice, also by values\[0\]/);
+await usageError("parameter_set", { values: [{ device: "Auto Filter", parameter: "Frequency", value: 60 }] }, /device needs its track/);
+await usageError("parameter_set", { values: [{ device_id: filterId, track_name: "Synth", parameter: "Frequency", value: 60 }] }, /not both/);
+await usageError("parameter_get", {}, /Provide parameter_ids and\/or parameters/);
+assert.equal(await filterFreq(), 50);
+// a value the host refuses is a host error, named by entry
+fixtures.refuseWrites("Ratio");
+const refusedSet = await client.callTool({ name: "parameter_set", arguments: { values: [{ device_id: compId, parameter: "Ratio", value: 50 }] } });
+fixtures.refuseWrites(null);
+assert.equal(refusedSet.isError, true);
+assert.match(refusedSet.content[0].text, /values\[0\]: could not set "Ratio" to 50: mock: Ratio is not settable/);
+
+// device paths through racks: drum pads by receiving note, chains by index
+const kit = await call("track_create", { type: "midi", name: "Kit", devices: ["Drum Rack"] });
+const kitRack = kit.devices[0].id;
+const pads = [];
+for (const [i, note] of [36, 38].entries()) {
+  const ch = await call("rack_insert_chain", { rack_device_id: kitRack, index: i });
+  await call("drum_chain_set", { drum_chain_id: ch.id, receiving_note: note });
+  pads.push(ch.id);
+}
+// device_insert: initial parameters in one more undo step
+const kickIns = await undoSteps(() => call("device_insert", { target_id: pads[0], device_name: "Simpler", parameters: [{ name: "volume", value: 0.4 }] }));
+assert.equal(kickIns.steps, 2, "insert + initial values");
+const kickSimpler = kickIns.result;
+assert.deepEqual(kickSimpler.parameters.map((p) => [p.name, p.value]), [["Volume", 0.4]]);
+await call("simpler_replace_sample", { simpler_device_id: kickSimpler.id, file_path: "/tmp/kick.wav" });
+const snare = await call("device_insert", { target_id: pads[1], device_name: "Simpler" });
+byDevice = await call("parameter_get", { parameters: [
+  { track_name: "Kit", device: ["Drum Rack", { pad: 36 }, "Simpler"], parameter: "Volume" },
+  { track_name: "Kit", device: [0, { chain: 1 }, 0], parameter: "Volume" },
+] });
+assert.deepEqual(byDevice.map((p) => [p.device_id, p.value]), [[kickSimpler.id, 0.4], [snare.id, 0.7]]);
+const kitPath = (device) => ({ parameters: [{ track_name: "Kit", device, parameter: "Volume" }] });
+await usageError("parameter_get", kitPath(["Drum Rack", { pad: 40 }, "Simpler"]),
+  /device\[1\]: No pad receives note 40 in "Drum Rack" \(id \d+\) \(pads: 36, 38\)/);
+await usageError("parameter_get", kitPath(["Drum Rack", { chain: 5 }, 0]), /device\[1\]: chain 5 out of range in "Drum Rack" \(id \d+\) \(0-1\)/);
+await usageError("parameter_get", kitPath(["Drum Rack", { pad: 36 }]), /path ends at a chain/);
+await usageError("parameter_get", kitPath(["Drum Rack", "Simpler"]), /device\[1\]: pick a chain of "Drum Rack"/);
+await usageError("parameter_get", kitPath([{ pad: 36 }]), /device\[0\]: a \{chain\} or \{pad\} step must follow a rack device/);
+// a step is a chain or a pad, never both (strict objects)
+await usageError("parameter_get", kitPath(["Drum Rack", { pad: 36, chain: 0 }, 0]), /Input validation error/);
+await usageError("parameter_get", { parameters: [{ track_name: "Synth", device: ["Auto Filter", { chain: 0 }], parameter: "x" }] },
+  /device\[1\]: "Auto Filter" \(id \d+\) is not a rack/);
+await usageError("parameter_get", { parameters: [{ track_name: "Synth", device: [7], parameter: "x" }] },
+  /device\[0\]: device index 7 out of range on track "Synth" .*\(0-2\)/);
+const instRack = await call("device_insert", { track_name: "Kit", device_name: "Instrument Rack" });
+await call("rack_insert_chain", { rack_device_id: instRack.id, index: 0 });
+await usageError("parameter_get", kitPath(["Instrument Rack", { pad: 36 }, 0]), /is not a Drum Rack: address its chains by \{chain: index\}/);
+await call("device_delete", { device_id: instRack.id });
+await call("drum_chain_set", { drum_chain_id: pads[1], receiving_note: 36 });
+await usageError("parameter_get", kitPath(["Drum Rack", { pad: 36 }, 0]), /Ambiguous pad 36 in "Drum Rack" .*chains 0, 1 .*Use \{chain: index\}/);
+await call("drum_chain_set", { drum_chain_id: pads[1], receiving_note: 38 });
+
+// device_set: on/off and parameters in one undo step
+let dset = await undoSteps(() => call("device_set", { track_name: "Synth", device: "Auto Filter", enabled: false,
+  parameters: [{ name: "Frequency", value: 70 }, { name: "type", value_item: "notch" }] }));
+assert.equal(dset.steps, 1, "device_set: one undo step");
+assert.deepEqual([dset.result.id, dset.result.enabled, dset.result.on_parameter.name, dset.result.on_parameter.fallback],
+  [filterId, false, "Device On", undefined]);
+assert.deepEqual(dset.result.parameters.map((p) => [p.name, p.value]), [["Frequency", 70], ["Filter Type", 3]]);
+assert.equal((await call("parameter_get", { parameters: [{ device_id: filterId, parameter: "Device On" }] }))[0].value_item, "Off");
+dset = await call("device_set", { device_id: filterId, enabled: true });
+assert.deepEqual([dset.enabled, dset.parameters], [true, undefined]);
+// without "Device On", a first two-state parameter is used, and reported
+dset = await call("device_set", { device_id: switchId, enabled: false });
+assert.deepEqual([dset.enabled, dset.on_parameter.name, dset.on_parameter.fallback], [false, "Active", true]);
+// parameters alone still report the on state
+dset = await call("device_set", { device_id: compId, parameters: [{ name: "Threshold", reset: true }] });
+assert.equal(dset.enabled, true);
+// a device without an on/off switch (the original Operator) cannot be switched; nothing changes
+await usageError("device_set", { device_id: deviceId, enabled: false, parameters: [{ name: "Osc-A Level", value: 0.1 }] },
+  /has no "Device On" parameter .*cannot be switched on or off/);
+assert.equal((await call("parameter_get", { parameters: [{ device_id: deviceId, parameter: "Osc-A Level" }] }))[0].value, 0.25);
+await usageError("device_set", { device_id: filterId, enabled: false, parameters: [{ name: "device on", value: 1 }] },
+  /parameters\[0\]: parameter "Device On" \(id \d+\) is set twice, also by enabled/);
+await usageError("device_set", { device_id: filterId, parameters: [{ parameter_id: paramId, value: 1 }] },
+  new RegExp(`parameters\\[0\\]: parameter ${paramId} is not a parameter of "Auto Filter"`));
+await usageError("device_set", { device_id: filterId, parameters: [{ name: "Frequency", parameter_id: paramId, value: 1 }] },
+  /exactly one of name and parameter_id/);
+await usageError("device_set", { device_id: filterId }, /Nothing to set/);
+await usageError("device_set", { device_id: filterId, track_name: "Synth", enabled: true }, /not both/);
+assert.equal((await call("device_set", { device_id: switchId, enabled: true })).enabled, true);
+
+// device_insert: a bad name keeps the device, sets none of the values and says why
+const rev1 = await call("device_insert", { track_name: "Synth", device_name: "Reverb", parameters: [{ name: "dry", value: 0.2 }] });
+assert.deepEqual(rev1.parameters.map((p) => [p.name, p.value]), [["Dry/Wet", 0.2]]);
+const rev2 = await call("device_insert", { track_name: "Synth", device_name: "Reverb",
+  parameters: [{ name: "dry", value: 0.2 }, { name: "Size", value: 1 }] });
+assert.match(rev2.errors[0], /^parameters: No parameter named "Size"/);
+assert.equal(rev2.parameters, undefined);
+assert.equal((await call("parameter_get", { parameters: [{ device_id: rev2.id, parameter: "Dry/Wet" }] }))[0].value, 0.5);
+const synthDevices = async () => (await call("track_get", { track_name: "Synth", include: ["devices"] })).devices;
+const deviceCount = (await synthDevices()).length;
+await usageError("device_insert", { track_name: "Synth", device_name: "Reverb", parameters: [{ name: "dry" }] },
+  /parameters\[0\]: give one of value/);
+assert.equal((await synthDevices()).length, deviceCount, "checked before the insert");
+for (const d of [rev1, rev2]) await call("device_delete", { device_id: d.id });
+
+// parameter_find: the whole set, a track (through racks), a device, by value item
+let found = await call("parameter_find", { query: "freq" });
+assert.deepEqual(found.matches.map((m) => [m.track_name, m.device_name, m.name, m.path]), [
+  ["Bass 2", "Operator", "Filter Freq", "Bass 2 > Operator"], ["Synth", "Auto Filter", "Frequency", "Synth > Auto Filter"]]);
+assert.deepEqual([found.total, found.truncated, found.matches[1].device_id, found.matches[1].track_id], [2, false, filterId, synth.id]);
+assert.equal(found.matches[0].value, undefined, "values only on request");
+found = await call("parameter_find", { track_name: "Kit", query: "VOL", include_values: true });
+assert.deepEqual(found.matches.map((m) => [m.path, m.device_id, m.value]), [
+  ["Kit > Drum Rack > pad 36 > Simpler", kickSimpler.id, 0.4], ["Kit > Drum Rack > pad 38 > Simpler", snare.id, 0.7]]);
+found = await call("parameter_find", { track_name: "Synth", value_item: "notch" });
+assert.deepEqual(found.matches.map((m) => [m.name, m.value_items.length]), [["Filter Type", 4]]);
+found = await call("parameter_find", { track_name: "Kit", device: ["Drum Rack", { pad: 38 }, "Simpler"] });
+assert.deepEqual(found.matches.map((m) => m.name), ["Device On", "Volume", "Transpose"]);
+assert.ok(found.matches.every((m) => m.path === "Kit > Drum Rack > pad 38 > Simpler"));
+found = await call("parameter_find", { device_id: kitRack, query: "o", limit: 2, include_value_items: false });
+assert.deepEqual([found.total, found.truncated, found.matches.length, found.devices_searched], [7, true, 2, 3]);
+assert.deepEqual(found.matches.map((m) => [m.path, m.track_id, m.value_items]),
+  [["Drum Rack", undefined, undefined], ["Drum Rack > pad 36 > Simpler", undefined, undefined]]);
+await usageError("parameter_find", { device: "Auto Filter" }, /device needs its track/);
+
+// --- device_copy: copy and move (lossy), presets ------------------------------
+const valuesOf = async (device_id) => Object.fromEntries(
+  (await call("parameter_find", { device_id, include_values: true })).matches.map((m) => [m.name, m.value]));
+await call("device_set", { device_id: filterId, enabled: false, parameters: [{ name: "Frequency", value: 66 }, { name: "Resonance", value: 0.3 }] });
+let copied = await undoSteps(() => call("device_copy", { device_id: filterId, track_name: "Bass 2", index: 0 }));
+assert.equal(copied.steps, 2, "device_copy: insert + values");
+const filterCopy = copied.result;
+assert.notEqual(filterCopy.id, filterId, "the copy has a new id");
+assert.deepEqual([filterCopy.name, filterCopy.index, filterCopy.moved, filterCopy.fidelity, filterCopy.source_id,
+  filterCopy.not_copied, filterCopy.copied_parameters], ["Auto Filter", 0, false, "approximate", filterId, undefined, 4]);
+assert.match(filterCopy.lost, /automation/);
+assert.deepEqual(await valuesOf(filterCopy.id), { "Device On": 0, Frequency: 66, Resonance: 0.3, "Filter Type": 3 });
+assert.deepEqual(await valuesOf(filterCopy.id), await valuesOf(filterId));
+// move = reorder: Switch Fx to the front of its own chain; the old id is gone
+await call("device_set", { device_id: switchId, parameters: [{ name: "amount", value: 0.9 }] });
+let moved2 = await undoSteps(() => call("device_copy", { device_id: switchId, index: 0, move: true }));
+assert.equal(moved2.steps, 3, "move: insert + values + delete");
+let movedDev = moved2.result;
+assert.deepEqual([movedDev.moved, movedDev.index, movedDev.name], [true, 0, "Switch Fx"]);
+assert.deepEqual((await synthDevices()).map((d) => d.name), ["Switch Fx", "Auto Filter", "Compressor"]);
+const staleDevice = await client.callTool({ name: "device_get", arguments: { device_id: switchId } });
+assert.equal(staleDevice.isError, true);
+assert.match(staleDevice.content[0].text, /stale/);
+// onto its own position: nothing happens; to the end: index counts before the original is removed
+const noMove = await call("device_copy", { device_id: movedDev.id, index: 1, move: true });
+assert.deepEqual([noMove.id, noMove.moved, noMove.index], [movedDev.id, false, 0]);
+assert.match(noMove.unchanged, /already at that position/);
+movedDev = await call("device_copy", { device_id: movedDev.id, move: true });
+assert.deepEqual([movedDev.moved, movedDev.index], [true, 2]);
+assert.deepEqual((await synthDevices()).map((d) => d.name), ["Auto Filter", "Compressor", "Switch Fx"]);
+// a Simpler brings its sample (insert + sample + values)
+copied = await undoSteps(() => call("device_copy", { device_id: kickSimpler.id, target_id: pads[1], index: 0 }));
+assert.equal(copied.steps, 3);
+assert.deepEqual(copied.result.sample, { file_path: "/tmp/kick.wav" });
+assert.equal((await valuesOf(copied.result.id)).Volume, 0.4);
+assert.ok((await call("device_get", { device_id: kickSimpler.id })).sample, "a copy keeps the original");
+await call("device_delete", { device_id: copied.result.id });
+// a sample that cannot be loaded removes the copy again
+const padDevices = async (chain_id) => (await call("chain_get", { chain_id })).devices.map((d) => d.id);
+const padBefore = await padDevices(pads[1]);
+fixtures.refuseSamples(true);
+const noSample = await client.callTool({ name: "device_copy", arguments: { device_id: kickSimpler.id, target_id: pads[1], move: true } });
+fixtures.refuseSamples(false);
+assert.equal(noSample.isError, true);
+assert.match(noSample.content[0].text, /Could not load the sample \/tmp\/kick\.wav: .*The new device was removed again; nothing else was changed/);
+assert.deepEqual(await padDevices(pads[1]), padBefore);
+assert.equal((await call("device_get", { device_id: kickSimpler.id })).name, "Simpler", "the original is kept");
+// racks are refused; a different device keeps the original and lists what it could not copy
+await usageError("device_copy", { device_id: kitRack, track_name: "Synth" }, /is a rack: .*device_duplicate/);
+const odd = await call("device_copy", { device_id: compId, device_name: "Reverb", move: true });
+assert.deepEqual([odd.name, odd.moved], ["Reverb", false]);
+assert.match(odd.original_kept, /incomplete/);
+assert.deepEqual(odd.not_copied.map((x) => x.name), ["Threshold", "Ratio"]);
+assert.match(odd.not_copied[0].reason, /has no parameter of that name/);
+assert.equal((await call("device_get", { device_id: compId })).name, "Compressor");
+await call("device_delete", { device_id: odd.id });
+// a value Live refuses: listed, and a move keeps the original
+fixtures.refuseWrites("Ratio");
+const partial2 = await call("device_copy", { device_id: compId, track_name: "Bass 2", move: true });
+fixtures.refuseWrites(null);
+assert.deepEqual(partial2.not_copied.map((x) => x.name), ["Ratio"]);
+assert.match(partial2.not_copied[0].reason, /Live refused 100: mock: Ratio is not settable/);
+assert.equal(partial2.moved, false);
+await call("device_delete", { device_id: partial2.id });
+// an insert Live rejects changes nothing
+const devicesOfBass = async () => (await call("track_get", { track_name: "Bass 2", include: ["devices"] })).devices.length;
+const bassCount = await devicesOfBass();
+const badCopy = await client.callTool({ name: "device_copy", arguments: { device_id: filterId, track_name: "Bass 2", device_name: "Nonexistent" } });
+assert.equal(badCopy.isError, true);
+assert.match(badCopy.content[0].text, /Could not insert "Nonexistent": .*Nothing was changed/);
+assert.equal(await devicesOfBass(), bassCount);
+await usageError("device_copy", { device_id: filterId, track_name: "Bass 2", index: 9 }, /index 9 out of range \(0-2/);
+// repeated parameter names line up by order
+const eq = await call("device_insert", { track_name: "Synth", device_name: "EQ Eight" });
+const eqFreqs = (await call("parameter_find", { device_id: eq.id, query: "Frequency" })).matches.map((m) => m.id);
+await call("parameter_set", { values: [{ parameter_id: eqFreqs[0], value: 0.3 }, { parameter_id: eqFreqs[1], value: 0.6 }] });
+await usageError("parameter_get", { parameters: [{ device_id: eq.id, parameter: "Frequency" }] },
+  /Ambiguous parameter "Frequency" on "EQ Eight" .*\(index 1, .*\(index 2, .*parameter_id/);
+const eqCopy = await call("device_copy", { device_id: eq.id, track_name: "Bass 2" });
+assert.deepEqual((await call("parameter_find", { device_id: eqCopy.id, query: "Frequency", include_values: true }))
+  .matches.map((m) => m.value), [0.3, 0.6]);
+
+// presets: JSON files in <storage>/presets
+const presetDir = path.join(storageDir, "presets");
+let saved = await call("device_preset_save", { name: "Bright Filter", device_id: filterId });
+assert.deepEqual([saved.name, saved.device_name, saved.parameter_count, saved.replaced, saved.directory],
+  ["Bright Filter", "Auto Filter", 4, false, presetDir]);
+const presetFile = JSON.parse(fs.readFileSync(path.join(presetDir, "Bright Filter.json"), "utf8"));
+assert.equal(presetFile.format, "ableton-live-mcp/device-preset");
+assert.deepEqual(presetFile.parameters.map((p) => [p.name, p.value]),
+  [["Device On", 0], ["Frequency", 66], ["Resonance", 0.3], ["Filter Type", 3]]);
+await usageError("device_preset_save", { name: "bright filter", device_id: filterId },
+  /A preset named "Bright Filter" already exists\. Pass overwrite:true/);
+await call("device_set", { device_id: filterId, parameters: [{ name: "Frequency", value: 99 }] });
+saved = await call("device_preset_save", { name: "bright filter", device_id: filterId, overwrite: true });
+assert.deepEqual([saved.replaced, saved.name], [true, "Bright Filter"], "an overwrite keeps the stored name");
+assert.deepEqual(fs.readdirSync(presetDir), ["Bright Filter.json"], "replaced in place, no temp file left");
+const replacedFile = JSON.parse(fs.readFileSync(path.join(presetDir, "Bright Filter.json"), "utf8"));
+assert.deepEqual([replacedFile.name, replacedFile.parameters[1].value], ["Bright Filter", 99]);
+saved = await call("device_preset_save", { name: " Kick 1 ", track_name: "Kit", device: ["Drum Rack", { pad: 36 }, "Simpler"] });
+assert.deepEqual([saved.name, saved.sample], ["Kick 1", { file_path: "/tmp/kick.wav" }]);
+let plist = await call("device_preset_list");
+assert.deepEqual(plist.presets.map((p) => [p.name, p.device_name, p.parameter_count, p.sample?.file_path]).sort(),
+  [["Bright Filter", "Auto Filter", 4, undefined], ["Kick 1", "Simpler", 3, "/tmp/kick.wav"]]);
+assert.equal(plist.unreadable, undefined);
+assert.deepEqual((await call("device_preset_list", { device_name: "simpler" })).presets.map((p) => p.name), ["Kick 1"]);
+// load as a new device (track by name, at an index)...
+let loaded = await call("device_preset_load", { name: "BRIGHT FILTER", track_name: "Drums", index: 0 });
+assert.deepEqual([loaded.name, loaded.inserted, loaded.index, loaded.preset, loaded.not_applied, loaded.warning],
+  ["Auto Filter", true, 0, "Bright Filter", undefined, undefined]);
+assert.equal((await valuesOf(loaded.id)).Frequency, 99);
+const drumsFilter = loaded.id;
+// ...onto an existing device (one undo step)...
+await call("device_set", { device_id: filterCopy.id, parameters: [{ name: "Frequency", value: 20 }] });
+loaded = await undoSteps(() => call("device_preset_load", { name: "Bright Filter", device_id: filterCopy.id }));
+assert.equal(loaded.steps, 1);
+assert.deepEqual([loaded.result.id, loaded.result.inserted, loaded.result.applied_parameters], [filterCopy.id, false, 4]);
+assert.equal((await valuesOf(filterCopy.id)).Frequency, 99);
+// ...a Simpler with its sample, into an empty pad...
+const pad3 = await call("rack_insert_chain", { rack_device_id: kitRack, index: 2 });
+loaded = await call("device_preset_load", { name: "kick 1", target_id: pad3.id });
+assert.deepEqual([loaded.name, loaded.sample], ["Simpler", { file_path: "/tmp/kick.wav" }]);
+assert.equal((await valuesOf(loaded.id)).Volume, 0.4);
+// a failing sample load onto an existing Simpler changes nothing
+fixtures.refuseSamples(true);
+const loadFail = await client.callTool({ name: "device_preset_load", arguments: { name: "Kick 1", device_id: snare.id } });
+fixtures.refuseSamples(false);
+assert.equal(loadFail.isError, true);
+assert.match(loadFail.content[0].text, /Could not load the sample \/tmp\/kick\.wav: .*Nothing was changed/);
+assert.equal((await valuesOf(snare.id)).Volume, 0.7);
+// ...or onto another kind of device: same names only, with a warning
+loaded = await call("device_preset_load", { name: "Kick 1", device_id: compId });
+assert.match(loaded.warning, /saved from "Simpler"/);
+assert.deepEqual(loaded.not_applied.map((x) => x.name), ["sample", "Volume", "Transpose"]);
+// names are one safe file name: no traversal, no hidden or reserved names
+for (const bad of ["../evil", "a/b", "..", ".hidden", "CON", "x\\y", "a:b", "", "   ", "trailing.", "x".repeat(65), "tab\there"])
+  await usageError("device_preset_save", { name: bad, device_id: filterId }, /Invalid preset name|1-64 characters/);
+assert.deepEqual(fs.readdirSync(presetDir).sort(), ["Bright Filter.json", "Kick 1.json"]);
+// letters with combining marks (NFC) are fine
+saved = await call("device_preset_save", { name: "Re\u0301sonance Ü", device_id: filterId });
+assert.equal(saved.name, "Résonance Ü");
+fs.rmSync(path.join(presetDir, "Résonance Ü.json"));
+assert.ok(!fs.existsSync(path.join(storageDir, "evil.json")) && !fs.existsSync(path.join(path.dirname(storageDir), "evil.json")));
+await usageError("device_preset_load", { name: "../Bright Filter", device_id: filterCopy.id }, /Invalid preset name/);
+await usageError("device_preset_load", { name: "Nope", device_id: filterCopy.id },
+  /No preset named "Nope"\. Saved presets: "Bright Filter", "Kick 1"/);
+await usageError("device_preset_save", { name: "Kit", device_id: kitRack }, /is a rack/);
+await usageError("device_preset_load", { name: "Bright Filter", device_id: filterCopy.id, index: 0 }, /only apply when inserting/);
+await usageError("device_preset_load", { name: "Bright Filter", device_id: filterCopy.id, target_id: kit.id }, /not both/);
+await usageError("device_preset_load", { name: "Bright Filter" }, /Give the device to load onto/);
+// a broken file is listed, not fatal; a symlink is never followed
+fs.writeFileSync(path.join(presetDir, "Broken.json"), "{nope");
+fs.symlinkSync(path.join(storageDir, "config.json"), path.join(presetDir, "Link.json"));
+plist = await call("device_preset_list");
+assert.deepEqual([plist.presets.length, plist.unreadable.map((u) => u.file)], [2, ["Broken.json"]]);
+await usageError("device_preset_load", { name: "broken", device_id: filterCopy.id },
+  /Preset "Broken" cannot be loaded: .*Broken\.json is not valid JSON/);
+await usageError("device_preset_load", { name: "Link", device_id: filterCopy.id }, /No preset named "Link"/);
+fs.rmSync(path.join(presetDir, "Broken.json"));
+fs.rmSync(path.join(presetDir, "Link.json"));
+
+for (const id of [filterCopy.id, eqCopy.id, drumsFilter]) await call("device_delete", { device_id: id });
+for (const id of [synth.id, kit.id]) await call("track_delete", { track_id: id });
+assert.equal((await tracksNow()).length, 2);
 
 // ui + commands; the status command and its menu entries are registered
 await call("execute_command", { command_id: "ableton-live-mcp.status" });

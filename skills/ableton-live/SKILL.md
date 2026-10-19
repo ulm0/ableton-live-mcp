@@ -24,7 +24,8 @@ or the port was changed in the extension's `config.json` (default 8722).
    and `clip_create` take `scene_id`, `scene_index` or `scene_name`. "Mute the Drums" is one
    call: `track_set {track_name:"Drums", mute:true}`. If you give several fields they must name
    the same object. An ambiguous name fails with the matching candidates — pick one by id or
-   index. `track_delete` and `scene_delete` only accept the exact name.
+   index. `track_delete` and `scene_delete` only accept the exact name. Parameters work the same
+   way: see [Devices & sound design](#devices--sound-design).
 4. Ids become stale when objects are deleted/moved or a different set is loaded. On a stale-id
    error, re-run `song_get` and re-resolve. Errors about your arguments (unknown name, index
    out of range, missing or conflicting fields) come without the stale-id hint: fix the call
@@ -53,7 +54,8 @@ or the port was changed in the extension's `config.json` (default 8722).
 - Colors: `"#RRGGBB"` strings.
 - Velocity 0–127, probability 0–1.
 - Device parameters use internal units within each parameter's `min`/`max` (no dB/Hz/ms
-  display values).
+  display values). Quantized parameters (switches, choosers) take the `value_items` index, or
+  the choice by name with `value_item`.
 
 ## MIDI composition
 
@@ -81,13 +83,55 @@ or the port was changed in the extension's `config.json` (default 8722).
   "Simpler", "Reverb", "Delay", "Auto Filter", "EQ Eight", "Compressor", "Saturator", ...
   Third-party plug-ins cannot be inserted. One instrument per track — inserting a second
   instrument fails.
-- Parameters: big devices have 100+ params — use `device_get {parameter_filter:"filter"}`
-  (substring match) and `include_values:true` instead of dumping everything. Quantized
-  parameters (switches/choosers) take the index from `value_items`. Set many at once with
-  `parameter_set` (one undo step).
+- **Address parameters by name — no id lookup needed.** `parameter_get` and `parameter_set`
+  entries take `{track_name, device, parameter}` (or `{device_id, parameter}`, or the old
+  `{parameter_id}`):
+  - `device`: a name (exact, then case-insensitive), a 0-based index on the track, or a path
+    into racks: `["Drum Rack", {pad:36}, "Simpler"]` (a pad is the drum chain with that
+    receiving note) or `["Instrument Rack", {chain:1}, 0]` (chains by index; chains have no
+    names).
+  - `parameter`: exact name first, then case-insensitive, then a unique substring (`"freq"` →
+    "Frequency"). Ambiguous matches fail with the candidates and their ids.
+  - Each write gives exactly one of `value` (internal units), `value_item` (a quantized
+    parameter's choice by name or short name, matched like `parameter`: `"high"` →
+    "Highpass"), `reset:true` (back to the default) or `delta` (relative to the current value,
+    clamped).
+  - "Switch the bass filter to high-pass" is one call, e.g.
+    `parameter_set {values:[{track_name:"Bass", device:"Auto Filter", parameter:"Filter Type", value_item:"high"}]}`
+    (when unsure of the exact names, `parameter_find` first).
+- `device_set {track_name, device, enabled?, parameters?:[{name, value|value_item|reset|delta}]}`
+  bypasses or enables a device and sets several of its parameters in one undo step. `enabled`
+  uses the "Device On" parameter (a Live convention, not an API field); a device without one
+  falls back to a two-state first parameter, and `on_parameter.fallback` says so. Some devices
+  have no switch at all — that fails with a clear error.
+- Don't know the parameter name? `parameter_find {track_name, query:"cutoff"}` (or the whole set,
+  or one device; `value_item:"saw"` finds choosers with that choice) returns ids, device names and
+  paths like "Drums > Drum Rack > pad 36 > Simpler". Big devices have 100+ params: prefer
+  `parameter_find` or `device_get {parameter_filter, include_values:true}` over dumping all.
+- `device_insert` and `track_create` devices take initial `parameters:[{name, value|value_item|…}]`.
+- dB, Hz and ms are not available: values are internal units only. Read `min`/`max` and the
+  current value first, and say that any unit conversion is approximate.
 - Drum racks: `device_get {include_chain_devices:true}` maps the whole kit (pad → note →
   sample) in one call; `drum_chain_set` maps a pad to a MIDI note; `simpler_replace_sample`
   swaps samples.
+
+## Copying, moving and presets (lossy)
+
+- Live's API cannot move, reorder or copy devices. `device_copy {device_id, track_name |
+  target_id, index?}` inserts a fresh built-in device of the same name and copies its parameter
+  values by name (a Simpler also gets its sample). `move:true` deletes the original afterwards:
+  "move the compressor before the EQ" = `device_copy {device_id:<comp>, index:<EQ's index>,
+  move:true}` (target omitted = the same track or chain; `index` counts the current devices).
+- It is lossy and you must say so: automation, modulation and MIDI/macro mappings, a custom
+  device name and any state that is not a parameter are lost, and the device gets a new id
+  (the old one is gone after a move). Racks are refused (use `device_duplicate` in place). If
+  some values could not be copied (`not_copied`), a move keeps the original.
+- If the user renamed the device in Live, pass the built-in name as `device_name`.
+- Presets: `device_preset_save {name, track_name, device}` stores the parameter values (and a
+  Simpler's sample path) as JSON in the extension's storage directory; `device_preset_load
+  {name, track_name}` inserts the device with those values (add `device` or `device_id` to
+  load onto an existing one); `device_preset_list` shows them. These are this server's
+  snapshots, not Live presets (`.adv`): no automation, mappings or other device state.
 
 ## Mixing
 
@@ -140,7 +184,9 @@ or the port was changed in the extension's `config.json` (default 8722).
 The Extensions API (1.0.0) has no access to:
 
 - transport (play/stop/record), song position, clip or scene launching;
-- the browser, third-party plug-ins, device presets;
+- the browser, third-party plug-ins, Live's own device presets (`.adv`/`.adg`) — the
+  `device_preset_*` tools keep this server's JSON snapshots instead;
+- moving, reordering or renaming devices (`device_copy` emulates move/reorder, lossily);
 - automation envelopes, modulation, MIDI/macro mapping;
 - track color, routing and sidechain sources, MIDI routing;
 - reordering or grouping tracks, creating return tracks;
@@ -155,8 +201,10 @@ Don't pretend otherwise or improvise workarounds — tell the user when asked.
 
 `track_delete`, `scene_delete`, `clip_delete`, `cue_point_delete`, `device_delete`,
 `midi_clip_set_notes` (mode `replace`), `midi_clip_edit_notes` (with `delete`),
-`track_clear_clips_in_range`, and `simpler_replace_sample` (discards the current sample)
-change the user's project (each is one undo step in Live). `track_delete` and `scene_delete`
+`track_clear_clips_in_range`, `simpler_replace_sample` (discards the current sample),
+`device_copy` with `move` (deletes the original, lossy) and `device_preset_load` onto a Simpler
+(replaces its sample) change the user's project (each step is undoable in Live).
+`device_preset_save` with `overwrite` replaces a saved preset file. `track_delete` and `scene_delete`
 by name need the exact name, so a case-insensitive guess can't delete the wrong object. They carry the MCP
 `destructiveHint` annotation; read-only tools carry `readOnlyHint`. For bulk destructive edits
 the user didn't explicitly enumerate, confirm first.

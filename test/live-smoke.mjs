@@ -213,6 +213,78 @@ assert.equal(batchMix.items.length, 2);
 await call("mixer_set", { targets: [{ track_id: midi.id }, { track_id: named.id }], panning: 0 });
 step("mixer_set targets: two tracks in one call, restored");
 
+// --- parameters by name, device on/off, copy/move, presets ------------------
+// Host behaviour the mock can only assume: built-in devices have "Device On",
+// a quantized value is its value_items index, a fresh Simpler takes a sample.
+const opOff = await call("device_set", { track_id: midi.id, device: "Operator", enabled: false });
+assert.equal(opOff.on_parameter.name, "Device On", "built-in devices have a Device On parameter");
+assert.equal(opOff.on_parameter.fallback, undefined);
+await eventually(async () => {
+  const [on] = await call("parameter_get", { parameters: [{ track_id: midi.id, device: 0, parameter: "Device On" }] });
+  assert.equal(on.value_item, "Off");
+});
+await call("device_set", { track_id: midi.id, device: "Operator", enabled: true });
+step('device_set enabled: Operator switched off and on via "Device On"');
+
+const chooser = (await call("parameter_find", { track_id: midi.id, device: "Operator", limit: 500 })).matches
+  .find((m) => m.is_quantized && m.value_items?.length > 2);
+assert.ok(chooser, "Operator has a chooser with more than two items");
+assert.equal(chooser.min, 0, "quantized parameters start at 0 (value = value_items index)");
+const [choiceBefore] = await call("parameter_get", { parameter_ids: [chooser.id] });
+const pick = chooser.value_items.find((v) => v.index !== choiceBefore.value);
+await call("parameter_set", { values: [{ parameter_id: chooser.id, value_item: pick.name }] });
+await eventually(async () => {
+  const [now] = await call("parameter_get", { parameter_ids: [chooser.id] });
+  assert.deepEqual([now.value, now.value_item], [pick.index, pick.name]);
+});
+await call("parameter_set", { values: [{ parameter_id: chooser.id, value: choiceBefore.value }] });
+step(`value_item: "${chooser.name}" set to "${pick.name}" = index ${pick.index}, restored`);
+
+const near = (a, b) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
+const valuesOf = async (id) =>
+  (await call("parameter_find", { device_id: id, include_values: true, include_value_items: false, limit: 500 }))
+    .matches.map((m) => [m.name, m.value]);
+const af = await call("device_insert", { track_id: midi.id, device_name: "Auto Filter",
+  parameters: [{ name: "Device On", value: 0 }] });
+const afCopy = await call("device_copy", { device_id: af.id, track_id: audio.id });
+assert.equal(afCopy.not_copied, undefined, `not copied: ${JSON.stringify(afCopy.not_copied)}`);
+await eventually(async () => {
+  const [src, dst] = [await valuesOf(af.id), await valuesOf(afCopy.id)];
+  assert.deepEqual(dst.map(([n]) => n), src.map(([n]) => n));
+  dst.forEach(([n, v], i) => assert.ok(near(v, src[i][1]), `${n}: ${v} vs ${src[i][1]}`));
+});
+step(`device_copy: Auto Filter to the audio track, ${afCopy.copied_parameters} values equal`);
+
+const rv = await call("device_insert", { track_id: midi.id, device_name: "Reverb" });
+const rvMoved = await call("device_copy", { device_id: rv.id, index: 1, move: true });
+assert.equal(rvMoved.moved, true);
+await eventually(async () => {
+  const names = (await call("track_get", { track_id: midi.id, include: ["devices"] })).devices.map((d) => d.name);
+  assert.deepEqual(names, ["Operator", "Reverb", "Auto Filter"]);
+});
+step("device_copy move: Reverb reordered before Auto Filter");
+
+if (chainDetail.receiving_note !== undefined) {
+  const simpler = await call("device_insert", { target_id: chain.id, device_name: "Simpler" });
+  await call("simpler_replace_sample", { simpler_device_id: simpler.id, file_path: wavPath });
+  const chain2 = await call("rack_insert_chain", { rack_device_id: rack.id, index: 1 });
+  await call("drum_chain_set", { drum_chain_id: chain2.id, receiving_note: 38 });
+  const simplerCopy = await call("device_copy", { device_id: simpler.id, target_id: chain2.id });
+  assert.ok(simplerCopy.sample?.file_path, "replaceSample works on a freshly inserted Simpler");
+  const viaPad = await call("parameter_get", { parameters: [
+    { track_id: drumTrack.id, device: ["Drum Rack", { pad: 36 }, "Simpler"], parameter: "Device On" }] });
+  assert.equal(viaPad[0].device_id, simpler.id);
+  step("Simpler copied to a new pad with its sample; pad path addressing resolves");
+}
+
+const presetName = `MCP Smoke ${Date.now()}`;
+const savedPreset = await call("device_preset_save", { name: presetName, device_id: af.id });
+const loadedPreset = await call("device_preset_load", { name: presetName, track_id: audio.id });
+assert.equal(loadedPreset.not_applied, undefined, `not applied: ${JSON.stringify(loadedPreset.not_applied)}`);
+assert.ok((await call("device_preset_list")).presets.some((p) => p.name === presetName));
+fs.rmSync(path.join(savedPreset.directory, `${presetName}.json`), { force: true });
+step(`device preset saved to ${savedPreset.directory}, loaded as a new device, removed`);
+
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;
 await call("song_set", { tempo: origTempo + 5 });

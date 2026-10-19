@@ -211,6 +211,84 @@ const exactSceneName = z.string().optional().describe("Exact scene name (case-se
 type TrackAddress = { track_id?: string; track_index?: number; track_name?: string };
 type SceneAddress = { scene_id?: string; scene_index?: number; scene_name?: string };
 
+// Device addressing: device_id, or the device's track plus `device`, a device
+// name or index on the track or a path into racks. In a path, a name or index
+// picks from the current device list; after a rack, {chain: index} or a Drum
+// Rack {pad: note} picks the chain whose devices the next step picks from.
+const chainStep = z.union([
+  z.object({ chain: z.number().int().min(0).describe("0-based chain index in the rack") }).strict(),
+  z
+    .object({ pad: z.number().int().min(0).max(127).describe("Drum Rack pad: the chain's receiving MIDI note") })
+    .strict(),
+]);
+// A fresh instance per use: a schema used twice in one tool becomes a JSON
+// Schema $ref, which some clients do not resolve.
+const deviceStep = () =>
+  z.union([
+    z.string().min(1).describe("Device name, exact match first, then case-insensitive"),
+    z.number().int().min(0).describe("0-based position in the device list"),
+  ]);
+const deviceAddress = {
+  device_id: z.string().optional().describe("Device id"),
+  ...trackAddress,
+  device: z
+    .union([deviceStep(), z.array(z.union([deviceStep(), chainStep])).min(1)])
+    .optional()
+    .describe(
+      "With a track instead of device_id: the device's name or 0-based index on the track, or a " +
+        'path into racks, e.g. ["Drum Rack", {"pad": 36}, "Simpler"] or [0, {"chain": 1}, "Reverb"]',
+    ),
+};
+type ChainStep = { chain: number } | { pad: number };
+type DeviceAddress = TrackAddress & {
+  device_id?: string;
+  device?: string | number | Array<string | number | ChainStep>;
+};
+
+// A parameter by id, or by its device and name.
+const parameterAddress = {
+  parameter_id: z.string().optional().describe("Parameter id (from device_get, mixer_get, parameter_find, ...)"),
+  ...deviceAddress,
+  parameter: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Instead of parameter_id: the parameter's name on the device (device_id, or track + device); " +
+        "exact match first, then case-insensitive, then unique substring",
+    ),
+};
+type ParameterAddress = DeviceAddress & { parameter_id?: string; parameter?: string };
+
+// One parameter write: exactly one of value, value_item, reset and delta.
+// Values are internal units: the API has no display values (dB, Hz, ms).
+const parameterWrite = {
+  value: z
+    .number()
+    .optional()
+    .describe("Internal units within [min, max]; a quantized parameter takes its value_items index"),
+  value_item: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Quantized parameters: the choice by value_items name or short name (exact, then " +
+        'case-insensitive, then unique substring), e.g. "Saw"',
+    ),
+  reset: z.boolean().optional().describe("true: set the parameter to its default value"),
+  delta: z
+    .number()
+    .optional()
+    .describe("Add this to the current value, clamped to [min, max] (whole steps for quantized parameters)"),
+};
+type ParameterWrite = { value?: number; value_item?: string; reset?: boolean; delta?: number };
+const parameterName = z
+  .string()
+  .min(1)
+  .describe("Parameter name: exact match first, then case-insensitive, then unique substring");
+// Initial values of a device that is being inserted (track_create, device_insert).
+const initialParameter = z.object({ name: parameterName, ...parameterWrite });
+
 const given = (o: object, keys: readonly string[]) =>
   keys.some((k) => (o as Record<string, unknown>)[k] !== undefined);
 const hasTrackAddress = (a: TrackAddress) => given(a, ["track_id", "track_index", "track_name"]);
@@ -244,6 +322,148 @@ function at<R>(label: string | (() => string) | undefined, fn: () => R): R {
       e.message = `${typeof label === "function" ? label() : label}: ${e.message}`;
     throw e;
   }
+}
+
+// ---------------------------------------------------------------------------
+// device presets: this server's own JSON files in <storageDirectory>/presets
+
+const PRESET_FORMAT = "ableton-live-mcp/device-preset";
+const presetSchema = z.object({
+  format: z.literal(PRESET_FORMAT),
+  version: z.literal(1),
+  name: z.string(),
+  device_name: z.string().min(1),
+  device_class: z.string().optional(),
+  saved_at: z.string().optional(),
+  parameters: z.array(z.object({ name: z.string(), value: z.number() })),
+  sample: z.object({ file_path: z.string().min(1) }).nullable().optional(),
+});
+type Preset = z.infer<typeof presetSchema>;
+
+// A preset name is also its file name, so it must be one safe path component
+// on every OS: letters (with combining marks), digits, spaces and a few
+// punctuation marks, starting with a letter or digit (so never ".", ".." or a
+// hidden file), not ending in a dot (Windows drops those), and not a Windows
+// device name. Path separators, ":" and control characters can never pass.
+const PRESET_NAME = /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _\-.,()'+&#]*$/u;
+const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+
+function presetBaseName(raw: string): string {
+  const name = raw.normalize("NFC").trim();
+  if (!name || name.length > 64) throw new UsageError("Preset names are 1-64 characters long.");
+  if (!PRESET_NAME.test(name) || /[. ]$/.test(name) || WINDOWS_DEVICE_NAME.test(name))
+    throw new UsageError(
+      `Invalid preset name ${JSON.stringify(raw)}: use letters, digits, spaces and - _ . , ( ) ' + & #, ` +
+        "starting with a letter or digit and not ending with a dot.",
+    );
+  return name;
+}
+
+function readPresetFile(file: string): Preset {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile()) throw new Error(`${file} is not a regular file.`);
+  if (stat.size > 4_000_000) throw new Error(`${file} is too large for a preset.`);
+  let data: unknown;
+  try {
+    data = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Error(`${file} is not valid JSON: ${errorMessage(e)}`);
+  }
+  const parsed = presetSchema.safeParse(data);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const where = issue.path.join(".") || "file";
+    throw new Error(`${file} is not a device preset of this server (${where}: ${issue.message}).`);
+  }
+  return parsed.data;
+}
+
+function presetStore(storageDirectory: string | undefined) {
+  if (!storageDirectory)
+    throw new Error("Live provides no storage directory for this extension, so presets cannot be stored.");
+  const dir = path.join(storageDirectory, "presets");
+  // Every path stays a direct child of dir (names are checked, this is the backstop).
+  const inside = (file: string) => {
+    const full = path.resolve(dir, file);
+    if (path.dirname(full) !== path.resolve(dir)) throw new Error(`Refusing a preset path outside ${dir}.`);
+    return full;
+  };
+  // Regular *.json files only: a symlink is never followed out of dir, and
+  // temporary files (dot names) are not presets.
+  const files = (): string[] => {
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw e;
+    }
+    return names
+      .filter((f) => {
+        if (!f.endsWith(".json") || f.startsWith(".")) return false;
+        try {
+          return fs.lstatSync(inside(f)).isFile();
+        } catch {
+          return false;
+        }
+      })
+      .sort();
+  };
+  // The name a file is loaded by: its base name (NFC, as names are compared).
+  const nameOf = (file: string) => path.basename(file, ".json").normalize("NFC");
+  // A name's file: exact first, then case-insensitive (macOS and Windows
+  // file systems treat "Bass" and "bass" as one file anyway).
+  const fileOf = (base: string) => {
+    const all = files();
+    const hit =
+      all.find((f) => nameOf(f) === base) ?? all.find((f) => nameOf(f).toLowerCase() === base.toLowerCase());
+    return hit === undefined ? undefined : inside(hit);
+  };
+  return {
+    dir,
+    find: fileOf,
+    list() {
+      const presets: Array<{ name: string; preset: Preset }> = [];
+      const unreadable: Array<{ file: string; error: string }> = [];
+      for (const f of files()) {
+        try {
+          presets.push({ name: nameOf(f), preset: readPresetFile(inside(f)) });
+        } catch (e) {
+          unreadable.push({ file: f, error: errorMessage(e) });
+        }
+      }
+      return { presets, unreadable };
+    },
+    // Returns the name the preset is stored (and loaded) under.
+    write(base: string, preset: Preset, overwrite: boolean): { name: string; replaced: boolean } {
+      const existing = fileOf(base);
+      if (existing && !overwrite)
+        throw new UsageError(
+          `A preset named ${JSON.stringify(nameOf(existing))} already exists. ` +
+            "Pass overwrite:true to replace it.",
+        );
+      fs.mkdirSync(dir, { recursive: true });
+      // an overwrite keeps the existing file, and so its name's case
+      const name = existing ? nameOf(existing) : base;
+      const data = `${JSON.stringify({ ...preset, name }, null, 2)}\n`;
+      if (!existing) {
+        // "wx": fails instead of replacing a file (or symlink) created meanwhile
+        fs.writeFileSync(inside(`${base}.json`), data, { flag: "wx" });
+        return { name, replaced: false };
+      }
+      // Replace atomically: rename swaps the directory entry, so it never
+      // writes through a symlink.
+      const tmp = inside(`.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+      fs.writeFileSync(tmp, data, { flag: "wx" });
+      try {
+        fs.renameSync(tmp, existing);
+      } catch (e) {
+        fs.rmSync(tmp, { force: true });
+        throw e;
+      }
+      return { name, replaced: true };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +693,431 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     return { mixer, owner };
   }
 
+  // -- devices and parameters by name ----------------------------------------
+
+  const quote = (s: string) => JSON.stringify(s);
+  const describeDevice = (d: Device<"1.0.0">) => `${quote(d.name)} (id ${remember(d)})`;
+  // Chains have no names: drum pads are called by their note, others by index.
+  const chainLabel = (c: Chain<"1.0.0">, i: number) =>
+    c instanceof DrumChain ? `pad ${num(c.receivingNote)}` : `chain ${i}`;
+
+  // A rack's chain by {chain: index} or, in a Drum Rack, {pad: receiving note}.
+  function findChain(rack: RackDevice<"1.0.0">, step: ChainStep) {
+    const chains = rack.chains;
+    if ("chain" in step) {
+      const chain = chains[step.chain];
+      if (!chain)
+        throw new UsageError(
+          `chain ${step.chain} out of range in ${describeDevice(rack)} ` +
+            `(${chains.length ? `0-${chains.length - 1}` : "it has no chains"}).`,
+        );
+      return { chain, label: chainLabel(chain, step.chain) };
+    }
+    if (!(rack instanceof DrumRack))
+      throw new UsageError(`${describeDevice(rack)} is not a Drum Rack: address its chains by {chain: index}.`);
+    const notes = chains.map((c) => (c instanceof DrumChain ? num(c.receivingNote) : undefined));
+    const hits = notes.flatMap((n, i) => (n === step.pad ? [i] : []));
+    if (hits.length === 1) return { chain: chains[hits[0]], label: `pad ${step.pad}` };
+    if (hits.length)
+      throw new UsageError(
+        `Ambiguous pad ${step.pad} in ${describeDevice(rack)}: chains ${hits.join(", ")} all receive ` +
+          `note ${step.pad}. Use {chain: index}.`,
+      );
+    const pads = [...new Set(notes.filter((n): n is number => n !== undefined))].sort((a, b) => a - b);
+    throw new UsageError(
+      `No pad receives note ${step.pad} in ${describeDevice(rack)} (pads: ${pads.join(", ") || "none"}).`,
+    );
+  }
+
+  // A device by device_id, or by its track and `device` (see deviceAddress).
+  // Also returns where it sits: the track (when addressed through one) and
+  // the readable path down to it, e.g. ["Drums", "Drum Rack", "pad 36", "Simpler"].
+  function locateDevice(a: DeviceAddress): {
+    device: Device<"1.0.0">;
+    track?: Track<"1.0.0">;
+    path: string[];
+  } {
+    if (a.device_id !== undefined) {
+      if (a.device !== undefined || hasTrackAddress(a))
+        throw new UsageError("Give device_id, or a track and device, not both.");
+      const device = resolve(a.device_id, Device);
+      return { device, path: [device.name] };
+    }
+    if (a.device === undefined)
+      throw new UsageError("Provide device_id, or a track (track_id, track_index or track_name) and device.");
+    if (!hasTrackAddress(a))
+      throw new UsageError("device needs its track: give track_id, track_index or track_name (or use device_id).");
+    const track = findTrack(a);
+    const steps = Array.isArray(a.device) ? a.device : [a.device];
+    const path = [track.name];
+    let list: Device<"1.0.0">[] | null = track.devices; // what the next name or index picks from
+    let where = `track ${describeTrack(track)}`;
+    let current: Device<"1.0.0"> | null = null;
+    for (const [i, step] of steps.entries()) {
+      const label = Array.isArray(a.device) ? `device[${i}]` : "device";
+      if (typeof step === "object") {
+        if (!current) throw new UsageError(`${label}: a {chain} or {pad} step must follow a rack device.`);
+        const rack = current;
+        if (!(rack instanceof RackDevice))
+          throw new UsageError(
+            `${label}: ${describeDevice(rack)} is not a rack, so the path cannot go into a chain.`,
+          );
+        const { chain, label: name } = at(label, () => findChain(rack, step));
+        path.push(name);
+        list = chain.devices;
+        where = `${name} of ${describeDevice(rack)}`;
+        current = null;
+        continue;
+      }
+      if (!list) {
+        const prev = current!;
+        throw new UsageError(
+          prev instanceof RackDevice
+            ? `${label}: pick a chain of ${describeDevice(prev)} first, with {chain: index} or {pad: note}.`
+            : `${label}: ${describeDevice(prev)} is not a rack, so the path cannot continue.`,
+        );
+      }
+      const devices: Device<"1.0.0">[] = list;
+      if (typeof step === "number") {
+        if (!devices[step])
+          throw new UsageError(
+            `${label}: device index ${step} out of range on ${where} ` +
+              `(${devices.length ? `0-${devices.length - 1}` : "it has no devices"}).`,
+          );
+        current = devices[step];
+      } else {
+        const indexed = devices.map((device, index) => ({ device, index }));
+        const describe = (x: (typeof indexed)[number]) =>
+          `${quote(x.device.name)} (index ${x.index}, id ${remember(x.device)})`;
+        current = at(`${label} on ${where}`, () =>
+          byName("device", step, indexed, (x) => x.device.name, describe, {
+            hint: "Use the device index or device_id.",
+          }),
+        ).device;
+      }
+      path.push(current.name);
+      list = null;
+    }
+    if (!current)
+      throw new UsageError("device: the path ends at a chain; add the device in it (a name or index).");
+    return { device: current, track, path };
+  }
+  const findDevice = (a: DeviceAddress) => locateDevice(a).device;
+
+  // Name matching for parameters and value items: exact, then case-insensitive,
+  // then case-insensitive substring. The first tier with a hit decides; more
+  // than one hit there is ambiguous.
+  function tieredMatch<T>(all: T[], namesOf: (x: T) => string[], query: string): T[] {
+    const lower = query.toLowerCase();
+    const tiers: Array<(n: string) => boolean> = [
+      (n) => n === query,
+      (n) => n.toLowerCase() === lower,
+      (n) => n.toLowerCase().includes(lower),
+    ];
+    for (const test of tiers) {
+      const hits = all.filter((x) => namesOf(x).some(test));
+      if (hits.length) return hits;
+    }
+    return [];
+  }
+
+  // A device's parameter by name (tieredMatch). Live devices can repeat a
+  // name: that is ambiguous, and the candidates' ids are listed.
+  function findParameter(device: Device<"1.0.0">, name: string): DeviceParameter<"1.0.0"> {
+    const params = device.parameters.map((p, index) => ({ p, index, name: p.name }));
+    const hits = tieredMatch(params, (x) => [x.name], name);
+    if (hits.length === 1) return hits[0].p;
+    if (!hits.length)
+      throw new UsageError(
+        `No parameter named ${quote(name)} (or containing it) on ${describeDevice(device)}. ` +
+          "Find names with parameter_find or device_get {parameter_filter}.",
+      );
+    const shown = hits.slice(0, 20).map((x) => `${quote(x.name)} (index ${x.index}, id ${remember(x.p)})`);
+    const more = hits.length > 20 ? `, ... (${hits.length - 20} more)` : "";
+    throw new UsageError(
+      `Ambiguous parameter ${quote(name)} on ${describeDevice(device)}: it matches ` +
+        `${shown.join(", ")}${more}. Use the exact name or the parameter_id.`,
+    );
+  }
+
+  // A quantized parameter's value_items index, by item name or short name.
+  function valueItemIndex(param: DeviceParameter<"1.0.0">, item: string): number {
+    const items = param.valueItems.map((v, index) => ({
+      index,
+      label: `${quote(v.name)} (${index})`,
+      names: [v.name, v.shortName].filter((n): n is string => typeof n === "string"),
+    }));
+    const hits = tieredMatch(items, (x) => x.names, item);
+    if (hits.length === 1) return hits[0].index;
+    const list = (xs: typeof items) => xs.map((x) => x.label).join(", ");
+    throw new UsageError(
+      hits.length
+        ? `Ambiguous value_item ${quote(item)} for ${quote(param.name)}: it matches ${list(hits)}.`
+        : `No value item ${quote(item)} for ${quote(param.name)}. Items: ${list(items) || "none"}.`,
+    );
+  }
+
+  const WRITE_KINDS = ["value", "value_item", "reset", "delta"] as const;
+  function writeKind(w: ParameterWrite): (typeof WRITE_KINDS)[number] {
+    const kinds = WRITE_KINDS.filter((k) => (k === "reset" ? w.reset === true : w[k] !== undefined));
+    if (kinds.length === 1) return kinds[0];
+    throw new UsageError(
+      kinds.length
+        ? `give only one of value, value_item, reset and delta, got ${kinds.join(" + ")}.`
+        : "give one of value, value_item, reset (true) or delta.",
+    );
+  }
+
+  // A validated write. `target` maps the current value (read only when
+  // `relative`, i.e. for delta) to the value to set.
+  type PlannedWrite = {
+    param: DeviceParameter<"1.0.0">;
+    relative: boolean;
+    target: (current: number) => number;
+  };
+
+  function planWrite(param: DeviceParameter<"1.0.0">, w: ParameterWrite): PlannedWrite {
+    const kind = writeKind(w);
+    const min = num(param.min);
+    const max = num(param.max);
+    const quantized = param.isQuantized;
+    const name = quote(param.name);
+    const fixed = (v: number, what: string): PlannedWrite => {
+      // tolerate float noise at the edges, then send an in-range value
+      const slack = 1e-9 * Math.max(1, Math.abs(max - min));
+      if (!(v >= min - slack && v <= max + slack))
+        throw new UsageError(`${what} ${v} is out of range for ${name} (${min} to ${max}).`);
+      if (quantized && !Number.isInteger(v))
+        throw new UsageError(
+          `${name} is quantized: give a whole value_items index or a value_item, not ${v}.`,
+        );
+      const value = Math.min(max, Math.max(min, v));
+      return { param, relative: false, target: () => value };
+    };
+    switch (kind) {
+      case "value":
+        return fixed(w.value!, "value");
+      case "value_item":
+        if (!quantized)
+          throw new UsageError(
+            `${name} is not quantized: give a value from ${min} to ${max}, not a value_item.`,
+          );
+        return fixed(valueItemIndex(param, w.value_item!), "value_items index");
+      case "reset": {
+        const value = num(param.defaultValue);
+        return { param, relative: false, target: () => value };
+      }
+      case "delta": {
+        const delta = w.delta!;
+        if (quantized && !Number.isInteger(delta))
+          throw new UsageError(
+            `${name} is quantized: delta must be a whole number of steps, not ${delta}.`,
+          );
+        return { param, relative: true, target: (current) => Math.min(max, Math.max(min, current + delta)) };
+      }
+    }
+  }
+
+  // Applies validated writes as one undo step. The current values a delta
+  // needs are read first: the transaction callback must be synchronous, so
+  // it only starts the setValue calls. labels[i] names entry i in errors.
+  // Returns the values written.
+  async function applyWrites(
+    plan: PlannedWrite[],
+    labels: Array<string | undefined> = [],
+  ): Promise<number[]> {
+    plan.forEach((w, i) => {
+      const first = plan.findIndex((o) => o.param.handle.id === w.param.handle.id);
+      if (first !== i)
+        throw new UsageError(
+          `${labels[i] ? `${labels[i]}: ` : ""}parameter ${quote(w.param.name)} (id ${remember(w.param)}) ` +
+            `is set twice${labels[first] ? `, also by ${labels[first]}` : ""}.`,
+        );
+    });
+    const current = await Promise.all(plan.map((w) => (w.relative ? w.param.getValue().then(num) : 0)));
+    const values = plan.map((w, i) => w.target(current[i]));
+    if (plan.length)
+      await context.withinTransaction(() =>
+        Promise.all(
+          plan.map((w, i) =>
+            w.param.setValue(values[i]).catch((e: unknown) => {
+              const where = labels[i] ? `${labels[i]}: ` : "";
+              throw new Error(`${where}could not set ${quote(w.param.name)} to ${values[i]}: ${errorMessage(e)}`);
+            }),
+          ),
+        ),
+      );
+    return values;
+  }
+
+  // parameter_get / parameter_set entries: parameter_id, or device + name.
+  function findParameterEntry(a: ParameterAddress) {
+    if (a.parameter_id !== undefined) {
+      if (a.parameter !== undefined || given(a, ["device_id", "device"]) || hasTrackAddress(a))
+        throw new UsageError("give parameter_id, or a device and parameter, not both.");
+      return { param: resolve(a.parameter_id, DeviceParameter), device: undefined };
+    }
+    if (a.parameter === undefined)
+      throw new UsageError("give parameter_id, or parameter with device_id or a track and device.");
+    const device = findDevice(a);
+    return { param: findParameter(device, a.parameter), device };
+  }
+  // parameter_get / parameter_set results: entries found by device name their device.
+  const withValue = async ({ param, device }: { param: DeviceParameter<"1.0.0">; device?: Device<"1.0.0"> }) => ({
+    ...(await parameterWithValue(param)),
+    ...(device ? { device_id: remember(device), device_name: device.name } : {}),
+  });
+
+  // Initial values for a device that was just inserted: every name first,
+  // then the values as one undo step. The device already exists, so a failure
+  // (which sets none of them) is returned instead of thrown.
+  async function setInitialParameters(
+    device: Device<"1.0.0">,
+    parameters: Array<{ name: string } & ParameterWrite>,
+  ): Promise<{ parameters?: Array<{ id: string; name: string; value: number }>; error?: string }> {
+    try {
+      const plan = parameters.map((p) => planWrite(findParameter(device, p.name), p));
+      const values = await applyWrites(plan);
+      return {
+        parameters: plan.map((w, i) => ({ id: remember(w.param), name: w.param.name, value: values[i] })),
+      };
+    } catch (e) {
+      return { error: `parameters: ${errorMessage(e)}` };
+    }
+  }
+
+  // The parameter that switches a device on and off. "Device On" is Live's
+  // naming convention, not an SDK field: without it, a first parameter that is
+  // a two-state switch is used instead (`fallback`). On and off are its
+  // "On"/"Off" items when it has both, else its max and min.
+  function onOffParameter(device: Device<"1.0.0">) {
+    const params = device.parameters;
+    let param = params.find((p) => p.name === "Device On");
+    const fallback = !param;
+    if (!param && params[0]?.isQuantized && params[0].valueItems.length === 2) param = params[0];
+    if (!param)
+      throw new UsageError(
+        `${describeDevice(device)} has no "Device On" parameter (and its first parameter is not a ` +
+          "two-state switch), so it cannot be switched on or off.",
+      );
+    const items = param.isQuantized ? param.valueItems.map((v) => v.name.toLowerCase()) : [];
+    const [on, off] = [items.indexOf("on"), items.indexOf("off")];
+    const named = on >= 0 && off >= 0;
+    return { param, fallback, on: named ? on : num(param.max), off: named ? off : num(param.min) };
+  }
+
+  // Parameter values by name, as device_copy and the presets carry them.
+  type SavedValue = { name: string; value: number };
+  async function readValues(device: Device<"1.0.0">): Promise<SavedValue[]> {
+    const params = device.parameters;
+    const values = await Promise.all(params.map((p) => p.getValue()));
+    return params.map((p, i) => ({ name: p.name, value: num(values[i]) }));
+  }
+
+  // Writes saved values onto a device by exact name, as one undo step. The
+  // k-th value of a name goes to the device's k-th parameter of that name, so
+  // repeated names line up. Values the device already has are not written.
+  // Lenient: what cannot be applied is listed in `skipped`, never thrown.
+  async function applySavedValues(device: Device<"1.0.0">, saved: SavedValue[]) {
+    const byParamName = new Map<string, DeviceParameter<"1.0.0">[]>();
+    for (const p of device.parameters) byParamName.set(p.name, [...(byParamName.get(p.name) ?? []), p]);
+    const seen = new Map<string, number>();
+    const skipped: Array<{ name: string; reason: string }> = [];
+    const writes: Array<{ param: DeviceParameter<"1.0.0">; value: number }> = [];
+    for (const { name, value } of saved) {
+      const k = seen.get(name) ?? 0;
+      seen.set(name, k + 1);
+      const param = byParamName.get(name)?.[k];
+      if (!param) {
+        const reason = k
+          ? `${describeDevice(device)} has only ${k} parameter${k > 1 ? "s" : ""} of that name`
+          : `${describeDevice(device)} has no parameter of that name`;
+        skipped.push({ name, reason });
+        continue;
+      }
+      try {
+        writes.push({ param, value: planWrite(param, { value }).target(value) });
+      } catch (e) {
+        skipped.push({ name, reason: errorMessage(e) });
+      }
+    }
+    const current = await Promise.all(writes.map((w) => w.param.getValue().then(num)));
+    const changed = writes.filter((w, i) => current[i] !== w.value);
+    const settled = changed.length
+      ? await context.withinTransaction(() =>
+          Promise.allSettled(changed.map((w) => w.param.setValue(w.value))),
+        )
+      : [];
+    let refused = 0;
+    settled.forEach((r, i) => {
+      if (r.status === "fulfilled") return;
+      refused++;
+      const { param, value } = changed[i];
+      skipped.push({ name: param.name, reason: `Live refused ${value}: ${errorMessage(r.reason)}` });
+    });
+    return { applied: writes.length - refused, skipped };
+  }
+
+  // Racks rebuild nothing by name: their chains and devices are not parameters.
+  function rejectRack(device: Device<"1.0.0">, what: string) {
+    if (device instanceof RackDevice)
+      throw new UsageError(
+        `${describeDevice(device)} is a rack: its chains and their devices are not parameters, so ` +
+          `it cannot be ${what}. device_duplicate copies a rack in place.`,
+      );
+  }
+
+  // Inserts a built-in device for device_copy / device_preset_load.
+  type DeviceHolder = Track<"1.0.0"> | Chain<"1.0.0">;
+  async function insertBuiltIn(target: DeviceHolder, name: string, index: number, renamedHint: boolean) {
+    try {
+      return await target.insertDevice(name, index);
+    } catch (e) {
+      const hint = renamedHint ? " If the device was renamed in Live, pass its built-in name as device_name." : "";
+      throw new Error(`Could not insert ${quote(name)}: ${errorMessage(e)}${hint} Nothing was changed.`);
+    }
+  }
+
+  // Undoes insertBuiltIn after a later step failed, then reports that failure.
+  async function removeInserted(target: DeviceHolder, device: Device<"1.0.0">, why: string): Promise<never> {
+    try {
+      await target.deleteDevice(device);
+    } catch (e) {
+      throw new Error(`${why} The new device ${remember(device)} could not be removed again: ${errorMessage(e)}.`);
+    }
+    throw new Error(`${why} The new device was removed again; nothing else was changed.`);
+  }
+
+  // device_copy / device_preset_load: a Simpler's sample first (loading one
+  // may reset sample-dependent parameters), then the values. A sample that
+  // cannot be loaded fails the call; a device inserted for it is removed again.
+  async function restoreDevice(
+    device: Device<"1.0.0">,
+    saved: SavedValue[],
+    samplePath: string | undefined,
+    insertedInto?: DeviceHolder,
+  ) {
+    const skipped: Array<{ name: string; reason: string }> = [];
+    let sample: { file_path: string } | undefined;
+    if (samplePath !== undefined) {
+      if (!(device instanceof Simpler)) {
+        skipped.push({ name: "sample", reason: `${describeDevice(device)} is not a Simpler` });
+      } else {
+        try {
+          sample = { file_path: (await device.replaceSample(samplePath)).filePath };
+        } catch (e) {
+          const why = `Could not load the sample ${samplePath}: ${errorMessage(e)}.`;
+          if (insertedInto) await removeInserted(insertedInto, device, why);
+          throw new Error(`${why} Nothing was changed.`);
+        }
+      }
+    }
+    const values = await applySavedValues(device, saved);
+    return { sample, applied: values.applied, skipped: [...skipped, ...values.skipped] };
+  }
+
+  const presets = () => presetStore(context.environment.storageDirectory);
+
   // -- tracks ----------------------------------------------------------------
 
   async function mixerDetail(mixer: TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">) {
@@ -480,7 +1125,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     const [volume, panning, sends] = await Promise.all([
       parameterWithValue(mixer.volume),
       parameterWithValue(mixer.panning),
-      Promise.all(mixer.sends.map(parameterWithValue)),
+      Promise.all(mixer.sends.map((p) => parameterWithValue(p))),
     ]);
     return {
       id: remember(mixer),
@@ -570,17 +1215,13 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  // A device parameter by name: exact first, then case-insensitive.
-  function parameterByName(device: Device<"1.0.0">, name: string) {
-    return byName("parameter", name, device.parameters, (p) => p.name, (p) => JSON.stringify(p.name));
-  }
-
   tool(
     "track_create",
     { title: "Create track", annotations: CREATE },
     "Create a new audio or MIDI track, optionally named and with built-in devices " +
-      "inserted in order (each a name, or {name, parameters:[{name, value}]} to set " +
-      "initial parameter values in internal units). The track is inserted after " +
+      "inserted in order (each a name, or {name, parameters:[{name, value | " +
+      "value_item | reset | delta}]} to set initial parameter values: internal " +
+      "units, or a quantized parameter's choice by name). The track is inserted after " +
       "the last selected track in Live, or appended if none is selected, so the " +
       "result carries its `index`. Once the track exists, a failing name or device " +
       "does not fail the call: it is reported in `errors` (and on its `devices` " +
@@ -594,14 +1235,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
             z.string().min(1).describe("Built-in device name, e.g. 'Operator', 'Reverb'"),
             z.object({
               name: z.string().min(1).describe("Built-in device name"),
-              parameters: z
-                .array(
-                  z.object({
-                    name: z.string().describe("Parameter name, exact match first, then case-insensitive"),
-                    value: z.number().describe("Internal units; quantized parameters take a value_items index"),
-                  }),
-                )
-                .optional(),
+              parameters: z.array(initialParameter).optional(),
             }),
           ]),
         )
@@ -609,6 +1243,10 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         .describe("Devices to insert, in chain order"),
     },
     async ({ type, name, devices }) => {
+      // Each initial value gives exactly one kind of write: checked before the track exists.
+      for (const [i, spec] of (devices ?? []).entries())
+        if (typeof spec !== "string")
+          spec.parameters?.forEach((p, k) => at(`devices[${i}].parameters[${k}]`, () => writeKind(p)));
       const track =
         type === "audio" ? await song().createAudioTrack() : await song().createMidiTrack();
       // From here on the track exists: report failures instead of throwing.
@@ -635,21 +1273,11 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         }
         const entry: Record<string, unknown> = { requested: deviceName, ...deviceSummary(device) };
         if (parameters?.length) {
-          try {
-            // all names first, then one undo step for the values
-            const values = parameters.map((p) => ({ param: parameterByName(device, p.name), value: p.value }));
-            await context.withinTransaction(() =>
-              Promise.all(values.map(({ param, value }) => param.setValue(value))),
-            );
-            entry.parameters = values.map(({ param, value }) => ({
-              id: remember(param),
-              name: param.name,
-              value,
-            }));
-          } catch (e) {
-            const msg = `parameters: ${errorMessage(e)}`;
-            errors.push(`devices[${i}] (${deviceName}): ${msg}`);
-            entry.error = msg;
+          const result = await setInitialParameters(device, parameters);
+          entry.parameters = result.parameters;
+          if (result.error) {
+            errors.push(`devices[${i}] (${deviceName}): ${result.error}`);
+            entry.error = result.error;
           }
         }
         inserted.push(entry);
@@ -1500,19 +2128,207 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "Eight', 'Compressor', 'Simpler', 'Drum Rack', 'Operator', 'Wavetable') into " +
       "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
       "0-based position in the device chain; omitted = append at the end. The " +
-      "target is a Track or Chain id, or a track given by track_id/track_index/track_name.",
+      "target is a Track or Chain id, or a track given by track_id/track_index/track_name. " +
+      "`parameters` sets initial values right after the insert, in one undo step " +
+      "(each {name, value | value_item | reset | delta}, as in device_set); if one " +
+      "cannot be set, none are, and the device is still inserted with `errors` saying why.",
     {
       target_id: z.string().optional().describe("Track or Chain id"),
       ...trackAddress,
       device_name: z.string(),
       index: z.number().int().min(0).optional(),
+      parameters: z.array(initialParameter).min(1).optional().describe("Initial parameter values"),
     },
-    async ({ device_name, index, ...address }) => {
+    async ({ device_name, index, parameters, ...address }) => {
+      parameters?.forEach((p, i) => at(`parameters[${i}]`, () => writeKind(p)));
       const target = findTarget(address);
       if (!(target instanceof Track) && !(target instanceof Chain))
         throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
       const device = await target.insertDevice(device_name, index ?? target.devices.length);
-      return deviceSummary(device);
+      if (!parameters) return deviceSummary(device);
+      // The device exists now: a failing value is reported, not thrown.
+      const result = await setInitialParameters(device, parameters);
+      return {
+        ...deviceSummary(device),
+        parameters: result.parameters,
+        errors: result.error ? [result.error] : undefined,
+      };
+    },
+  );
+
+  tool(
+    "device_set",
+    { title: "Set device", annotations: SET },
+    "Switch a device on or off and/or set several of its parameters, in one call and " +
+      "one undo step (nothing is changed if any entry is invalid). Address the device " +
+      "by device_id, or by its track (track_id/track_index/track_name) and `device`: a " +
+      'name, an index, or a path into racks such as ["Drum Rack", {"pad": 36}, ' +
+      '"Simpler"]. `enabled` sets the device\'s "Device On" parameter — a Live naming ' +
+      "convention, not an API field: a device without one falls back to its first " +
+      "parameter if that is a two-state switch, and `on_parameter` reports which " +
+      "parameter was used (`fallback: true`). Each `parameters` entry names the " +
+      "parameter (name: exact, then case-insensitive, then unique substring; or " +
+      "parameter_id) and gives one of value (internal units), value_item (a " +
+      'quantized parameter\'s choice by name, e.g. "Saw"), reset:true (the default) or ' +
+      "delta (added to the current value, clamped).",
+    {
+      ...deviceAddress,
+      enabled: z.boolean().optional().describe("true = on, false = off (bypassed)"),
+      parameters: z
+        .array(
+          z.object({
+            name: parameterName.optional(),
+            parameter_id: z.string().optional().describe("Instead of name: the parameter's id"),
+            ...parameterWrite,
+          }),
+        )
+        .min(1)
+        .optional(),
+    },
+    async ({ enabled, parameters, ...address }) => {
+      if (enabled === undefined && !parameters)
+        throw new UsageError("Nothing to set — give enabled and/or parameters.");
+      const device = findDevice(address);
+      // Validate everything before the first write.
+      const onOff = enabled !== undefined ? onOffParameter(device) : undefined;
+      const plan: PlannedWrite[] = [];
+      const labels: string[] = [];
+      if (onOff) {
+        plan.push(planWrite(onOff.param, { value: enabled ? onOff.on : onOff.off }));
+        labels.push("enabled");
+      }
+      const own = new Set(device.parameters.map((p) => p.handle.id));
+      (parameters ?? []).forEach((p, i) =>
+        at(`parameters[${i}]`, () => {
+          if ((p.name === undefined) === (p.parameter_id === undefined))
+            throw new UsageError("give exactly one of name and parameter_id.");
+          const param =
+            p.parameter_id !== undefined
+              ? resolve(p.parameter_id, DeviceParameter)
+              : findParameter(device, p.name!);
+          if (!own.has(param.handle.id))
+            throw new UsageError(`parameter ${p.parameter_id} is not a parameter of ${describeDevice(device)}.`);
+          plan.push(planWrite(param, p));
+          labels.push(`parameters[${i}]`);
+        }),
+      );
+      await applyWrites(plan, labels);
+      // Report the on-state even when only parameters were set, if the device has one.
+      let state = onOff;
+      if (!state)
+        try {
+          state = onOffParameter(device);
+        } catch {
+          // no on/off switch: leave `enabled` out
+        }
+      const [values, onValue] = await Promise.all([
+        Promise.all(plan.filter((w) => w.param !== onOff?.param).map((w) => parameterWithValue(w.param))),
+        state ? state.param.getValue().then(num) : undefined,
+      ]);
+      return {
+        ...deviceSummary(device),
+        enabled: state ? onValue !== state.off : undefined,
+        on_parameter: state
+          ? { id: remember(state.param), name: state.param.name, fallback: state.fallback || undefined }
+          : undefined,
+        parameters: parameters ? values : undefined,
+      };
+    },
+  );
+
+  tool(
+    "parameter_find",
+    { title: "Find parameters", annotations: READ },
+    "Find device parameters by name without walking device_get: in the whole Live Set " +
+      "(every regular, return and main track), on one track (track_id/track_index/" +
+      "track_name), or in one device (device_id, or track + device); racks are searched " +
+      "through all their chains. `query` is a case-insensitive substring of the " +
+      "parameter name (omit it to list everything in scope); `value_item` keeps only " +
+      'quantized parameters with a matching choice (e.g. "saw"). Each match carries its ' +
+      "id (for parameter_set, parameter_get, device_set), its device's id and name, the " +
+      'track, and a readable path such as "Drums > Drum Rack > pad 36 > Simpler". ' +
+      "include_values adds current values (internal units). At most `limit` matches " +
+      "are returned; `total` counts them all.",
+    {
+      query: z.string().optional().describe("Case-insensitive substring of the parameter name"),
+      value_item: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Only quantized parameters with a value item whose name or short name contains this"),
+      ...deviceAddress,
+      include_values: z.boolean().default(false),
+      include_value_items: z.boolean().default(true),
+      limit: z.number().int().min(1).max(500).default(50),
+    },
+    async ({ query, value_item, include_values, include_value_items, limit, ...address }) => {
+      type Root = { devices: Device<"1.0.0">[]; track?: Track<"1.0.0">; prefix: string[] };
+      let roots: Root[];
+      if (address.device_id !== undefined || address.device !== undefined) {
+        const { device, track, path } = locateDevice(address);
+        roots = [{ devices: [device], track, prefix: path.slice(0, -1) }];
+      } else if (hasTrackAddress(address)) {
+        const track = findTrack(address);
+        roots = [{ devices: track.devices, track, prefix: [track.name] }];
+      } else {
+        const s = song();
+        roots = [...s.tracks, ...s.returnTracks, s.mainTrack].map((track) => ({
+          devices: track.devices,
+          track,
+          prefix: [track.name],
+        }));
+      }
+      const q = query?.toLowerCase();
+      const item = value_item?.toLowerCase();
+      const wanted = (p: DeviceParameter<"1.0.0">) =>
+        (q === undefined || p.name.toLowerCase().includes(q)) &&
+        (item === undefined ||
+          (p.isQuantized &&
+            p.valueItems.some((v) => [v.name, v.shortName].some((n) => n?.toLowerCase().includes(item)))));
+      const MAX_DEVICES = 1000;
+      type Match = { param: DeviceParameter<"1.0.0">; device: Device<"1.0.0">; root: Root; path: string[] };
+      const found: Match[] = [];
+      let total = 0;
+      let searched = 0;
+      let stopped = false;
+      const walk = (devices: Device<"1.0.0">[], root: Root, prefix: string[], depth: number) => {
+        for (const device of devices) {
+          if (searched >= MAX_DEVICES) {
+            stopped = true;
+            return;
+          }
+          searched++;
+          const path = [...prefix, device.name];
+          for (const param of device.parameters) {
+            if (!wanted(param)) continue;
+            total++;
+            if (found.length < limit) found.push({ param, device, root, path });
+          }
+          if (device instanceof RackDevice && depth < 8)
+            device.chains.forEach((c, i) => walk(c.devices, root, [...path, chainLabel(c, i)], depth + 1));
+        }
+      };
+      for (const root of roots) walk(root.devices, root, root.prefix, 0);
+      const matches = await Promise.all(
+        found.map(async ({ param, device, root, path }) => ({
+          ...(include_values
+            ? await parameterWithValue(param, include_value_items)
+            : parameterSummary(param, include_value_items)),
+          device_id: remember(device),
+          device_name: device.name,
+          track_id: root.track ? remember(root.track) : undefined,
+          track_name: root.track?.name,
+          path: path.join(" > "),
+        })),
+      );
+      return {
+        matches,
+        total,
+        truncated: total > matches.length,
+        devices_searched: searched,
+        // the search stopped early: total counts only what was searched
+        device_limit_reached: stopped || undefined,
+      };
     },
   );
 
@@ -1544,6 +2360,289 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       if (parent instanceof Track || parent instanceof Chain)
         return deviceSummary(await parent.duplicateDevice(device));
       throw new Error(`Cannot duplicate device with parent ${parent ? classOf(parent) : "null"}.`);
+    },
+  );
+
+  // What a rebuilt device (device_copy, device_preset_load) does not carry over.
+  const LOST =
+    "automation, modulation and MIDI/macro mappings, a custom device name, and any device " +
+    "state that is not a parameter";
+
+  tool(
+    "device_copy",
+    { title: "Copy or move device", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Copy a device to a track or rack chain, or to another position in its own chain; " +
+      "with move:true the original is deleted afterwards, which is how a device is moved " +
+      "or reordered (Live's API has no device move, reorder or copy). LOSSY: a fresh " +
+      "built-in device is inserted at the target and the parameter values are copied by " +
+      `name (a Simpler also gets its sample); ${LOST} are lost, and the copy has a new ` +
+      "id (after a move the old id is gone). Racks cannot be copied this way: " +
+      "device_duplicate copies one in place. Target: target_id (Track or Chain id) or " +
+      "track_id/track_index/track_name; omitted = the device's own track or chain. " +
+      "`index` counts the target's current devices, before a move removes the original " +
+      "(omitted = append). `device_name` is the built-in device to insert when the " +
+      "device was renamed in Live (default: its name). Live allows one instrument per " +
+      "track or chain, so an instrument cannot be copied next to another one. Undo " +
+      "steps: insert, sample, values, delete. If the copy cannot be inserted or its " +
+      "sample cannot be loaded, nothing is changed; values that cannot be copied are " +
+      "listed in `not_copied`, and then a move keeps the original.",
+    {
+      device_id: z.string().describe("The device to copy or move"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("Track or Chain id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress,
+      index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("0-based position among the target's current devices; omitted = append"),
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Built-in device to insert; default: the device's name"),
+      move: z.boolean().default(false).describe("Delete the original once everything was copied"),
+    },
+    async ({ device_id, index, device_name, move, ...address }) => {
+      const source = resolve(device_id, Device);
+      rejectRack(source, "copied by name");
+      const from = source.parent;
+      const target =
+        address.target_id !== undefined || hasTrackAddress(address) ? findTarget(address) : from;
+      if (!(target instanceof Track) && !(target instanceof Chain))
+        throw new UsageError(
+          `Devices can be copied into a Track or Chain, got ${target ? classOf(target) : "none"}.`,
+        );
+      if (move && !(from instanceof Track) && !(from instanceof Chain))
+        throw new Error(`Cannot move a device whose parent is ${from ? classOf(from) : "null"}.`);
+      const count = target.devices.length;
+      if (index !== undefined && index > count)
+        throw new UsageError(`index ${index} out of range (0-${count}, or omit it to append).`);
+      const insertAt = index ?? count;
+      const position =
+        from && from.handle.id === target.handle.id
+          ? target.devices.findIndex((d) => d.handle.id === source.handle.id)
+          : -1;
+      // Moving a device onto its own position would only lose state.
+      if (move && position >= 0 && (insertAt === position || insertAt === position + 1))
+        return {
+          ...deviceSummary(source),
+          index: position,
+          source_id: device_id,
+          moved: false,
+          unchanged: "the device is already at that position",
+        };
+
+      // Read everything from the original before the first write.
+      const saved = await readValues(source);
+      const samplePath = (source instanceof Simpler && source.sample?.filePath) || undefined;
+      const copy = await insertBuiltIn(target, device_name ?? source.name, insertAt, device_name === undefined);
+      const { sample, applied, skipped: notCopied } = await restoreDevice(copy, saved, samplePath, target);
+      let moved = false;
+      let error: string | undefined;
+      let kept: string | undefined;
+      if (move) {
+        if (notCopied.length) {
+          kept = "the copy is incomplete (see not_copied), so the original was kept";
+        } else {
+          try {
+            await (from as DeviceHolder).deleteDevice(source);
+            moved = true;
+          } catch (e) {
+            error = `copied, but the original ${device_id} could not be deleted: ${errorMessage(e)}`;
+          }
+        }
+      }
+      return {
+        ...deviceSummary(copy),
+        index: target.devices.findIndex((d) => d.handle.id === copy.handle.id),
+        source_id: device_id,
+        moved,
+        fidelity: "approximate",
+        lost: LOST,
+        copied_parameters: applied,
+        not_copied: notCopied.length ? notCopied : undefined,
+        sample,
+        original_kept: kept,
+        error,
+      };
+    },
+  );
+
+  // -- device presets (JSON files of this server, not Live presets) ----------
+
+  tool(
+    "device_preset_save",
+    { title: "Save device preset", annotations: DESTRUCTIVE },
+    "Save a device's parameter values (and a Simpler's sample path) as a named preset " +
+      "of this server: a JSON file in the extension's storage directory " +
+      "(presets/<name>.json). It is not a Live preset (.adv): Live's API cannot read or " +
+      "write those. Address the device by device_id, or track + device as in " +
+      "device_set. Racks cannot be saved. `device_name` records the built-in device a " +
+      "load inserts (default: the device's name; pass it if the device was renamed in " +
+      "Live). The sample is referenced by its path, not copied. An existing preset of " +
+      "the same name (case-insensitive) is only replaced with overwrite:true. Names are " +
+      "1-64 letters, digits, spaces and - _ . , ( ) ' + & #, starting with a letter or digit.",
+    {
+      name: z.string().describe("Preset name"),
+      ...deviceAddress,
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Built-in device a load inserts; default: the device's name"),
+      overwrite: z.boolean().default(false).describe("Replace an existing preset of the same name"),
+    },
+    async ({ name, device_name, overwrite, ...address }) => {
+      const base = presetBaseName(name);
+      const device = findDevice(address);
+      rejectRack(device, "saved as a preset");
+      const store = presets();
+      const samplePath = (device instanceof Simpler && device.sample?.filePath) || undefined;
+      const preset: Preset = {
+        format: PRESET_FORMAT,
+        version: 1,
+        name: base,
+        device_name: device_name ?? device.name,
+        device_class: classOf(device),
+        saved_at: new Date().toISOString(),
+        parameters: await readValues(device),
+        sample: samplePath ? { file_path: samplePath } : undefined,
+      };
+      const { name: stored, replaced } = store.write(base, preset, overwrite);
+      return {
+        name: stored,
+        device_name: preset.device_name,
+        parameter_count: preset.parameters.length,
+        sample: preset.sample,
+        replaced,
+        directory: store.dir,
+      };
+    },
+  );
+
+  tool(
+    "device_preset_list",
+    { title: "List device presets", annotations: READ },
+    "List the presets saved with device_preset_save: name, the built-in device they " +
+      "insert, parameter count, sample, and when they were saved. Files in the presets " +
+      "directory that are not valid presets are listed under `unreadable`.",
+    {
+      device_name: z.string().optional().describe("Only presets for this built-in device (case-insensitive)"),
+    },
+    ({ device_name }) => {
+      const store = presets();
+      const all = store.list();
+      const want = device_name?.toLowerCase();
+      return {
+        directory: store.dir,
+        presets: all.presets
+          .filter(({ preset }) => want === undefined || preset.device_name.toLowerCase() === want)
+          .map(({ name, preset }) => ({
+            name,
+            device_name: preset.device_name,
+            parameter_count: preset.parameters.length,
+            sample: preset.sample ?? undefined,
+            saved_at: preset.saved_at,
+          })),
+        unreadable: all.unreadable.length ? all.unreadable : undefined,
+      };
+    },
+  );
+
+  tool(
+    "device_preset_load",
+    { title: "Load device preset", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Load a preset saved with device_preset_save. Onto an existing device (device_id, " +
+      "or track + device as in device_set): its parameters are set by name in one undo " +
+      "step, and a Simpler also loads the preset's sample in place of its own. Or as a " +
+      "new device: give the target instead (target_id: Track or Chain id, or " +
+      "track_id/track_index/track_name without `device`) and optionally `index`; the " +
+      "preset's built-in device (or `device_name`) is inserted there first. Values the " +
+      "device has no parameter for, or that Live refuses, are listed in `not_applied`. " +
+      `A preset holds parameter values only: ${LOST} are not part of it.`,
+    {
+      name: z.string().describe("Preset name (case-insensitive)"),
+      ...deviceAddress,
+      target_id: z
+        .string()
+        .optional()
+        .describe("Insert a new device into this Track or Chain instead of loading onto an existing one"),
+      index: z.number().int().min(0).optional().describe("New device only: 0-based position; omitted = append"),
+      device_name: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("New device only: the built-in device to insert instead of the preset's"),
+    },
+    async ({ name, index, device_name, ...address }) => {
+      const base = presetBaseName(name);
+      const onto = address.device_id !== undefined || address.device !== undefined;
+      if (onto && address.target_id !== undefined)
+        throw new UsageError("Give a device to load onto, or target_id to insert a new one, not both.");
+      if (onto && (index !== undefined || device_name !== undefined))
+        throw new UsageError("index and device_name only apply when inserting a new device.");
+      if (!onto && address.target_id === undefined && !hasTrackAddress(address))
+        throw new UsageError(
+          "Give the device to load onto (device_id, or a track and device), or where to insert " +
+            "a new one (target_id, or track_id/track_index/track_name).",
+        );
+      const store = presets();
+      const file = store.find(base);
+      if (!file) {
+        const names = store.list().presets.map((p) => quote(p.name));
+        throw new UsageError(`No preset named ${quote(base)}. Saved presets: ${names.join(", ") || "none"}.`);
+      }
+      const presetName = path.basename(file, ".json");
+      let preset: Preset;
+      try {
+        preset = readPresetFile(file);
+      } catch (e) {
+        // the file is broken, not the Live Set: no stale-id hint
+        throw new UsageError(`Preset ${quote(presetName)} cannot be loaded: ${errorMessage(e)}`);
+      }
+
+      // Validate the destination before the first write.
+      let device: Device<"1.0.0">;
+      let inserted: { target: DeviceHolder } | undefined;
+      if (onto) {
+        device = findDevice(address);
+        rejectRack(device, "loaded from a preset");
+      } else {
+        const target = findTarget(address);
+        if (!(target instanceof Track) && !(target instanceof Chain))
+          throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
+        const count = target.devices.length;
+        if (index !== undefined && index > count)
+          throw new UsageError(`index ${index} out of range (0-${count}, or omit it to append).`);
+        device = await insertBuiltIn(target, device_name ?? preset.device_name, index ?? count, false);
+        inserted = { target };
+      }
+      const { sample, applied, skipped: notApplied } = await restoreDevice(
+        device,
+        preset.parameters,
+        preset.sample?.file_path,
+        inserted?.target,
+      );
+      const mismatch = device.name.toLowerCase() !== preset.device_name.toLowerCase();
+      return {
+        ...deviceSummary(device),
+        preset: presetName,
+        inserted: inserted !== undefined,
+        index: inserted
+          ? inserted.target.devices.findIndex((d) => d.handle.id === device.handle.id)
+          : undefined,
+        applied_parameters: applied,
+        not_applied: notApplied.length ? notApplied : undefined,
+        sample,
+        warning: mismatch
+          ? `The preset was saved from ${quote(preset.device_name)}; only parameters with the same ` +
+            "names were set."
+          : undefined,
+      };
     },
   );
 
@@ -1609,32 +2708,54 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
   tool(
     "parameter_get",
     { title: "Get parameter values", annotations: READ },
-    "Read current values (and metadata) of one or more device/mixer parameters.",
-    { parameter_ids: z.array(z.string()).min(1) },
-    async ({ parameter_ids }) =>
-      Promise.all(parameter_ids.map((id) => parameterWithValue(resolve(id, DeviceParameter)))),
+    "Read current values (and metadata) of device or mixer parameters: by id " +
+      "(`parameter_ids`) and/or by device and name (`parameters`: entries " +
+      "{device_id | track_id/track_index/track_name + device, parameter}, where device " +
+      'is a name, an index or a path into racks such as ["Drum Rack", {"pad": 36}, ' +
+      '"Simpler"], and parameter matches exactly first, then case-insensitively, then ' +
+      "by unique substring; an entry may also be {parameter_id}). Results follow that " +
+      "order; entries found by device also carry device_id and device_name. Values are " +
+      "internal units; quantized parameters also report the current `value_item`.",
+    {
+      parameter_ids: z.array(z.string()).min(1).optional(),
+      parameters: z
+        .array(z.object(parameterAddress))
+        .min(1)
+        .optional()
+        .describe("Parameters by device and name (or parameter_id)"),
+    },
+    async ({ parameter_ids, parameters }) => {
+      if (!parameter_ids && !parameters) throw new UsageError("Provide parameter_ids and/or parameters.");
+      const list = [
+        ...(parameter_ids ?? []).map((id) => ({ param: resolve(id, DeviceParameter), device: undefined })),
+        ...(parameters ?? []).map((p, i) => at(`parameters[${i}]`, () => findParameterEntry(p))),
+      ];
+      return Promise.all(list.map(withValue));
+    },
   );
 
   tool(
     "parameter_set",
     { title: "Set parameter values", annotations: SET },
-    "Set one or more device/mixer parameter values. Values must be within the " +
-      "parameter's [min, max]; quantized parameters take the value_items index. " +
-      "Multiple values are grouped into a single undo step.",
-    {
-      values: z
-        .array(z.object({ parameter_id: z.string(), value: z.number() }))
-        .min(1),
-    },
+    "Set one or more device or mixer parameters in one undo step; nothing is changed if " +
+      "any entry is invalid. Each entry addresses its parameter by parameter_id, or by " +
+      "device and name as in parameter_get ({device_id | track + device, parameter}), " +
+      "and gives exactly one of: value (internal units within [min, max]; a quantized " +
+      "parameter takes its value_items index), value_item (a quantized parameter's " +
+      'choice by name or short name, e.g. "Saw"), reset:true (the default value) or ' +
+      "delta (added to the current value, clamped to [min, max]). Returns the " +
+      "parameters with their new values.",
+    { values: z.array(z.object({ ...parameterAddress, ...parameterWrite })).min(1) },
     async ({ values }) => {
-      const params = values.map((v) => ({
-        param: resolve(v.parameter_id, DeviceParameter),
-        value: v.value,
-      }));
-      await context.withinTransaction(() =>
-        Promise.all(params.map(({ param, value }) => param.setValue(value))),
+      const labels = values.map((_, i) => `values[${i}]`);
+      const plan = values.map((v, i) =>
+        at(labels[i], () => {
+          const { param, device } = findParameterEntry(v);
+          return { ...planWrite(param, v), device };
+        }),
       );
-      return Promise.all(params.map(({ param }) => parameterWithValue(param)));
+      await applyWrites(plan, labels);
+      return Promise.all(plan.map(withValue));
     },
   );
 

@@ -110,22 +110,37 @@ songObj.scenes = [
 ];
 songObj.cues = [make(["CuePoint"], { name: "Start", time: 0 })];
 
-// Built-in device names the mock can insert, with their parameters.
-const deviceOn = () => makeParam("Device On", { quantized: true, value: 1, valueItems: [
-  { name: "Off", shortName: "Off" }, { name: "On", shortName: "On" }] });
+// Built-in device names the mock can insert, with their parameters. The API
+// only gives names, ranges and value items; a quantized parameter's value is
+// its value_items index.
+const items = (...names) => names.map((name) => ({ name, shortName: name.slice(0, 4) }));
+const deviceOn = () => makeParam("Device On", { quantized: true, value: 1, def: 1, max: 1, valueItems: items("Off", "On") });
 const BUILTIN_DEVICES = {
   "Operator": () => [deviceOn(), makeParam("Osc-A Level")],
   "Reverb": () => [deviceOn(), makeParam("Dry/Wet")],
   "Auto Filter": () => [
-    deviceOn(), makeParam("Frequency", { min: 20, max: 135, value: 135 }), makeParam("Resonance"),
+    deviceOn(), makeParam("Frequency", { min: 20, max: 135, value: 135, def: 135 }), makeParam("Resonance"),
+    makeParam("Filter Type", { quantized: true, max: 3, value: 0, def: 0,
+      valueItems: items("Lowpass", "Highpass", "Bandpass", "Notch") }),
   ],
-  "Compressor": () => [deviceOn(), makeParam("Threshold")],
-  "EQ Eight": () => [deviceOn()],
+  "Compressor": () => [deviceOn(), makeParam("Threshold"), makeParam("Ratio", { min: 1, max: 100, value: 4, def: 4 })],
+  // two parameters share a name, as some Live devices' parameters do
+  "EQ Eight": () => [deviceOn(), makeParam("Frequency", { value: 0.2 }), makeParam("Frequency", { value: 0.8 })],
   "Utility": () => [deviceOn(), makeParam("Gain")],
   "Drum Rack": () => [deviceOn()],
   "Instrument Rack": () => [deviceOn()],
-  "Simpler": () => [deviceOn()],
+  "Simpler": () => [deviceOn(), makeParam("Volume", { value: 0.7, def: 0.7 }),
+    makeParam("Transpose", { min: -48, max: 48, value: 0, def: 0 })],
+  // "Device On" is a naming convention only: this one's switch is named otherwise
+  "Switch Fx": () => [
+    makeParam("Active", { quantized: true, value: 1, def: 1, max: 1, valueItems: items("Off", "On") }),
+    makeParam("Amount"),
+  ],
 };
+// Parameter names whose writes the host refuses (fixtures.refuseWrites), and
+// whether Simpler sample loads fail (fixtures.refuseSamples).
+const refusedWrites = new Set();
+let refuseSamples = false;
 
 let selectedTrack = null;
 function insertAfterSelection(song, track) {
@@ -292,9 +307,11 @@ const dataModel = {
     get(h).devices.splice(Number(index), 0, d);
     ok(d.handle);
   },
+  // A deleted device's handle is invalid from then on, as in Live.
   trackDeleteDevice: (h, dh, ok) => {
     const t = get(h);
     t.devices = t.devices.filter((d) => d.handle.id !== dh.id);
+    objects.delete(dh.id.toString());
     ok();
   },
   trackDuplicateDevice: (h, dh, ok) => {
@@ -398,7 +415,8 @@ const dataModel = {
   deviceGetParameters: (h) => get(h).params.map((p) => p.handle),
   sampleGetFilePath: (h) => get(h).filePath,
   simplerGetSample: (h) => (get(h).sample ? get(h).sample.handle : null),
-  simplerReplaceSample: (h, fp, ok) => {
+  simplerReplaceSample: (h, fp, ok, err) => {
+    if (refuseSamples) return err(); // without details, like most host rejections
     const s = make(["Sample"], { filePath: fp });
     get(h).sample = s;
     ok(s.handle);
@@ -437,7 +455,13 @@ const dataModel = {
   deviceParameterGetDefaultValue: (h) => get(h).def,
   deviceParameterGetValueItems: (h) => get(h).valueItems,
   deviceParameterGetInternalValue: (h, ok) => ok(get(h).value),
-  deviceParameterSetInternalValue: (h, v, ok) => { get(h).value = v; ok(); },
+  // The only setter with an error value (index.d.mts deviceParameterSetInternalValue).
+  deviceParameterSetInternalValue: (h, v, ok, err) => {
+    const p = get(h);
+    if (refusedWrites.has(p.name)) return err(`mock: ${p.name} is not settable right now`);
+    p.value = v;
+    ok();
+  },
   mixerdeviceGetVolume: (h) => get(h).volume.handle,
   mixerdeviceGetPanning: (h) => get(h).panning.handle,
   mixerdeviceGetSends: (h) => get(h).sends.map((s) => s.handle),
@@ -490,6 +514,10 @@ const fixtures = {
   },
   // The track Live would insert new tracks after (null = none selected).
   selectTrack: (id) => { selectedTrack = id ? objects.get(id) : null; },
+  // Make the host refuse writes to parameters of this name (null = none).
+  refuseWrites: (name) => { refusedWrites.clear(); if (name) refusedWrites.add(name); },
+  // Make Simpler.replaceSample fail (e.g. an unreadable file).
+  refuseSamples: (on) => { refuseSamples = on; },
 };
 
 module.exports = { makeActivation, calls, fixtures, ids: {

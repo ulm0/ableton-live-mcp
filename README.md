@@ -71,6 +71,10 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 { "port": 8722 }
 ```
 
+Device presets saved with `device_preset_save` are JSON files in `presets/` in the same
+directory (one file per preset, named after it); they can be copied between machines, and
+deleting a file deletes the preset.
+
 ## How it works
 
 - Every Live object (track, clip, device, parameter, ...) is addressed by a stable **object id**
@@ -93,19 +97,39 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
   **one undo step** in Live — as do the multi-value writes of `parameter_set` and `mixer_set`.
 - **Create with initial config**: `track_create` takes a `name` and `devices` (each a name or
   `{name, parameters}`) and returns the new track's `index` (Live inserts it after the selected
-  track); `scene_create` and `cue_point_create` take a `name` or `items` for several at once.
+  track); `device_insert` takes initial `parameters`; `scene_create` and `cue_point_create` take
+  a `name` or `items` for several at once.
+- **Parameters by name**: `parameter_get` / `parameter_set` entries take
+  `{track_name, device, parameter}` (or `device_id` + `parameter`) instead of a `parameter_id`.
+  `device` is a name, an index, or a path into racks, e.g. `["Drum Rack", {"pad": 36}, "Simpler"]`
+  (drum pads by receiving note) or `[0, {"chain": 1}, "Reverb"]` (chains by index); `parameter`
+  matches exactly first, then case-insensitively, then by unique substring. Each write gives
+  exactly one of `value` (internal units), `value_item` (a quantized parameter's choice by name,
+  e.g. `"Saw"`), `reset: true` (default value) or `delta` (relative, clamped). `device_set`
+  switches a device on or off and sets several of its parameters in one undo step;
+  `parameter_find` searches parameter names across the set, a track or a device. Values stay in
+  internal units — the API has no display values (dB, Hz, ms).
+- **Copy, move and presets** (lossy by design): Live's API cannot move, reorder or copy devices,
+  so `device_copy` inserts a fresh built-in device and copies the parameter values by name (a
+  Simpler also gets its sample); `move: true` then deletes the original. Automation, mappings, a
+  custom device name and non-parameter state are lost, and ids change. `device_preset_save` /
+  `device_preset_load` / `device_preset_list` keep the same kind of snapshot as named JSON files
+  in the extension's storage directory (`presets/`) — not Live `.adv` presets. Racks are refused
+  by both.
 - On `initialize` the server sends short **instructions** (a digest of the
   [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
   and what the API cannot do. Clients that support server instructions (Claude Code) add them
   to the agent's prompt.
 - Every tool has a **title and MCP annotations**, so clients can auto-approve reads and single
   out destructive calls:
-  - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `render_track_audio`
-    (it only writes a temp file);
+  - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `parameter_find`,
+    `device_preset_list`, `render_track_audio` (it only writes a temp file);
   - setters (`*_set`): non-destructive, idempotent;
   - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`): non-destructive;
   - destructive (`destructiveHint`): the deletes, `track_clear_clips_in_range`,
-    `midi_clip_set_notes`, `midi_clip_edit_notes`, `simpler_replace_sample`;
+    `midi_clip_set_notes`, `midi_clip_edit_notes`, `simpler_replace_sample`, `device_copy`
+    (`move` deletes the original), `device_preset_load` (replaces a Simpler's sample),
+    `device_preset_save` (`overwrite` replaces a preset);
   - `show_dialog` (non-destructive) and `execute_command` (destructive) are open-world.
 
 ## Security
@@ -163,8 +187,11 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | Tool | Description |
 |------|-------------|
 | `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample. |
-| `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain. |
-| `device_delete` / `device_duplicate` | Remove or copy devices. |
+| `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain, optionally with initial `parameters` (one more undo step). |
+| `device_set` | Switch a device on/off (`enabled`: its "Device On" parameter, or a two-state first parameter as a reported fallback) and set several of its parameters by name, `value_item`, `reset` or `delta` — one undo step. The device is `device_id` or track + `device` (name, index or rack path). |
+| `device_delete` / `device_duplicate` | Remove or copy devices (the duplicate lands right after the original). |
+| `device_copy` | Copy a device to another track or chain, or with `move: true` move/reorder it: inserts the built-in device by name and copies parameter values by name (Simpler: and its sample). Lossy — automation, mappings and non-parameter state are lost, ids change; racks are refused. |
+| `device_preset_save` / `device_preset_load` / `device_preset_list` | Named parameter snapshots (plus a Simpler's sample path) stored as JSON under the extension's storage directory. Load onto an existing device or insert a new one. Not Live presets. |
 | `chain_get` | Rack chain detail: devices + chain mixer. |
 | `rack_insert_chain` | Add a chain to a rack. |
 | `drum_chain_set` | Set the MIDI note of a drum rack pad. |
@@ -173,8 +200,9 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 ### Parameters & mixing
 | Tool | Description |
 |------|-------------|
-| `parameter_get` | Read device/mixer parameter values (batch). |
-| `parameter_set` | Write parameter values (batch, single undo step). |
+| `parameter_get` | Read device/mixer parameter values (batch) by id or by `{track, device, parameter}`; quantized parameters report their `value_item`. |
+| `parameter_set` | Write parameter values (batch, single undo step, nothing written if any entry is invalid): each entry by id or `{track, device, parameter}` with one of `value`, `value_item`, `reset` or `delta`. |
+| `parameter_find` | Search parameter names (and quantized choices) across the set, a track or a device, through racks; returns ids, devices and readable paths. |
 | `mixer_get` | Volume / pan / sends of a track (by id, index or name) or chain, with parameter ids and unit hints. |
 | `mixer_set` | Set volume / pan / sends (by index or `return_name`) in one undo step: one track or chain, the same values on several (`targets`) or on every track (`all_tracks` minus `exclude`), or per-target values (`items`). `all_tracks` sets the top-most tracks only: a group covers its tracks, an excluded group keeps its tracks, and a group holding an excluded track is skipped while its other tracks are set; the result lists what was `skipped` and why. |
 
@@ -208,11 +236,15 @@ Typical things you can ask a connected assistant to do:
 - "Turn down every track that isn't the vocal bus by 3 dB"
 - "Build a song skeleton: intro, verse, chorus scenes with locators"
 - "Replace the sample in Simpler with /path/to/kick.wav and map it to C1"
+- "Bypass the compressor on the vocals and switch the bass filter to high-pass"
+- "Move the reverb before the EQ" (a lossy copy-and-delete: see `device_copy`)
 
 ## Limitations
 
 - The extension (and thus the MCP endpoint) only runs while Live is open.
 - Only built-in Live devices can be inserted; third-party plug-ins can't be loaded by the SDK.
+  Devices cannot be moved, renamed or loaded from Live presets: `device_copy` and the JSON
+  `device_preset_*` tools rebuild a device from its parameter values only.
 - No transport control (play/stop/record) or clip launching — the Extensions API v1.0.0 does not
   expose them. Same for browser access, parameter automation curves, track color, routing and
   sidechain, reordering or grouping tracks, creating return tracks, metering, editing clip

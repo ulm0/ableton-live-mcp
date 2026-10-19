@@ -156,8 +156,14 @@ export function parameterSummary(param: DeviceParameter<V>, includeValueItems = 
   };
 }
 
-export async function parameterWithValue(param: DeviceParameter<V>) {
-  return { ...parameterSummary(param), value: num(await param.getValue()) };
+// A quantized parameter's value is its value_items index (assumed host
+// semantics: the SDK documents no mapping), so `value_item` names the current
+// choice, e.g. "Saw". Internal units only: the API has no display values.
+export async function parameterWithValue(param: DeviceParameter<V>, includeValueItems = true) {
+  const summary = parameterSummary(param, includeValueItems);
+  const value = num(await param.getValue());
+  const items = summary.value_items ?? (summary.is_quantized ? param.valueItems : []);
+  return { ...summary, value, value_item: items[value]?.name };
 }
 
 export function chainSummary(chain: Chain<V>) {
