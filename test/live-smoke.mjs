@@ -331,6 +331,61 @@ step(`selection_get: ${lastSelection.captured
   ? `seq ${lastSelection.seq} from ${lastSelection.scope}: ${JSON.stringify(lastSelection.items ?? lastSelection.lanes).slice(0, 200)}`
   : 'nothing captured yet (right-click a clip -> "MCP: Use as selection", then rerun)'}`);
 
+// --- samples, kits, copies, renders: host behaviour the mock can only assume -
+// drum_kit_build: insertChain on a Drum Rack yields DrumChains, a fresh Simpler takes a sample
+const kitSmoke = await call("track_create", { type: "midi", name: "MCP Smoke Kit" });
+const kitBuilt = await call("drum_kit_build", { track_id: kitSmoke.id, pads: [
+  { note: "C1", sample_path: wavPath, volume: 0.7 }, { note: "D1", sample_path: wavPath, panning: -0.3 }] });
+assert.equal(kitBuilt.errors, undefined, `kit errors: ${JSON.stringify(kitBuilt.errors)}`);
+assert.ok(kitBuilt.rack_created && kitBuilt.pads.every((p) => p.chain_created && p.simpler_created && p.sample?.file_path));
+await eventually(async () => {
+  const rackNow = await call("device_get", { device_id: kitBuilt.rack_device_id, include_chain_devices: true });
+  assert.deepEqual(rackNow.chains.map((c) => c.receiving_note).sort(), [36, 38]);
+  assert.ok(rackNow.chains.every((c) => c.devices[0]?.sample?.file_path), "every pad has its sample");
+});
+step(`drum_kit_build: Drum Rack with pads C1, D1 (DrumChains, Simplers, imported samples: ${kitBuilt.pads[0].imported_path})`);
+
+// render analysis: the generated tone (16-bit, 12000 / 32768 = -8.7 dBFS) is what the clip plays
+const analyzed = await call("render_track_audio", { track_id: audio.id, start_time: 0, end_time: 2, analyze: true });
+assert.ok(analyzed.analysis, `the render could not be analyzed: ${analyzed.analysis_error}`);
+assert.equal(analyzed.analysis.silent, false, "the render holds the clip's tone");
+const an = analyzed.analysis;
+step(`render analysis: ${an.format} ${an.bits_per_sample}-bit, ${an.channels} ch, ${an.sample_rate} Hz, ` +
+  `${an.duration_s} s, peak ${an.peak_dbfs} dBFS, rms ${an.rms_dbfs} dBFS, ${an.clipped_samples} clipped`);
+
+// clip_copy: MIDI notes re-based into the arrangement; audio re-created with its markers
+const midiCopy = await call("clip_copy", { clip_id: clip.id, track_id: midi.id, start_time: 64 });
+await eventually(async () => {
+  const [src, dst] = [await call("midi_clip_get_notes", { clip_id: clip.id }), await call("midi_clip_get_notes", { clip_id: midiCopy.id })];
+  assert.equal(dst.note_count, src.note_count);
+});
+const audioCopy = await call("clip_copy", { clip_id: aclip.id, track_id: audio.id, start_time: 64 });
+step(`clip_copy: MIDI copy at beat 64 (${midiCopy.note_count} notes); audio copy warp_markers_match=` +
+  `${audioCopy.warp_markers_match}, differs=${JSON.stringify(audioCopy.differs ?? null)}`);
+
+// arrangement_copy_range: overwrite 96-100 on the smoke tracks with 64-68
+const copiedRange = await call("arrangement_copy_range", { start_time: 64, end_time: 68, to_time: 96,
+  tracks: [{ track_id: midi.id }, { track_id: audio.id }] });
+assert.equal(copiedRange.errors, undefined, JSON.stringify(copiedRange.errors));
+await eventually(async () => {
+  const at96 = await call("arrangement_get", { start_time: 96, end_time: 100, tracks: [{ track_id: midi.id }, { track_id: audio.id }] });
+  assert.ok(at96.tracks.every((t) => t.clips.length >= 1), "both tracks have a copy at beat 96");
+});
+step(`arrangement_copy_range: ${copiedRange.copied_count} clips copied, ${copiedRange.skipped_count} skipped`);
+
+// audio_track_consolidate: the copies at 96 become one unwarped clip
+const consolidated = await call("audio_track_consolidate", { track_id: audio.id, start_time: 96, end_time: 100, name: "MCP Consolidated" });
+assert.equal(consolidated.warping, false);
+await eventually(async () => {
+  const at96 = await call("arrangement_get", { start_time: 96, end_time: 100, tracks: [{ track_id: audio.id }] });
+  assert.deepEqual(at96.tracks[0].clips.map((c) => c.id), [consolidated.id]);
+});
+step(`audio_track_consolidate: one unwarped clip ${consolidated.start_time}-${consolidated.end_time} from ${consolidated.imported_path}`);
+
+const samples = await call("sample_search", { query: "wav", limit: 3, time_limit_s: 2 });
+step(`sample_search: roots ${samples.roots.filter((r) => r.exists).map((r) => r.name).join(", ") || "none"}; ` +
+  `${samples.results.length} results (complete=${samples.complete})`);
+
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;
 await call("song_set", { tempo: origTempo + 5 });
@@ -345,6 +400,7 @@ await call("track_delete", { track_id: midi.id });
 await call("track_delete", { track_id: drumTrack.id });
 await call("track_delete", { track_id: audio.id });
 await call("track_delete", { track_id: named.id });
+await call("track_delete", { track_id: kitSmoke.id });
 fs.rmSync(wavPath, { force: true });
 step("duplicated + deleted all smoke tracks (cleanup)");
 

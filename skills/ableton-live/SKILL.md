@@ -20,11 +20,12 @@ or the port was changed in the extension's `config.json` (default 8722).
    need.
 3. **Address tracks and scenes by name when the user does.** Every tool that acts on one track
    (`track_get`, `track_set`, `track_delete`, `track_duplicate`, `track_clear_clips_in_range`,
-   `take_lane_create`, `render_track_audio`, `mixer_get`, `mixer_set`, `device_insert`,
-   `clip_create`) takes `track_id`, `track_index` (0-based, regular tracks) or `track_name`
-   (exact first, then case-insensitive; also finds return and main tracks). The scene tools
-   and `clip_create` take `scene_id`, `scene_index` or `scene_name`. "Mute the Drums" is one
-   call: `track_set {track_name:"Drums", mute:true}`. If you give several fields they must name
+   `take_lane_create`, `render_track_audio`, `audio_track_consolidate`, `mixer_get`, `mixer_set`,
+   `device_insert`, `drum_kit_build`, `clip_create`, `clip_copy`) takes `track_id`, `track_index`
+   (0-based, regular tracks) or `track_name` (exact first, then case-insensitive; also finds
+   return and main tracks). The scene tools, `clip_create` and `clip_copy` take `scene_id`,
+   `scene_index` or `scene_name`. "Mute the Drums" is one call:
+   `track_set {track_name:"Drums", mute:true}`. If you give several fields they must name
    the same object. An ambiguous name fails with the matching candidates — pick one by id or
    index. `track_delete` and `scene_delete` only accept the exact name. Parameters work the same
    way: see [Devices & sound design](#devices--sound-design).
@@ -199,6 +200,19 @@ or the port was changed in the extension's `config.json` (default 8722).
   `drum_chain_set` maps a pad to a MIDI note (`receiving_note: 38` or `"D1"`), and pads in
   device paths take names too (`["Drum Rack", {pad:"C1"}, "Simpler"]`);
   `simpler_replace_sample` swaps samples.
+- **A kit from sample files is one call**: `drum_kit_build {track_name:"Drums", pads:[{note:"C1",
+  sample_path:"/abs/kick.wav"}, {note:"D1", sample_path:"/abs/snare.wav", volume:0.7},
+  {note:"F#1", sample_path:"/abs/hat.wav", panning:0.2}]}`. It uses the track's Drum Rack (or
+  inserts one on a MIDI track; `rack_device_id` for a specific rack), reuses the pad receiving
+  each note or creates a chain for it, inserts a Simpler (or keeps the pad's Simpler and REPLACES
+  its sample), imports the sample into the project and loads it; `volume` (0-1, 0.85 = 0 dB) and
+  `panning` set the pad's chain mixer. Every path is checked first; a pad that fails later
+  carries `error` in its entry while the others are built (Live cannot delete a chain, so a
+  created chain stays). Need the paths? `sample_search {query:"808 kick"}` first.
+- Samples go into the project by default: `simpler_replace_sample` and `device_insert
+  {device_name:"Simpler", sample_path}` copy the file into the Live project and load the copy
+  (`imported_path`), so the set keeps working when moved; `import_into_project:false` loads the
+  original.
 
 ## Copying, moving and presets (lossy)
 
@@ -244,8 +258,22 @@ or the port was changed in the extension's `config.json` (default 8722).
 - `render_track_audio` renders the pre-FX audio of an audio track (its clip audio before the
   device chain: no effects, mixer or sends) to a WAV file and returns the path — useful for
   analysis or resampling. Since Live 12.4.15 the render is not normalized. The file lives in
-  the extension's temp directory, which may be cleaned: `import_file` it (or `clip_create`
-  with it, which imports by default) to keep it.
+  the extension's temp directory, which may be cleaned: `persist:true` copies it into the
+  project (`imported_path`; or `import_file` it, or `clip_create` with it).
+- "Is this take clipping / silent / where is it loud?": `render_track_audio {track_name, start_time,
+  end_time, analyze:true}` returns `analysis` read from the WAV: `peak_dbfs` and `rms_dbfs`
+  (overall and per channel; `null` = digital silence), `clipped_samples` (at or over 0 dBFS),
+  `silent` (peak below -80 dBFS) and a 32-part `envelope` of peak and RMS dBFS. Pre-FX: it
+  measures the clips, not the track's output after its devices and fader (there is no metering).
+  `tracks:[...]` renders and analyzes several audio tracks over the same range.
+- Consolidating a comp or a stretch of clips: `audio_track_consolidate {track_name, start_time,
+  end_time, name?, color?}` renders the range pre-FX, imports the render, clears the range and
+  puts one unwarped clip there (it then plays at the current tempo only). Destructive: confirm
+  first. The device chain stays on the track.
+- Finding files: `sample_search {query:"kick 808", extensions?, roots?, limit?}` searches the
+  `sample_roots` of the extension's config.json plus Live's User Library and Factory Packs
+  folders (when they exist) — read-only, and nothing outside those folders. With no folder it
+  returns a `hint`: tell the user to add `"sample_roots": ["/path/to/samples"]` to config.json.
 
 ## Song structure
 
@@ -256,6 +284,20 @@ or the port was changed in the extension's `config.json` (default 8722).
   time, so it is re-created at the new time with its name and the old one is deleted: use the
   returned `id` from then on (`replaced_id` is the old, now invalid one). A move onto a beat
   that already has a cue point is refused.
+- Copying clips: `clip_copy {clip_id, track_name, start_time}` (arrangement), `{clip_id,
+  track_name, scene_name}` (an empty session slot) or `{clip_id, target_id:<take lane>,
+  start_time}`; `move:true` deletes the source afterwards; `duration` makes it longer (the loop
+  repeats). Live's API has no clip copy: the copy is a new clip with a new id. MIDI notes are
+  re-based to where the source plays them, so it plays the same (`fidelity:"notes"`); audio
+  copies keep the file, warping and markers but Live warps them itself
+  (`fidelity:"approximate"`, check `warp_markers_match` and `differs`). Clip envelopes, groove
+  and launch settings are never copied (`lost`) — say so.
+- "Repeat the chorus" / "copy bars 9-16 to bar 33": `arrangement_copy_range {start_time:32,
+  end_time:64, to_time:128, tracks?, include_cue_points?}`. It OVERWRITES the target range on
+  every selected track (cleared first, also where the source is empty); nothing after it moves
+  (the API cannot insert time). MIDI clips crossing the source edges are trimmed; audio clips
+  crossing them are skipped and listed in `skipped` — tell the user. Take-lane clips are not
+  copied. Confirm with the user before overwriting a range that holds clips.
 
 ## Interacting with the user in Live
 
@@ -278,9 +320,12 @@ The Extensions API (1.0.0) has no access to:
 - automation envelopes, modulation, MIDI/macro mapping;
 - track color, routing and sidechain sources, MIDI routing;
 - reordering or grouping tracks, creating return tracks;
-- metering (no level readouts);
+- metering (no level readouts; `render_track_audio {analyze:true}` measures an audio track's
+  clips pre-FX, not its output);
 - editing clip start/end markers or loop positions after creation (a MIDI clip's loop can't
-  be set even at creation);
+  be set even at creation) — `clip_copy` re-bases a MIDI clip's notes instead;
+- copying, moving or trimming clips natively (`clip_copy` / `arrangement_copy_range` create new
+  clips) and inserting time into the arrangement;
 - the song time signature (scenes report theirs, read-only).
 
 Don't pretend otherwise or improvise workarounds — tell the user when asked.
@@ -290,8 +335,10 @@ Don't pretend otherwise or improvise workarounds — tell the user when asked.
 `track_delete`, `scene_delete`, `clip_delete`, `cue_point_delete`, `device_delete`,
 `midi_clip_set_notes` (mode `replace`), `midi_clip_edit_notes` (with `delete`),
 `track_clear_clips_in_range`, `simpler_replace_sample` (discards the current sample),
-`device_copy` with `move` (deletes the original, lossy) and `device_preset_load` onto a Simpler
-(replaces its sample) change the user's project (each step is undoable in Live).
+`device_copy` and `clip_copy` with `move` (delete the original; lossy), `device_preset_load` onto a
+Simpler and `drum_kit_build` on existing pads (replace their samples), `arrangement_copy_range`
+(overwrites its target range) and `audio_track_consolidate` (clears its range) change the user's
+project (each step is undoable in Live).
 `device_preset_save` with `overwrite` replaces a saved preset file. `track_delete` and `scene_delete`
 by name need the exact name, so a case-insensitive guess can't delete the wrong object. They carry the MCP
 `destructiveHint` annotation; read-only tools carry `readOnlyHint`. For bulk destructive edits

@@ -60,7 +60,7 @@ const usageError = async (name, args, pattern) => {
 
 // tools/list
 const { tools } = await client.listTools();
-assert.equal(tools.length, 52, `expected exactly 52 tools, got ${tools.length}`);
+assert.equal(tools.length, 57, `expected exactly 57 tools, got ${tools.length}`);
 
 // every tool has a title and explicit hints — the spec defaults
 // (destructiveHint/openWorldHint true) must never apply by omission
@@ -78,25 +78,30 @@ const write = (destructive, idempotent) => ({
 });
 const annotationGroups = [
   [{ readOnlyHint: true, openWorldHint: false }, ["song_get", "track_get", "clip_get",
-    "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get", "render_track_audio",
+    "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get",
     "parameter_find", "device_preset_list", "scene_get", "session_grid", "arrangement_get", "song_audit",
-    "selection_get", "selection_wait"]],
+    "selection_get", "selection_wait", "sample_search"]],
   [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
     "clip_set", "drum_chain_set", "parameter_set", "mixer_set", "device_set"]],
   [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
     "scene_duplicate", "cue_point_create", "clip_create", "device_insert", "device_duplicate",
-    "rack_insert_chain", "import_file"]],
-  // device_preset_save may overwrite a preset (overwrite:true)
+    "rack_insert_chain", "import_file",
+    // render_track_audio persist:true imports the render into the project
+    "render_track_audio"]],
+  // device_preset_save may overwrite a preset (overwrite:true); arrangement_copy_range overwrites its target
   [write(true, true), ["track_delete", "scene_delete", "clip_delete", "cue_point_delete",
-    "device_delete", "track_clear_clips_in_range", "simpler_replace_sample", "device_preset_save"]],
-  // device_copy move deletes the original; device_preset_load replaces a Simpler's sample
-  [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes", "device_copy", "device_preset_load"]],
+    "device_delete", "track_clear_clips_in_range", "simpler_replace_sample", "device_preset_save",
+    "arrangement_copy_range"]],
+  // device_copy / clip_copy move delete the original; device_preset_load and drum_kit_build replace
+  // Simpler samples; audio_track_consolidate clears its range
+  [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes", "device_copy", "device_preset_load",
+    "clip_copy", "drum_kit_build", "audio_track_consolidate"]],
   [{ ...write(false, false), openWorldHint: true }, ["show_dialog"]],
   [{ ...write(true, false), openWorldHint: true }, ["execute_command"]],
 ];
 for (const [expected, names] of annotationGroups)
   for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
-assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 52, "snapshot lists every tool once");
+assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 57, "snapshot lists every tool once");
 
 // server instructions: a short digest, sent on initialize
 const instructions = client.getInstructions();
@@ -284,6 +289,9 @@ assert.equal(chainDetail.mixer.volume.name, "Volume");
 const simplerE = await call("device_insert", { target_id: chainE.id, device_name: "Simpler" });
 const sampleE = await call("simpler_replace_sample", { simpler_device_id: simplerE.id, file_path: "/tmp/kick.wav" });
 assert.ok(sampleE.file_path.includes("kick.wav"));
+// by default the sample is copied into the project and the copy is loaded
+assert.deepEqual([sampleE.imported_path, sampleE.file_path],
+  ["/mock-project/Samples/Imported/kick.wav", "/mock-project/Samples/Imported/kick.wav"]);
 const deepRack = await call("device_get", { device_id: rackE.id, include_chain_devices: true });
 assert.equal(deepRack.chains[0].devices[0].name, "Simpler");
 assert.ok(deepRack.chains[0].devices[0].sample.file_path.includes("kick.wav"));
@@ -355,8 +363,12 @@ assert.ok(audioClip.file_path.includes("kick.wav"));
 const warped = await call("clip_set", { clip_id: audioClip.id, warping: true, warp_mode: "Complex" });
 assert.equal(warped.warp_mode, "Complex");
 
-// clear range + render + import
-await call("track_clear_clips_in_range", { track_id: audioTrackId, start_time: 0, end_time: 64 });
+// clear range + render + import: clips inside the range are deleted, others stay
+const toClear = await call("clip_create", { type: "audio", target_id: audioTrackId, start_time: 16, file_path: "/tmp/kick.wav" });
+await call("track_clear_clips_in_range", { track_id: audioTrackId, start_time: 8, end_time: 64 });
+assert.deepEqual((await call("track_get", { track_id: audioTrackId, include: ["arrangement_clips"] })).arrangement_clips.map((c) => c.id),
+  [audioClip.id], "the clip in the range is gone");
+assert.notEqual(toClear.id, audioClip.id);
 const render = await call("render_track_audio", { track_id: audioTrackId, start_time: 0, end_time: 8 });
 assert.ok(render.audio_path.endsWith(".wav"));
 const imp = await call("import_file", { file_path: "/tmp/loop.wav" });
@@ -740,7 +752,8 @@ const kickIns = await undoSteps(() => call("device_insert", { target_id: pads[0]
 assert.equal(kickIns.steps, 2, "insert + initial values");
 const kickSimpler = kickIns.result;
 assert.deepEqual(kickSimpler.parameters.map((p) => [p.name, p.value]), [["Volume", 0.4]]);
-await call("simpler_replace_sample", { simpler_device_id: kickSimpler.id, file_path: "/tmp/kick.wav" });
+const kickLoaded = await call("simpler_replace_sample", { simpler_device_id: kickSimpler.id, file_path: "/tmp/kick.wav", import_into_project: false });
+assert.deepEqual([kickLoaded.file_path, kickLoaded.imported_path], ["/tmp/kick.wav", undefined]);
 const snare = await call("device_insert", { target_id: pads[1], device_name: "Simpler" });
 byDevice = await call("parameter_get", { parameters: [
   { track_name: "Kit", device: ["Drum Rack", { pad: 36 }, "Simpler"], parameter: "Volume" },
@@ -1262,7 +1275,7 @@ const [rackK, reverbK] = kitT.devices.map((d) => d.id);
 const padK = await call("rack_insert_chain", { rack_device_id: rackK, index: 0 });
 await call("drum_chain_set", { drum_chain_id: padK.id, receiving_note: "C1" });
 const kickK = await call("device_insert", { target_id: padK.id, device_name: "Simpler" });
-const kickSample = await call("simpler_replace_sample", { simpler_device_id: kickK.id, file_path: presentWav });
+const kickSample = await call("simpler_replace_sample", { simpler_device_id: kickK.id, file_path: presentWav, import_into_project: false });
 const emptyPad = await call("rack_insert_chain", { rack_device_id: rackK, index: 1 });
 await call("drum_chain_set", { drum_chain_id: emptyPad.id, receiving_note: "D1" });
 await call("device_set", { device_id: reverbK, enabled: false });
@@ -1508,7 +1521,7 @@ assert.equal((await call("selection_get")).seq, seqNow + 2);
 
 // --- song_audit ----------------------------------------------------------------
 const snareK = await call("device_insert", { target_id: (await call("rack_insert_chain", { rack_device_id: rackK, index: 2 })).id, device_name: "Simpler" });
-await call("simpler_replace_sample", { simpler_device_id: snareK.id, file_path: missingWav });
+await call("simpler_replace_sample", { simpler_device_id: snareK.id, file_path: missingWav, import_into_project: false });
 const emptySimpler = await call("device_insert", { track_id: synthIn, device_name: "Simpler" });
 const relClip = await call("clip_create", { type: "audio", track_id: audioTrackId, start_time: 64, file_path: "relative.wav", import_into_project: false });
 const okClip = await call("clip_create", { type: "audio", track_id: audioTrackId, start_time: 72, file_path: presentWav, import_into_project: false });
@@ -1547,6 +1560,415 @@ for (const id of [relClip.id, okClip.id, takeClip.id]) await call("clip_delete",
 await call("device_delete", { device_id: returnFx.id });
 await call("cue_point_delete", { cue_point_id: drop.id });
 assert.deepEqual((await tracksNow()).map((t) => t.name), ["Bass 2", "Drums"]);
+
+// --- samples into Simplers, drum kits ---------------------------------------
+const samplesDir = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-samples-"));
+const kickWav = path.join(samplesDir, "kick.wav");
+const snareWav = path.join(samplesDir, "snare.wav");
+const hatWav = path.join(samplesDir, "hat.wav");
+for (const f of [kickWav, snareWav, hatWav]) fs.writeFileSync(f, "RIFF");
+const imported = (f) => `/mock-project/Samples/Imported/${path.basename(f)}`;
+const devicesOf = async (track_name) => (await call("track_get", { track_name, include: ["devices"] })).devices;
+
+// device_insert sample_path: insert, sample, values — the sample is imported first by default
+await call("track_create", { type: "midi", name: "Sampler T" });
+const loadedSimpler = await undoSteps(() => call("device_insert", { track_name: "Sampler T", device_name: "Simpler",
+  sample_path: kickWav, parameters: [{ name: "volume", value: 0.3 }] }));
+assert.equal(loadedSimpler.steps, 3, "insert + sample + values");
+assert.deepEqual([loadedSimpler.result.sample.file_path, loadedSimpler.result.imported_path, loadedSimpler.result.parameters[0].value],
+  [imported(kickWav), imported(kickWav), 0.3]);
+const plainLoad = await call("device_insert", { track_name: "Sampler T", device_name: "Simpler", sample_path: hatWav, import_into_project: false });
+assert.deepEqual([plainLoad.sample.file_path, plainLoad.imported_path], [hatWav, undefined]);
+// checked before the insert; a sample that cannot be loaded removes the Simpler again
+const samplerCount = (await devicesOf("Sampler T")).length;
+await usageError("device_insert", { track_name: "Sampler T", device_name: "Reverb", sample_path: kickWav }, /sample_path only applies to a Simpler, not "Reverb"/);
+await usageError("device_insert", { track_name: "Sampler T", device_name: "Simpler", sample_path: path.join(samplesDir, "nope.wav") },
+  /sample_path ".*nope\.wav": no such file/);
+await usageError("device_insert", { track_name: "Sampler T", device_name: "Simpler", sample_path: "kick.wav" }, /not an absolute path/);
+fixtures.refuseSamples(true);
+const noLoad = await client.callTool({ name: "device_insert", arguments: { track_name: "Sampler T", device_name: "Simpler", sample_path: kickWav } });
+fixtures.refuseSamples(false);
+assert.equal(noLoad.isError, true);
+assert.match(noLoad.content[0].text, /Could not load the sample .*kick\.wav: .*The new device was removed again/);
+assert.equal((await devicesOf("Sampler T")).length, samplerCount, "nothing is left behind");
+// simpler_replace_sample: a failing import changes nothing
+fixtures.refuseImports(true);
+const noImport = await client.callTool({ name: "simpler_replace_sample", arguments: { simpler_device_id: plainLoad.id, file_path: snareWav } });
+fixtures.refuseImports(false);
+assert.equal(noImport.isError, true);
+assert.match(noImport.content[0].text, /Could not import .*snare\.wav into the project: mock: could not copy/);
+assert.equal((await call("device_get", { device_id: plainLoad.id })).sample.file_path, hatWav);
+
+// drum_kit_build: a new Drum Rack on a MIDI track, a chain + Simpler + sample per pad, pad levels
+const kit3 = await call("track_create", { type: "midi", name: "Kit 3" });
+const importsBefore = calls.imports.length;
+let kitBuild = await undoSteps(() => call("drum_kit_build", { track_name: "Kit 3", pads: [
+  { note: "C1", sample_path: kickWav, volume: 0.7 }, { note: 38, sample_path: snareWav, panning: -0.5 },
+  { note: "F#1", sample_path: hatWav }, { note: 37, sample_path: kickWav }] }));
+assert.equal(kitBuild.steps, 6, "rack, chains, notes, Simplers, samples, levels");
+let kitRes = kitBuild.result;
+assert.deepEqual([kitRes.rack_created, kitRes.track_id, kitRes.track_name, kitRes.built_count, kitRes.errors],
+  [true, kit3.id, "Kit 3", 4, undefined]);
+assert.deepEqual(kitRes.pads.map((p) => [p.note, p.note_name, p.chain_created, p.simpler_created, p.sample?.file_path, p.imported_path, p.error]), [
+  [36, "C1", true, true, imported(kickWav), imported(kickWav), undefined],
+  [38, "D1", true, true, imported(snareWav), imported(snareWav), undefined],
+  [42, "F#1", true, true, imported(hatWav), imported(hatWav), undefined],
+  [37, "C#1", true, true, imported(kickWav), imported(kickWav), undefined]]);
+assert.deepEqual(calls.imports.slice(importsBefore), [kickWav, snareWav, hatWav], "each file is imported once");
+let builtRack = await call("device_get", { device_id: kitRes.rack_device_id, include_chain_devices: true });
+assert.deepEqual(builtRack.chains.map((c) => [c.id, c.receiving_note, c.devices.map((d) => [d.id, d.sample?.file_path])]),
+  kitRes.pads.map((p) => [p.chain_id, p.note, [[p.simpler_device_id, p.sample.file_path]]]), "chains in the pads' order");
+const padMixer = async (i) => (await call("chain_get", { chain_id: kitRes.pads[i].chain_id })).mixer;
+assert.deepEqual([(await padMixer(0)).volume.value, (await padMixer(1)).panning.value, (await padMixer(2)).volume.value],
+  [0.7, -0.5, 0.85]);
+// reused pads keep their chain and Simpler and get the new sample; new pads are added
+const firstPads = kitRes.pads;
+kitBuild = await undoSteps(() => call("drum_kit_build", { rack_device_id: kitRes.rack_device_id, pads: [
+  { note: 36, sample_path: snareWav }, { note: "E1", sample_path: snareWav }] }));
+assert.equal(kitBuild.steps, 4, "chains, notes, Simplers, samples");
+kitRes = kitBuild.result;
+assert.deepEqual([kitRes.rack_created, kitRes.track_id], [false, kit3.id]);
+assert.deepEqual(kitRes.pads.map((p) => [p.note, p.chain_created, p.simpler_created, p.sample.file_path]),
+  [[36, false, false, imported(snareWav)], [40, true, true, imported(snareWav)]]);
+assert.deepEqual([kitRes.pads[0].chain_id, kitRes.pads[0].simpler_device_id], [firstPads[0].chain_id, firstPads[0].simpler_device_id]);
+const kitPadsAfter = await call("drum_kit_build", { track_name: "Kit 3", pads: [{ note: 42, sample_path: hatWav }], import_into_project: false });
+assert.deepEqual([kitPadsAfter.rack_device_id, kitPadsAfter.pads[0].sample.file_path, kitPadsAfter.pads[0].imported_path],
+  [kitRes.rack_device_id, hatWav, undefined], "the track's Drum Rack is found; no import");
+// everything is checked first: nothing changes on a bad entry
+const builtChains = async () => (await call("device_get", { device_id: kitRes.rack_device_id })).chains.map((c) => [c.id, c.receiving_note]);
+const chainsBefore = await builtChains();
+await usageError("drum_kit_build", { track_name: "Kit 3", pads: [{ note: 50, sample_path: kickWav }, { note: "D2", sample_path: kickWav }] },
+  /pads\[1\]: note 50 \(D2\) is given twice, also by pads\[0\]/);
+await usageError("drum_kit_build", { track_name: "Kit 3", pads: [{ note: 50, sample_path: kickWav }, { note: 51, sample_path: path.join(samplesDir, "nope.wav") }] },
+  /pads\[1\]: sample_path ".*nope\.wav": no such file/);
+await usageError("drum_kit_build", { track_name: "Kit 3", pads: [{ note: "Q1", sample_path: kickWav }] }, /pads\[0\]: note: "Q1" is not a MIDI pitch/);
+await usageError("drum_kit_build", { pads: [{ note: 50, sample_path: kickWav }] }, /Give rack_device_id or a track/);
+await usageError("drum_kit_build", { track_name: "Kit 3", rack_device_id: kitRes.rack_device_id, pads: [{ note: 50, sample_path: kickWav }] },
+  /Give rack_device_id or a track/);
+await usageError("drum_kit_build", { track_name: "Drums", pads: [{ note: 50, sample_path: kickWav }] },
+  /"Drums" .* has no Drum Rack, and only a MIDI track can get one/);
+await usageError("drum_kit_build", { rack_device_id: kitRes.pads[0].simpler_device_id, pads: [{ note: 50, sample_path: kickWav }] },
+  /is a Simpler, expected DrumRackDevice/);
+await call("drum_chain_set", { drum_chain_id: kitRes.pads[1].chain_id, receiving_note: 38 });
+await usageError("drum_kit_build", { rack_device_id: kitRes.rack_device_id, pads: [{ note: 38, sample_path: kickWav }] },
+  /pads\[0\]: 2 chains of "Drum Rack" .* receive note 38 .*ambiguous/);
+await call("drum_chain_set", { drum_chain_id: kitRes.pads[1].chain_id, receiving_note: 40 });
+const secondRack = await call("device_insert", { track_name: "Kit 3", device_name: "Drum Rack" });
+await usageError("drum_kit_build", { track_name: "Kit 3", pads: [{ note: 50, sample_path: kickWav }] }, /has 2 Drum Racks .*give rack_device_id/);
+await call("device_delete", { device_id: secondRack.id });
+assert.deepEqual(await builtChains(), chainsBefore, "failed builds change nothing");
+// an import that fails changes nothing in the set; a pad that fails later is reported, the call succeeds
+await call("track_create", { type: "midi", name: "Kit 4" });
+fixtures.refuseImports(true);
+const kitNoImport = await client.callTool({ name: "drum_kit_build", arguments: { track_name: "Kit 4", pads: [{ note: 36, sample_path: kickWav }] } });
+fixtures.refuseImports(false);
+assert.equal(kitNoImport.isError, true);
+assert.match(kitNoImport.content[0].text, /pads\[0\]: Could not import .*Nothing was changed in the Live Set\./);
+assert.equal((await devicesOf("Kit 4")).length, 0);
+fixtures.refuseSamples(true);
+const kitNoSample = await call("drum_kit_build", { track_name: "Kit 4", pads: [{ note: 36, sample_path: kickWav }, { note: 38, sample_path: snareWav, volume: 0.1 }] });
+fixtures.refuseSamples(false);
+assert.deepEqual([kitNoSample.rack_created, kitNoSample.built_count, kitNoSample.errors.length], [true, 0, 2]);
+assert.match(kitNoSample.pads[0].error, /^loading \/mock-project\/Samples\/Imported\/kick\.wav: .*rejected the operation/);
+assert.deepEqual(kitNoSample.pads.map((p) => [p.chain_created, p.simpler_created, p.sample]), [[true, true, undefined], [true, true, undefined]]);
+assert.equal((await call("chain_get", { chain_id: kitNoSample.pads[1].chain_id })).mixer.volume.value, 0.85, "a failed pad gets no level");
+// insertChain is typed as returning a Chain: a chain that is not a DrumChain fails its pad
+await call("track_create", { type: "midi", name: "Kit 5" });
+fixtures.plainChains(true);
+const kitPlain = await call("drum_kit_build", { track_name: "Kit 5", pads: [{ note: 36, sample_path: kickWav }] });
+fixtures.plainChains(false);
+assert.deepEqual([kitPlain.pads[0].chain_created, kitPlain.pads[0].simpler_device_id], [true, undefined]);
+assert.match(kitPlain.pads[0].error, /^creating its chain: Live created Chain \d+, not a drum chain/);
+
+// --- clip_copy -----------------------------------------------------------------
+const copySrcTrack = await call("track_create", { type: "midi", name: "Copy Src" });
+const riff = await call("clip_create", { type: "midi", track_name: "Copy Src", scene_index: 0, duration: 4, name: "Riff", color: "#123456", notes: [
+  { pitch: 60, start_time: 0, duration: 0.5, velocity: 100 }, { pitch: 61, start_time: 1, duration: 0.5, velocity: 90, probability: 0.5 },
+  { pitch: 62, start_time: 2, duration: 0.5, velocity: 100 }, { pitch: 63, start_time: 3, duration: 2, velocity: 100 }] });
+const playOf = async (clip_id) => (await notesOf(clip_id)).map((n) => [n.pitch, n.start_time, n.duration]);
+// session (looping 0-4) to the arrangement, twice as long: the loop repeats; a note is cut at the loop end
+let copiedClip = await undoSteps(() => call("clip_copy", { clip_id: riff.id, track_name: "Copy Src", start_time: 8, duration: 8 }));
+assert.equal(copiedClip.steps, 2, "create + notes and properties");
+let cc = copiedClip.result;
+assert.deepEqual([cc.class, cc.start_time, cc.end_time, cc.name, cc.color, cc.looping, cc.note_count, cc.moved, cc.fidelity, cc.source_id],
+  ["MidiClip", 8, 16, "Riff", "#123456", true, 8, false, "notes", riff.id]);
+assert.deepEqual(cc.location, { view: "arrangement", track_id: copySrcTrack.id, track_name: "Copy Src", track_index: copySrcTrack.index, track_type: "midi" });
+assert.match(cc.lost.join(" "), /envelopes/);
+assert.deepEqual(await playOf(cc.id), [[60, 0, 0.5], [61, 1, 0.5], [62, 2, 0.5], [63, 3, 1], [60, 4, 0.5], [61, 5, 0.5], [62, 6, 0.5], [63, 7, 1]]);
+assert.deepEqual((await notesOf(cc.id))[1], { pitch: 61, start_time: 1, duration: 0.5, velocity: 90, probability: 0.5 }, "note fields are kept");
+const arrCopy = cc;
+// start marker 1, loop 2-4: plays 1-4, then the loop; re-based to start at 0, into an empty session slot
+fixtures.setClipRegion(riff.id, { startMarker: 1, loopStart: 2, loopEnd: 4, looping: true });
+cc = await call("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_name: "Chorus", duration: 6 });
+assert.deepEqual([cc.location.view, cc.location.scene_index, cc.duration, cc.looping], ["session", 1, 6, true]);
+assert.deepEqual(await playOf(cc.id), [[61, 0, 0.5], [62, 1, 0.5], [63, 2, 1], [62, 3, 0.5], [63, 4, 1], [62, 5, 0.5]]);
+const slotCopy = cc;
+// not looping, markers 1-3: the region; a longer copy repeats it
+fixtures.setClipRegion(riff.id, { looping: false, startMarker: 1, endMarker: 3, endTime: 2 });
+cc = await call("clip_copy", { clip_id: riff.id, track_id: copySrcTrack.id, start_time: 20 });
+assert.deepEqual([cc.start_time, cc.end_time, cc.looping], [20, 22, false]);
+assert.deepEqual(await playOf(cc.id), [[61, 0, 0.5], [62, 1, 0.5]]);
+const regionCopy = cc;
+cc = await call("clip_copy", { clip_id: riff.id, track_id: copySrcTrack.id, start_time: 24, duration: 5, name: "Tiled", color: "#00ff00" });
+assert.deepEqual([cc.name, cc.color], ["Tiled", "#00ff00"]);
+assert.deepEqual((await playOf(cc.id)).map((n) => [n[0], n[1]]), [[61, 0], [62, 1], [61, 2], [62, 3], [61, 4]]);
+const tiledCopy = cc;
+// move: the copy first, then the source is deleted (three undo steps); onto its own place: nothing happens
+const movedClip = await undoSteps(() => call("clip_copy", { clip_id: arrCopy.id, track_name: "Copy Src", start_time: 32, move: true }));
+assert.equal(movedClip.steps, 3);
+assert.deepEqual([movedClip.result.moved, movedClip.result.start_time, movedClip.result.note_count], [true, 32, 8]);
+assert.equal((await client.callTool({ name: "clip_get", arguments: { clip_id: arrCopy.id } })).isError, true, "the source is gone");
+const stay = await call("clip_copy", { clip_id: movedClip.result.id, track_name: "Copy Src", start_time: 32, move: true });
+assert.deepEqual([stay.id, stay.moved, stay.unchanged], [movedClip.result.id, false, "the clip is already there"]);
+// over existing clips: they are reported
+cc = await call("clip_copy", { clip_id: movedClip.result.id, track_name: "Copy Src", start_time: 30, duration: 4 });
+assert.deepEqual(cc.overlaps, [movedClip.result.id]);
+const overlapCopy = cc;
+// the target is checked first; nothing is created on a bad call
+const arrCount = async (track_name) => (await call("track_get", { track_name, include: ["arrangement_clips"] })).arrangement_clips.length;
+const copyClipsBefore = await arrCount("Copy Src");
+await usageError("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_index: 0 }, /The target is the clip's own slot/);
+await usageError("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_index: 1 },
+  new RegExp(`already holds clip ${slotCopy.id} \\("Riff"\\): delete it first`));
+await usageError("clip_copy", { clip_id: riff.id, track_name: "Drums", start_time: 0 },
+  /A MIDI clip can only be copied to a MIDI track; "Drums" .* is of type audio/);
+await usageError("clip_copy", { clip_id: riff.id, track_name: "Copy Src" }, /start_time is required/);
+await usageError("clip_copy", { clip_id: riff.id, target_id: (await slotsOf(midiTrackId))[1].id, start_time: 4 }, /start_time only applies/);
+await usageError("clip_copy", { clip_id: riff.id, track_name: "Copy Src", start_time: 40, color: "red" }, /Invalid color/);
+await usageError("clip_copy", { clip_id: riff.id, target_id: kit3.id, start_time: 0, track_name: "Copy Src" }, /not both/);
+assert.equal(await arrCount("Copy Src"), copyClipsBefore);
+// audio: file, warping, warp mode and markers/loop; Live warps the copy itself
+await call("track_create", { type: "audio", name: "Copy Audio" });
+const loopSrc = await call("clip_create", { type: "audio", track_name: "Copy Audio", start_time: 0, duration: 8, file_path: "/tmp/loop.wav",
+  import_into_project: false, is_warped: true, name: "Loop",
+  loop_settings: { looping: true, start_marker: 0.5, end_marker: 3.5, loop_start: 1, loop_end: 3 } });
+await call("clip_set", { clip_id: loopSrc.id, warp_mode: "Complex", muted: true });
+fixtures.setWarpMarkers(loopSrc.id, [{ sampleTime: 0, beatTime: 0 }, { sampleTime: 1.5, beatTime: 4 }]);
+cc = await call("clip_copy", { clip_id: loopSrc.id, track_name: "Copy Audio", start_time: 16 });
+assert.deepEqual([cc.class, cc.file_path, cc.warping, cc.warp_mode, cc.muted, cc.name, cc.start_time, cc.end_time],
+  ["AudioClip", "/tmp/loop.wav", true, "Complex", true, "Loop", 16, 24]);
+assert.deepEqual([cc.looping, cc.start_marker, cc.end_marker, cc.loop_start, cc.loop_end], [true, 0.5, 3.5, 1, 3]);
+assert.deepEqual([cc.fidelity, cc.warp_markers_match, cc.differs], ["approximate", false, undefined]);
+assert.match(cc.lost.join(" "), /warp markers/);
+const audioCopies = [cc.id];
+cc = await call("clip_copy", { clip_id: loopSrc.id, track_name: "Copy Audio", scene_index: 0 });
+assert.deepEqual([cc.location.view, cc.looping, cc.loop_start, cc.loop_end], ["session", true, 1, 3]);
+audioCopies.push(cc.id);
+await usageError("clip_copy", { clip_id: loopSrc.id, track_name: "Copy Audio", scene_index: 1, duration: 4 }, /takes no duration/);
+await usageError("clip_copy", { clip_id: loopSrc.id, track_name: "Copy Src", start_time: 40 }, /An audio clip can only be copied to a audio track|can only be copied to a audio track/);
+// a loop shorter than a new clip allows: copied without it, and said so
+fixtures.setClipRegion(loopSrc.id, { loopStart: 1, loopEnd: 1.1 });
+cc = await call("clip_copy", { clip_id: loopSrc.id, track_name: "Copy Audio", start_time: 40 });
+assert.deepEqual([cc.looping, cc.loop_start, cc.loop_end, cc.differs], [false, 0.5, 3.5, [{ field: "duration", requested: 8, got: 3 }]],
+  "without its loop the copy is only as long as its region");
+assert.match(cc.lost.join(" "), /the loop: it is shorter than 0\.25 beats/);
+audioCopies.push(cc.id);
+// a longer copy of a clip that does not loop: Live caps it at the region, and `differs` says so
+const hit = await call("clip_create", { type: "audio", track_name: "Copy Audio", start_time: 60, file_path: "/tmp/hit.wav", import_into_project: false });
+cc = await call("clip_copy", { clip_id: hit.id, track_name: "Copy Audio", start_time: 70, duration: 8 });
+assert.deepEqual([cc.warping, cc.warp_markers_match, cc.differs], [false, undefined, [{ field: "duration", requested: 8, got: 4 }]]);
+
+// --- arrangement_copy_range ----------------------------------------------------
+await call("track_create", { type: "midi", name: "ArrM" });
+await call("track_create", { type: "audio", name: "ArrA" });
+const mk = (start_time, duration, pitches, name) => call("clip_create", { type: "midi", track_name: "ArrM", start_time, duration, name,
+  notes: pitches.map((pitch, i) => ({ pitch, start_time: i, duration: 0.5 })) });
+const clipA = await mk(0, 4, [60, 61, 62, 63], "A");
+const clipB = await mk(6, 4, [64, 65, 66, 67], "B"); // crosses the range end
+const clipC = await mk(12, 2, [70], "C");
+const inTarget = await mk(18, 2, [72], "T1");
+const crossTarget = await mk(22, 4, [74, 75, 76, 77], "T2"); // crosses the target end
+const clipD = await call("clip_create", { type: "audio", track_name: "ArrA", start_time: 0, file_path: "/tmp/kick.wav", name: "D" });
+const clipE = await call("clip_create", { type: "audio", track_name: "ArrA", start_time: 7, file_path: "/tmp/kick.wav", name: "E" });
+const arrLane = await call("take_lane_create", { track_name: "ArrM" });
+await call("clip_create", { type: "midi", target_id: arrLane.id, start_time: 1, duration: 2 });
+const partCue = await call("cue_point_create", { time: 2, name: "Part" });
+const busyCue = await call("cue_point_create", { time: 5, name: "Busy" });
+const takenCue = await call("cue_point_create", { time: 21, name: "Taken" });
+const arrClipsOf = async (track_name) => (await call("track_get", { track_name, include: ["arrangement_clips"] })).arrangement_clips;
+let copyRange = await undoSteps(() => call("arrangement_copy_range", { start_time: 0, end_time: 8, to_time: 16,
+  tracks: [{ track_name: "ArrM" }, { track_name: "ArrA" }], include_cue_points: true }));
+assert.equal(copyRange.steps, 5, "clear, create, notes and properties, cue points, their names");
+let cr = copyRange.result;
+assert.deepEqual([cr.source, cr.target, cr.copied_count, cr.skipped_count, cr.take_lane_clips_not_copied, cr.errors],
+  [{ start_time: 0, end_time: 8 }, { start_time: 16, end_time: 24 }, 3, 1, 1, undefined]);
+const [rowM, rowA] = cr.tracks;
+assert.deepEqual(rowM.copies.map((c) => [c.source_id, c.name, c.start_time, c.end_time, c.trimmed]),
+  [[clipA.id, "A", 16, 20, undefined], [clipB.id, "B", 22, 24, true]]);
+assert.deepEqual(await playOf(rowM.copies[0].id), [[60, 0, 0.5], [61, 1, 0.5], [62, 2, 0.5], [63, 3, 0.5]]);
+assert.deepEqual(await playOf(rowM.copies[1].id), [[64, 0, 0.5], [65, 1, 0.5]], "trimmed to the range");
+assert.deepEqual(rowA.copies.map((c) => [c.source_id, c.start_time, c.end_time, c.warp_markers_match]), [[clipD.id, 16, 20, undefined]]);
+assert.deepEqual(rowA.skipped.map((s) => [s.source_id, s.start_time, s.end_time]), [[clipE.id, 7, 11]]);
+assert.match(rowA.skipped[0].reason, /crosses the edge of the range/);
+assert.deepEqual([rowM.cleared, rowA.cleared, rowM.name, rowA.type], [true, true, "ArrM", "audio"]);
+// the target was cleared first: the clip in it is gone, the one crossing its end is shortened
+const arrMNow = (await arrClipsOf("ArrM")).sort((a, b) => a.start_time - b.start_time);
+assert.deepEqual(arrMNow.map((c) => [c.name, c.start_time, c.end_time]),
+  [["A", 0, 4], ["B", 6, 10], ["C", 12, 14], ["A", 16, 20], ["B", 22, 24], ["T2", 24, 26]]);
+assert.equal(arrMNow[5].id, crossTarget.id, "a truncated clip keeps its id");
+assert.ok(!arrMNow.some((c) => c.id === inTarget.id));
+assert.deepEqual(cr.cue_points.map((c) => [c.name, c.time, c.skipped !== undefined]),
+  [["Start", 16, false], ["Part", 18, false], ["Busy", 21, true]]);
+assert.deepEqual(cr.cue_points.slice(0, 2).map((c) => c.source_id), [song.cue_points[0].id, partCue.id]);
+// a clip crossing the range's start: its played part from there on, re-based
+cr = await call("arrangement_copy_range", { start_time: 2, end_time: 8, to_time: 40, tracks: [{ track_name: "ArrM" }] });
+assert.deepEqual(cr.tracks[0].copies.map((c) => [c.source_id, c.start_time, c.end_time, c.trimmed]),
+  [[clipA.id, 40, 42, true], [clipB.id, 44, 46, true]]);
+assert.deepEqual(await playOf(cr.tracks[0].copies[0].id), [[62, 0, 0.5], [63, 1, 0.5]]);
+for (const c of cr.tracks[0].copies) await call("clip_delete", { clip_id: c.id });
+// every regular audio and MIDI track by default (the empty ones are cleared too)
+cr = await call("arrangement_copy_range", { start_time: 0, end_time: 4, to_time: 200 });
+const byName2 = Object.fromEntries(cr.tracks.map((t) => [t.name, t.copies.map((c) => c.source_id)]));
+assert.deepEqual(byName2, { "Bass 2": [], Drums: [audioClip.id], "Sampler T": [], "Kit 3": [], "Kit 4": [], "Kit 5": [],
+  "Copy Src": [], "Copy Audio": [], ArrM: [clipA.id], ArrA: [clipD.id] });
+assert.deepEqual(cr.tracks.find((t) => t.name === "Copy Audio").skipped.map((x) => x.source_id), [loopSrc.id], "beats 0-8 cross the range end");
+assert.equal(cr.cue_points, undefined);
+for (const t of cr.tracks) for (const c of t.copies) await call("clip_delete", { clip_id: c.id });
+// checked first; nothing changes on a bad call
+const arrMCount = (await arrClipsOf("ArrM")).length;
+await usageError("arrangement_copy_range", { start_time: 8, end_time: 8, to_time: 32 }, /end_time 8 must be after start_time 8/);
+await usageError("arrangement_copy_range", { start_time: 0, end_time: 8, to_time: 4 }, /target range 4-12 overlaps the source range 0-8/);
+await usageError("arrangement_copy_range", { start_time: 0, end_time: 8, to_time: 32, tracks: [{ track_name: "ArrM" }, { track_name: "A-Reverb" }] },
+  /"A-Reverb" .* is a return track: only audio and MIDI tracks/);
+assert.equal((await arrClipsOf("ArrM")).length, arrMCount);
+
+// --- render_track_audio: analysis, persist, several tracks ---------------------
+await call("track_create", { type: "audio", name: "Render" });
+await call("clip_create", { type: "audio", track_name: "Render", start_time: 0, file_path: "/tmp/kick.wav" }); // beats 0-4
+const near = (a, b, tol = 0.2) => a !== null && Math.abs(a - b) <= tol;
+let rendered = await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 8, analyze: true });
+let an = rendered.analysis;
+assert.ok(fs.existsSync(rendered.audio_path) && rendered.imported_path === undefined);
+assert.deepEqual([an.format, an.bits_per_sample, an.sample_rate, an.channels, an.frames, an.duration_s, an.clipped_samples, an.silent],
+  ["float", 32, 8000, 2, 38400, 4.8, 0, false], "8 beats at 100 bpm");
+assert.ok(near(an.peak_dbfs, -6.02) && near(an.rms_dbfs, -14.08), `levels ${an.peak_dbfs} / ${an.rms_dbfs}`);
+assert.ok(near(an.channel_levels[0].peak_dbfs, -6.02) && near(an.channel_levels[1].peak_dbfs, -12.04));
+assert.ok(near(an.channel_levels[0].rms_dbfs, -12.04) && near(an.channel_levels[1].rms_dbfs, -18.06));
+assert.equal(an.envelope.buckets, 32);
+assert.ok(an.envelope.peak_dbfs.slice(0, 16).every((v) => near(v, -6.02, 0.3)), "sound while the clip plays");
+assert.deepEqual(an.envelope.peak_dbfs.slice(16), Array(16).fill(null), "digital silence after it");
+assert.ok(near(an.envelope.rms_dbfs[0], -11.07, 0.3), `bucket rms ${an.envelope.rms_dbfs[0]}`);
+// every sample format the analysis reads
+for (const [fmt, expected] of [
+  [{ bits: 16, float: false }, ["pcm", 16]], [{ bits: 24, float: false }, ["pcm", 24]], [{ bits: 32, float: false }, ["pcm", 32]],
+  [{ bits: 8, float: false }, ["pcm", 8]], [{ bits: 64, float: true }, ["float", 64]],
+  [{ bits: 24, float: false, extensible: true, listChunk: true }, ["pcm", 24]], [{ bits: 32, float: true, extensible: true, channels: 1 }, ["float", 32]],
+]) {
+  fixtures.renderFormat({ extensible: false, listChunk: false, channels: 2, ...fmt });
+  an = (await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 8, analyze: true })).analysis;
+  assert.deepEqual([an.format, an.bits_per_sample, an.channels, an.frames], [...expected, fmt.channels ?? 2, 38400], JSON.stringify(fmt));
+  assert.ok(near(an.peak_dbfs, -6.02) && an.clipped_samples === 0 && !an.silent, `${JSON.stringify(fmt)}: peak ${an.peak_dbfs}`);
+}
+// clipping: integer samples stop at full scale, float ones go over it
+const renderId = (await tracksNow()).find((t) => t.name === "Render").id;
+fixtures.renderLevel(renderId, 1.5);
+fixtures.renderFormat({ bits: 16, float: false, extensible: false, listChunk: false, channels: 2 });
+an = (await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 8, analyze: true })).analysis;
+assert.ok(an.peak_dbfs === 0 && an.clipped_samples > 0 && an.channel_levels[0].clipped_samples > 0, `peak ${an.peak_dbfs}, ${an.clipped_samples} clipped`);
+fixtures.renderFormat({ bits: 32, float: true });
+an = (await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 8, analyze: true })).analysis;
+assert.ok(near(an.peak_dbfs, 3.52) && an.clipped_samples > 0, `float peak ${an.peak_dbfs}`);
+fixtures.renderLevel(renderId, 0.5);
+// silence, a broken file (the render is still returned), persist, several tracks
+an = (await call("render_track_audio", { track_name: "Render", start_time: 100, end_time: 104, analyze: true })).analysis;
+assert.deepEqual([an.silent, an.peak_dbfs, an.rms_dbfs, an.clipped_samples, new Set(an.envelope.peak_dbfs).size], [true, null, null, 0, 1]);
+fixtures.renderFormat({ garbage: true });
+rendered = await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 4, analyze: true });
+fixtures.renderFormat({ garbage: false });
+assert.ok(rendered.audio_path && rendered.analysis === undefined);
+assert.match(rendered.analysis_error, /could not be analyzed: not a WAV file/);
+rendered = await call("render_track_audio", { track_name: "Render", start_time: 0, end_time: 4, persist: true });
+assert.equal(rendered.imported_path, `/mock-project/Samples/Imported/${path.basename(rendered.audio_path)}`);
+assert.equal(rendered.analysis, undefined, "analysis only on request");
+const multi2 = await call("render_track_audio", { tracks: [{ track_name: "Render" }, { track_name: "ArrA" }], start_time: 0, end_time: 4, analyze: true });
+assert.deepEqual(multi2.items.map((it) => [it.track_name, it.analysis.silent]), [["Render", false], ["ArrA", false]]);
+assert.notEqual(multi2.items[0].audio_path, multi2.items[1].audio_path);
+await usageError("render_track_audio", { tracks: [{ track_name: "Render" }, { track_name: "ArrM" }], start_time: 0, end_time: 4 },
+  /Only audio tracks can be rendered; "ArrM"/);
+await usageError("render_track_audio", { tracks: [{ track_name: "Render" }], track_name: "Render", start_time: 0, end_time: 4 }, /not both/);
+await usageError("render_track_audio", { track_name: "Render", start_time: 4, end_time: 4 }, /end_time 4 must be after start_time 4/);
+
+// --- audio_track_consolidate ---------------------------------------------------
+await call("track_create", { type: "audio", name: "Comp" });
+const compClips = [];
+for (const start_time of [0, 4, 10]) compClips.push(await call("clip_create", { type: "audio", track_name: "Comp", start_time, file_path: "/tmp/take.wav" }));
+const consolidated = await undoSteps(() => call("audio_track_consolidate", { track_name: "Comp", start_time: 0, end_time: 12, name: "Comp 1", color: "#ff0000" }));
+assert.equal(consolidated.steps, 3, "clear, create, name and color");
+const cons = consolidated.result;
+assert.deepEqual([cons.class, cons.start_time, cons.end_time, cons.warping, cons.looping, cons.name, cons.color, cons.cleared],
+  ["AudioClip", 0, 12, false, false, "Comp 1", "#ff0000", [0, 12]]);
+assert.deepEqual([cons.file_path, cons.imported_path], [`/mock-project/Samples/Imported/${path.basename(cons.rendered_path)}`, cons.file_path]);
+assert.ok(fs.existsSync(cons.rendered_path));
+assert.equal(cons.location.view, "arrangement");
+const compNow = (await arrClipsOf("Comp")).sort((a, b) => a.start_time - b.start_time);
+assert.deepEqual(compNow.map((c) => [c.id, c.start_time, c.end_time]), [[cons.id, 0, 12], [compClips[2].id, 12, 14]],
+  "the clips in the range are replaced; the one crossing its end is shortened");
+await usageError("audio_track_consolidate", { track_name: "ArrM", start_time: 0, end_time: 4 }, /Only audio tracks can be consolidated; "ArrM"/);
+await usageError("audio_track_consolidate", { track_name: "Comp", start_time: 4, end_time: 2 }, /end_time 2 must be after start_time 4/);
+await usageError("audio_track_consolidate", { track_name: "Comp", start_time: 0, end_time: 4, color: "#12" }, /Invalid color/);
+await usageError("audio_track_consolidate", { track_name: "Comp", start_time: 50, end_time: 60 }, /"Comp" .* has no arrangement clips between 50 and 60/);
+fixtures.refuseImports(true);
+const consFail = await client.callTool({ name: "audio_track_consolidate", arguments: { track_name: "Comp", start_time: 0, end_time: 12 } });
+fixtures.refuseImports(false);
+assert.equal(consFail.isError, true);
+assert.match(consFail.content[0].text, /Could not render and import the range: .*Nothing was changed/);
+assert.deepEqual((await arrClipsOf("Comp")).map((c) => c.id).sort(), compNow.map((c) => c.id).sort());
+
+// --- sample_search ---------------------------------------------------------------
+const sampleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-root-"));
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-outside-"));
+const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-home-"));
+const put = (base, rel) => {
+  fs.mkdirSync(path.dirname(path.join(base, rel)), { recursive: true });
+  fs.writeFileSync(path.join(base, rel), "RIFF");
+};
+for (const rel of ["Drums/Kicks/Kick 808.wav", "Drums/Kicks/Kick Acoustic.aiff", "Drums/Snares/Snare.aif", "Loops/Break.WAV",
+  "readme.txt", ".hidden/secret.wav", "deep/a/b/c/Deep.wav"]) put(sampleRoot, rel);
+put(outside, "Outside Kick.wav");
+put(fakeHome, "Music/Ableton/User Library/Samples/Clap.wav");
+fs.symlinkSync(outside, path.join(sampleRoot, "Linked Out"));
+fs.symlinkSync(path.join(sampleRoot, "Drums"), path.join(sampleRoot, "Drums Alias"));
+const configFile = path.join(storageDir, "config.json");
+fs.writeFileSync(configFile, JSON.stringify({ port: PORT, sample_roots: [sampleRoot, "relative/samples", 42] }));
+const realHome = process.env.HOME;
+process.env.HOME = fakeHome;
+try {
+  let found2 = await call("sample_search", { query: "KICK 808" });
+  const realRoot = fs.realpathSync(sampleRoot);
+  assert.deepEqual(found2.results.map((r) => [r.path, r.name, r.root, r.relative_path, r.size_bytes]),
+    [[path.join(realRoot, "Drums/Kicks/Kick 808.wav"), "Kick 808.wav", path.basename(realRoot), "Drums/Kicks/Kick 808.wav", 4]]);
+  assert.deepEqual([found2.complete, found2.stopped], [true, undefined]);
+  assert.deepEqual(found2.problems, ['sample_roots entry "relative/samples" is not an absolute path', "sample_roots entry 42 is not a folder path"]);
+  assert.deepEqual(found2.roots.map((r) => [r.name, r.source, r.exists]), [[path.basename(sampleRoot), "config", true],
+    ["User Library", "library", true], ["Factory Packs", "library", false], ["User Library", "library", false], ["Factory Packs", "library", false]]);
+  // everything: audio files only, shallow first, no hidden folders, nothing outside the roots, no duplicates via links
+  found2 = await call("sample_search");
+  assert.deepEqual(found2.results.map((r) => r.relative_path), ["Loops/Break.WAV", "Samples/Clap.wav", "Drums/Kicks/Kick 808.wav",
+    "Drums/Kicks/Kick Acoustic.aiff", "Drums/Snares/Snare.aif", "deep/a/b/c/Deep.wav"]);
+  assert.ok(!found2.results.some((r) => /Outside|secret/.test(r.path)), "links out of the roots are not followed");
+  assert.deepEqual((await call("sample_search", { query: "kick", limit: 1 })).stopped, "limit");
+  assert.ok(!(await call("sample_search", { max_depth: 2 })).results.some((r) => r.name === "Deep.wav"));
+  assert.deepEqual((await call("sample_search", { extensions: ["aif"] })).results.map((r) => r.name), ["Snare.aif"]);
+  assert.deepEqual((await call("sample_search", { roots: ["user library"] })).results.map((r) => r.name), ["Clap.wav"]);
+  await usageError("sample_search", { roots: ["Nope"] }, /No sample root named "Nope"\. Roots: /);
+  // without any sample folder the result says how to add one
+  fs.writeFileSync(configFile, JSON.stringify({ port: PORT }));
+  process.env.HOME = outside;
+  found2 = await call("sample_search");
+  assert.deepEqual([found2.results, found2.complete], [[], true]);
+  assert.match(found2.hint, /add folders to "sample_roots"/);
+} finally {
+  process.env.HOME = realHome;
+  fs.writeFileSync(configFile, JSON.stringify({ port: PORT }));
+}
+
+// clean up
+for (const name of ["Sampler T", "Kit 3", "Kit 4", "Kit 5", "Copy Src", "Copy Audio", "ArrM", "ArrA", "Render", "Comp"])
+  await call("track_delete", { track_name: name });
+for (const c of (await call("song_get", { include: ["cue_points"] })).cue_points.filter((x) => x.name !== "Start" || x.time !== 0))
+  await call("cue_point_delete", { cue_point_id: c.id });
+assert.deepEqual((await tracksNow()).map((t) => t.name), ["Bass 2", "Drums"]);
+for (const dir of [samplesDir, sampleRoot, outside, fakeHome]) fs.rmSync(dir, { recursive: true, force: true });
 
 // ui + commands; the status command and its menu entries are registered
 await call("execute_command", { command_id: "ableton-live-mcp.status" });

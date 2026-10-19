@@ -90,6 +90,16 @@ assert.match(init.result.instructions, /song_get/);
 const song = await post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "song_get" } });
 assert.ok(!song.result.isError, song.result.content[0].text);
 assert.equal(typeof JSON.parse(song.result.content[0].text).tempo, "number");
+// file reading code runs inside the context too: no Node globals such as Buffer there
+const toolCall = async (id, name, args) => {
+  const r = await post({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+  assert.ok(!r.result.isError, `${name}: ${r.result.content[0].text}`);
+  return JSON.parse(r.result.content[0].text);
+};
+const rendered = await toolCall(3, "render_track_audio", { track_name: "Drums", start_time: 0, end_time: 4, analyze: true });
+assert.ok(rendered.analysis, `analysis failed in the VM context: ${rendered.analysis_error}`);
+assert.equal(rendered.analysis.silent, true, "the mock's Drums track has no clips: a silent render");
+assert.ok(Array.isArray((await toolCall(4, "sample_search", { limit: 1, time_limit_s: 1 })).results));
 
 fs.rmSync(storageDir, { recursive: true, force: true });
 console.log("OK — bundle activates and serves MCP in a bare VM context");

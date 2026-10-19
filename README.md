@@ -71,6 +71,15 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 { "port": 8722 }
 ```
 
+`sample_roots` lists the folders `sample_search` may search for audio files (absolute paths, or
+`~/...`), in addition to Live's default User Library and Factory Packs folders
+(`~/Music/Ableton/...` on macOS, `~/Documents/Ableton/...` on Windows) when they exist. Unlike
+the port, it is read on every search, so no restart is needed:
+
+```json
+{ "port": 8722, "sample_roots": ["/Users/me/Samples", "~/Splice"] }
+```
+
 Device presets saved with `device_preset_save` are JSON files in `presets/` in the same
 directory (one file per preset, named after it); they can be copied between machines, and
 deleting a file deletes the preset.
@@ -130,6 +139,24 @@ deleting a file deletes the preset.
   `device_preset_load` / `device_preset_list` keep the same kind of snapshot as named JSON files
   in the extension's storage directory (`presets/`) — not Live `.adv` presets. Racks are refused
   by both.
+- **Samples, kits and copies in one call**: `drum_kit_build {track_name | rack_device_id, pads:
+  [{note, sample_path, volume?, panning?}]}` builds or updates a Drum Rack kit — per pad it reuses
+  or creates the chain receiving that note, inserts a Simpler, imports the sample into the project
+  and loads it; every path is checked before anything changes. `simpler_replace_sample` and
+  `device_insert {device_name: "Simpler", sample_path}` import samples into the project by default
+  (`import_into_project`), so the set survives being moved. `sample_search` finds audio files in
+  the configured `sample_roots` and Live's library folders (read-only, confined to those folders).
+  Live's API has no clip copy, so `clip_copy` creates a new clip: MIDI notes are re-based to where
+  the source plays them (markers, loop) and repeated when the copy is longer, so it plays the same;
+  audio copies get the file, warping and markers/loop but Live warps them itself
+  (`fidelity: "approximate"`, `lost`, `warp_markers_match`). `move: true` deletes the source once
+  the copy exists. `arrangement_copy_range` overwrites a target range with a copy of a source range
+  across tracks ("repeat the chorus"): MIDI clips crossing the edges are trimmed, audio clips
+  crossing them are skipped and listed (there is no way to insert time). `audio_track_consolidate`
+  renders a range of an audio track, imports the render, clears the range and puts one unwarped
+  clip there. `render_track_audio {analyze: true}` returns peak/RMS levels (dBFS), clipped samples,
+  a silence flag and a 32-part envelope read from the WAV; `persist: true` imports the render;
+  `tracks` renders several audio tracks.
 - **Whole-set reads**: `song_get` lists every track with its `index`, `depth` in the group
   hierarchy and, for group tracks, type `group` and `child_track_ids`; `include: ["devices",
   "mixer", "clips"]` adds each track's device tree (through racks, with each device's on-state),
@@ -155,14 +182,16 @@ deleting a file deletes the preset.
 - Every tool has a **title and MCP annotations**, so clients can auto-approve reads and single
   out destructive calls:
   - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `parameter_find`,
-    `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `render_track_audio`
-    (it only writes a temp file);
+    `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `sample_search`;
   - setters (`*_set`): non-destructive, idempotent;
-  - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`): non-destructive;
+  - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`, `render_track_audio` —
+    `persist` copies the render into the project): non-destructive;
   - destructive (`destructiveHint`): the deletes, `track_clear_clips_in_range`,
-    `midi_clip_set_notes`, `midi_clip_edit_notes`, `simpler_replace_sample`, `device_copy`
-    (`move` deletes the original), `device_preset_load` (replaces a Simpler's sample),
-    `device_preset_save` (`overwrite` replaces a preset);
+    `midi_clip_set_notes`, `midi_clip_edit_notes`, `simpler_replace_sample`, `device_copy` and
+    `clip_copy` (`move` deletes the original), `device_preset_load` and `drum_kit_build` (replace
+    Simpler samples), `device_preset_save` (`overwrite` replaces a preset),
+    `arrangement_copy_range` (overwrites its target range), `audio_track_consolidate` (clears
+    its range);
   - `show_dialog` (non-destructive) and `execute_command` (destructive) are open-world.
 
 ## Security
@@ -206,6 +235,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `scene_get` | One session row: a scene (by id, index or name) with every regular track's clip slot and clip in it (`only_clips` drops the empty ones). |
 | `session_grid` | The Session View as a compact track × scene matrix (`null` or a brief clip per cell); narrow with `tracks` and `scene_index_min`/`scene_index_max`. |
 | `arrangement_get` | A beat range of the arrangement (`start_time`/`end_time`, default the whole song): cue points in it and each track's overlapping clips (`tracks` to pick, `include_take_lanes` for take lanes), plus a derived `song_end`. |
+| `arrangement_copy_range` | Copy a beat range of the arrangement to `to_time` on every audio/MIDI track (or `tracks`), overwriting the target range (cleared first; no insert-time). MIDI clips crossing the range edges are trimmed, audio clips crossing them skipped and listed; `include_cue_points` copies the locators too. |
 | `scene_create` / `scene_set` / `scene_delete` / `scene_duplicate` | Manage scenes, addressed by `scene_id`, `scene_index` or `scene_name` (exact for delete). `scene_create` takes a `name`, or `items` to create several in order; `scene_set` renames many with `items` in one undo step. |
 | `cue_point_create` / `cue_point_set` / `cue_point_delete` | Manage arrangement locators. Create with a `name`, or several with `items`. `cue_point_set` renames (`items` for many) and moves: with `time` it re-creates the locator at the new position with its name, deletes the old one and returns the new id plus `replaced_id`. |
 
@@ -216,6 +246,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count) and its `location`: session (track, scene, slot), arrangement (track) or take lane. |
 | `clip_set` | Name, color, mute, looping, warping, warp mode — for one clip, several (`items`), or every clip of a track (`select: {track_name, scope, name_contains}`), in one undo step. |
 | `clip_delete` | Delete a session or arrangement clip. |
+| `clip_copy` | Copy a clip to an empty session slot, an arrangement position or a take lane (`move: true` deletes the source afterwards). MIDI notes are re-based from the source's markers/loop and repeated to fill a longer `duration`; audio copies keep file, warping, warp mode and markers/loop but are re-warped by Live (`fidelity`, `lost`, `warp_markers_match`, `differs`). |
 | `midi_clip_get_notes` | Read MIDI notes: all, or those matching `select` (pitch/time range, `in_scale`, `every_nth`, `only_selected`); `format: "compact"` returns tuples. Notes carry `selected` when Live reports it. |
 | `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top); step `patterns` and `repeat` write repetitive parts in a few characters. |
 | `midi_clip_edit_notes` | Server-side note transforms — transpose, snap to scale, set fields, velocity scale/offset, time-shift, quantize (beats or Live's grid), swing, duration set/scale, legato, seeded humanize, delete — on the notes matching `select`, for one clip or several (`clip_ids`, one undo step). No read-modify-write roundtrip. |
@@ -224,7 +255,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | Tool | Description |
 |------|-------------|
 | `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample, and its `location` (track, path through racks, position). |
-| `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain, optionally with initial `parameters` (one more undo step). |
+| `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain, optionally with initial `parameters` (one more undo step); a Simpler can load a `sample_path` (imported into the project by default; removed again if the sample fails). |
 | `device_set` | Switch a device on/off (`enabled`: its "Device On" parameter, or a two-state first parameter as a reported fallback) and set several of its parameters by name, `value_item`, `reset` or `delta` — one undo step. The device is `device_id` or track + `device` (name, index or rack path). |
 | `device_delete` / `device_duplicate` | Remove or copy devices (the duplicate lands right after the original). |
 | `device_copy` | Copy a device to another track or chain, or with `move: true` move/reorder it: inserts the built-in device by name and copies parameter values by name (Simpler: and its sample). Lossy — automation, mappings and non-parameter state are lost, ids change; racks are refused. |
@@ -232,7 +263,8 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `chain_get` | Rack chain detail: devices + chain mixer and `location`; drum chains report `receiving_note` and `receiving_note_name`. |
 | `rack_insert_chain` | Add a chain to a rack. |
 | `drum_chain_set` | Set the MIDI note of a drum rack pad (a number or a name like `"D1"`). |
-| `simpler_replace_sample` | Swap the sample in a Simpler. |
+| `simpler_replace_sample` | Swap the sample in a Simpler; by default the file is imported into the project first (`import_into_project`). |
+| `drum_kit_build` | Build or update a Drum Rack kit from sample files: per pad `{note, sample_path, volume?, panning?}` the chain receiving the note is reused or created, a Simpler inserted, the sample imported and loaded. All paths are checked first; later per-pad failures are reported per pad. The rack is `rack_device_id`, or a MIDI track's Drum Rack (inserted when missing). |
 
 ### Parameters & mixing
 | Tool | Description |
@@ -247,7 +279,9 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | Tool | Description |
 |------|-------------|
 | `import_file` | Copy a file into the Live project. |
-| `render_track_audio` | Render the pre-FX audio of an audio track (by id, index or name; clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — import it to keep it. Not normalized since Live 12.4.15. |
+| `render_track_audio` | Render the pre-FX audio of an audio track (by id, index or name; clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — `persist: true` imports it into the project. Not normalized since Live 12.4.15. `analyze: true` adds overall and per-channel peak/RMS in dBFS, clipped samples, a silence flag and a 32-part envelope; `tracks` renders several audio tracks. |
+| `audio_track_consolidate` | Render a range of an audio track (pre-FX), import it, clear the range and create one unwarped clip of the render there, optionally named and colored — Live's Consolidate for comps. Destructive. |
+| `sample_search` | Find audio files by words in their path, read-only, in the `sample_roots` of config.json and Live's User Library / Factory Packs folders; confined to those folders, with depth, time and result limits. |
 
 ### Selection
 | Tool | Description |
@@ -279,6 +313,9 @@ Typical things you can ask a connected assistant to do:
 - "Turn down every track that isn't the vocal bus by 3 dB"
 - "Build a song skeleton: intro, verse, chorus scenes with locators"
 - "Replace the sample in Simpler with /path/to/kick.wav and map it to C1"
+- "Build an 8-pad kit from the 808 samples in my sample folder" (`sample_search`, then `drum_kit_build`)
+- "Repeat the chorus at bar 33" / "Put this clip in the arrangement at bar 17" (`arrangement_copy_range`, `clip_copy`)
+- "Is the vocal take clipping anywhere?" (`render_track_audio {analyze: true}`)
 - "Bypass the compressor on the vocals and switch the bass filter to high-pass"
 - "Move the reverb before the EQ" (a lossy copy-and-delete: see `device_copy`)
 - "What happens in bars 17 to 33?" / "Check the set for missing samples"
@@ -296,6 +333,13 @@ Typical things you can ask a connected assistant to do:
   markers or loops after creation, and the song time signature.
 - The user's selection can't be read directly: it is only available once the user hands it over
   with the "MCP: Use as selection" context-menu entry.
+- Clips can't be copied, moved or trimmed by the API: `clip_copy` and `arrangement_copy_range`
+  create new clips. Audio copies are re-warped by Live (warp markers can't be set), clip
+  envelopes, groove and launch settings are lost, and time can't be inserted into the
+  arrangement. Racks can't delete chains, so `drum_kit_build` keeps a chain it created even if
+  its pad fails.
+- `sample_search` only sees the folders it is given (`sample_roots`) and Live's default library
+  folders — the API has no browser access.
 - `show_dialog` blocks until the user closes the dialog in Live.
 
 ## Tests

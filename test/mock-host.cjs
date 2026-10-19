@@ -3,6 +3,8 @@
 // 1 cue point. Enough to E2E-test the MCP pipeline without Ableton Live.
 "use strict";
 
+const fs = require("node:fs");
+
 let nextId = 1n;
 const objects = new Map(); // idString -> mock object
 
@@ -148,6 +150,140 @@ const BUILTIN_DEVICES = {
 const refusedWrites = new Set();
 let refuseSamples = false;
 
+// Drum Racks whose new chains are plain Chains (fixtures.plainChains): the SDK
+// types insertChain as returning Chain, so the server must check.
+let plainChains = false;
+// Whether importIntoProject fails (fixtures.refuseImports).
+let refuseImports = false;
+
+// --- audio files -------------------------------------------------------------
+// A file's natural length in beats, for the files the mock renders (and their
+// imported copies); any other file counts as 4 beats long.
+const fileBeats = new Map();
+const naturalBeats = (file) => fileBeats.get(file) ?? 4;
+
+// Where a clip is in its own time after `p` beats of playback from its start
+// marker: through the marker region, or into the loop and around it.
+function clipTimeAt(c, p) {
+  if (!c.looping) return c.startMarker + p;
+  const pre = Math.max(0, c.loopEnd - c.startMarker);
+  if (p < pre) return c.startMarker + p;
+  return c.loopStart + ((p - pre) % (c.loopEnd - c.loopStart));
+}
+
+// The region and length of a new audio clip, by AudioTrack.createAudioClip's
+// rules (index.d.mts ClipLoopSettings); null when the API rejects the args.
+function audioClipFields(args, withDuration) {
+  const ls = args.loopSettings;
+  if (ls) {
+    if (args.isWarped === undefined) return null;
+    if (ls.startMarker > ls.endMarker) return null;
+    if (ls.loopEnd - ls.loopStart < 0.25) return null;
+    if (!ls.looping && (ls.loopStart !== ls.startMarker || ls.loopEnd !== ls.endMarker)) return null;
+    const positions = [ls.startMarker, ls.endMarker, ls.loopStart, ls.loopEnd];
+    if (args.isWarped === false && (ls.looping || positions.some((v) => v < 0))) return null;
+  }
+  const natural = naturalBeats(args.filePath);
+  const region = ls
+    ? { looping: ls.looping, startMarker: ls.startMarker, endMarker: ls.endMarker, loopStart: ls.loopStart, loopEnd: ls.loopEnd }
+    : { looping: false, startMarker: 0, endMarker: natural, loopStart: 0, loopEnd: natural };
+  // the duration is capped at the region for non-looping clips; looping ones repeat to fill it
+  const own = region.looping ? region.loopEnd - region.loopStart : region.endMarker - region.startMarker;
+  const length = withDuration && args.duration !== undefined
+    ? (region.looping ? args.duration : Math.min(args.duration, own))
+    : own;
+  return { ...region, length, warping: !!args.isWarped };
+}
+function makeAudioClip(args, startTime, withDuration) {
+  const f = audioClipFields(args, withDuration);
+  if (!f) return null;
+  return make(["AudioClip", "Clip"], {
+    name: "", startTime, endTime: startTime + f.length,
+    startMarker: f.startMarker, endMarker: f.endMarker, looping: f.looping, loopStart: f.loopStart, loopEnd: f.loopEnd,
+    color: 0, muted: false, filePath: args.filePath, warping: f.warping, warpMode: 0, warpMarkers: [],
+  });
+}
+
+// WAV files as renderPreFxAudio writes them (fixtures.renderFormat): PCM
+// 8/16/24/32-bit or IEEE float 32/64, optionally WAVE_FORMAT_EXTENSIBLE, and
+// optionally with a LIST chunk (odd-sized, so padded) before the data, or
+// not a WAV at all (garbage).
+let renderFormat = { sampleRate: 8000, channels: 2, bits: 32, float: true, extensible: false, listChunk: false };
+// The level of a track's render where its arrangement clips play (fixtures.renderLevel).
+const renderLevels = new Map();
+function writeWav(file, fmt, frames, sampleAt) {
+  const bytes = fmt.bits / 8;
+  const block = bytes * fmt.channels;
+  const data = Buffer.alloc(frames * block);
+  const full = 2 ** (fmt.bits - 1);
+  for (let f = 0; f < frames; f++)
+    for (let ch = 0; ch < fmt.channels; ch++) {
+      const v = sampleAt(f, ch);
+      const at = f * block + ch * bytes;
+      if (fmt.float) {
+        if (fmt.bits === 32) data.writeFloatLE(v, at);
+        else data.writeDoubleLE(v, at);
+        continue;
+      }
+      const code = Math.max(-full, Math.min(full - 1, Math.round(v * (full - 1))));
+      if (fmt.bits === 8) data.writeUInt8(code + 128, at);
+      else if (fmt.bits === 16) data.writeInt16LE(code, at);
+      else if (fmt.bits === 24) data.writeIntLE(code, at, 3);
+      else data.writeInt32LE(code, at);
+    }
+  const code = fmt.float ? 3 : 1;
+  const fmtBody = Buffer.alloc(fmt.extensible ? 40 : 16);
+  fmtBody.writeUInt16LE(fmt.extensible ? 0xfffe : code, 0);
+  fmtBody.writeUInt16LE(fmt.channels, 2);
+  fmtBody.writeUInt32LE(fmt.sampleRate, 4);
+  fmtBody.writeUInt32LE(fmt.sampleRate * block, 8);
+  fmtBody.writeUInt16LE(block, 12);
+  fmtBody.writeUInt16LE(fmt.bits, 14);
+  if (fmt.extensible) {
+    fmtBody.writeUInt16LE(22, 16);
+    fmtBody.writeUInt16LE(fmt.bits, 18);
+    fmtBody.writeUInt32LE(fmt.channels === 2 ? 3 : 4, 20);
+    // KSDATAFORMAT_SUBTYPE_PCM / _IEEE_FLOAT: the format code, then a fixed GUID tail
+    fmtBody.writeUInt16LE(code, 24);
+    Buffer.from("000000001000800000aa00389b71", "hex").copy(fmtBody, 26);
+  }
+  const chunk = (id, body) => {
+    const head = Buffer.alloc(8);
+    head.write(id, 0, "ascii");
+    head.writeUInt32LE(body.length, 4);
+    return Buffer.concat([head, body, body.length % 2 ? Buffer.alloc(1) : Buffer.alloc(0)]);
+  };
+  const chunks = [chunk("fmt ", fmtBody)];
+  if (fmt.listChunk) chunks.push(chunk("LIST", Buffer.from("INFOISFT\x05\x00\x00\x00mock\x00", "latin1")));
+  chunks.push(chunk("data", data));
+  const body = Buffer.concat([Buffer.from("WAVE", "ascii"), ...chunks]);
+  const riff = Buffer.alloc(8);
+  riff.write("RIFF", 0, "ascii");
+  riff.writeUInt32LE(body.length, 4);
+  fs.writeFileSync(file, Buffer.concat([riff, body]));
+}
+let renders = 0;
+// Pre-FX render of a track: a 440 Hz tone (the right channel 6 dB lower)
+// where its unmuted arrangement clips play, silence elsewhere.
+function renderTrack(tempDir, track, start, end) {
+  const fmt = renderFormat;
+  const seconds = ((end - start) * 60) / songObj.tempo;
+  const frames = Math.round(seconds * fmt.sampleRate);
+  const level = renderLevels.get(track.handle.id.toString()) ?? 0.5;
+  const clips = track.arrClips.filter((c) => !c.muted);
+  const file = `${tempDir}/render-${track.handle.id}-${++renders}.wav`;
+  fileBeats.set(file, end - start);
+  // a file that is not a WAV at all (fixtures.renderFormat({garbage: true}))
+  if (fmt.garbage) return fs.writeFileSync(file, "not a wav file"), file;
+  writeWav(file, fmt, frames, (f, ch) => {
+    const t = f / fmt.sampleRate;
+    const beat = start + (t * songObj.tempo) / 60;
+    if (!clips.some((c) => c.startTime <= beat && beat < c.endTime)) return 0;
+    return level * (ch === 0 ? 1 : 0.5) * Math.sin(2 * Math.PI * 440 * t);
+  });
+  return file;
+}
+
 let selectedTrack = null;
 function insertAfterSelection(song, track) {
   const i = selectedTrack ? song.tracks.indexOf(selectedTrack) : -1;
@@ -166,7 +302,7 @@ const SELECTION_SCOPES = ["ClipSlotSelection", "AudioTrack.ArrangementSelection"
 // nested transactions collapse into the outermost one (index.d.mts
 // withinTransaction); `transactions.all` also counts the nested ones that the
 // SDK opens around every setter and async operation.
-const calls = { dialogs: [], commands: {}, menus: [], transactions: { outer: 0, all: 0 } };
+const calls = { dialogs: [], commands: {}, menus: [], imports: [], transactions: { outer: 0, all: 0 } };
 let transactionDepth = 0;
 
 const dataModel = {
@@ -292,13 +428,11 @@ const dataModel = {
     get(h).arrClips.push(c);
     ok(c.handle);
   },
-  trackCreateAudioClip: (h, args, ok) => {
-    const c = make(["AudioClip", "Clip"], {
-      name: "", startTime: args.startTime, endTime: args.startTime + (args.duration ?? 4),
-      startMarker: 0, endMarker: 4, looping: false, loopStart: 0, loopEnd: 4,
-      color: 0, muted: false, filePath: args.filePath, warping: !!args.isWarped,
-      warpMode: 0, warpMarkers: [],
-    });
+  // Audio clips follow createAudioClip's rules (audioClipFields): arguments
+  // the API rejects are rejected without an error value.
+  trackCreateAudioClip: (h, args, ok, err) => {
+    const c = makeAudioClip(args, args.startTime, true);
+    if (!c) return err();
     c.parentTrack = get(h);
     get(h).arrClips.push(c);
     ok(c.handle);
@@ -336,15 +470,54 @@ const dataModel = {
     t.devices.splice(t.devices.findIndex((x) => x.handle.id === dh.id) + 1, 0, d);
     ok(d.handle);
   },
+  // A deleted clip's handle is invalid from then on, as in Live.
   trackDeleteClip: (h, ch, ok) => {
     const t = get(h);
     t.arrClips = t.arrClips.filter((c) => c.handle.id !== ch.id);
     // take-lane clips are arrangement clips too: the server deletes them via
     // their lane's track
     for (const lane of t.takeLanes) lane.clips = lane.clips.filter((c) => c.handle.id !== ch.id);
+    objects.delete(ch.id.toString());
     ok();
   },
-  trackClearClipsInRange: (h, s, e, ok) => ok(),
+  // "Deletes clips within the range. Clips that overlap a boundary are
+  // truncated to the range edge" (Track.clearClipsInRange): a truncated clip
+  // keeps its id. A clip spanning the whole range keeps its part before it,
+  // and its part after it becomes a new clip (assumed: Live splits it). Take
+  // lanes are left alone.
+  trackClearClipsInRange: (h, s, e, ok) => {
+    const t = get(h);
+    if (!(e > s)) return ok();
+    const kept = [];
+    // the part of a clip from `at` on (playback continues where it was)
+    const cutStart = (c, at) => {
+      c.startMarker = clipTimeAt(c, at - c.startTime);
+      c.startTime = at;
+    };
+    const cutEnd = (c, at) => {
+      if (!c.looping) c.endMarker = c.startMarker + (at - c.startTime);
+      c.endTime = at;
+    };
+    for (const c of t.arrClips) {
+      if (c.endTime <= s || c.startTime >= e) {
+        kept.push(c);
+      } else if (c.startTime >= s && c.endTime <= e) {
+        objects.delete(c.handle.id.toString());
+      } else if (c.startTime < s && c.endTime > e) {
+        const { handle: _h, ...props } = c;
+        const right = make([...c.classes], { ...props, notes: c.notes && c.notes.map((n) => ({ ...n })) });
+        cutStart(right, e);
+        cutEnd(c, s);
+        kept.push(c, right);
+      } else {
+        if (c.startTime < s) cutEnd(c, s);
+        else cutStart(c, e);
+        kept.push(c);
+      }
+    }
+    t.arrClips = kept.sort((a, b) => a.startTime - b.startTime);
+    ok();
+  },
   withinTransaction: (fn) => {
     calls.transactions.all++;
     if (transactionDepth === 0) calls.transactions.outer++;
@@ -380,7 +553,12 @@ const dataModel = {
   audioclipSetWarpMode: (h, v) => { get(h).warpMode = v; },
   audioclipGetWarpMarkers: (h) => get(h).warpMarkers,
   clipslotGetClip: (h) => (get(h).clip ? get(h).clip.handle : null),
-  clipslotDeleteClip: (h, ok) => { get(h).clip = null; ok(); },
+  clipslotDeleteClip: (h, ok) => {
+    const slot = get(h);
+    if (slot.clip) objects.delete(slot.clip.handle.id.toString());
+    slot.clip = null;
+    ok();
+  },
   clipslotCreateMidiClip: (h, length, ok) => {
     const c = make(["MidiClip", "Clip"], {
       name: "", startTime: 0, endTime: length, startMarker: 0, endMarker: length,
@@ -390,12 +568,9 @@ const dataModel = {
     get(h).clip = c;
     ok(c.handle);
   },
-  clipslotCreateAudioClip: (h, args, ok) => {
-    const c = make(["AudioClip", "Clip"], {
-      name: "", startTime: 0, endTime: 4, startMarker: 0, endMarker: 4,
-      looping: false, loopStart: 0, loopEnd: 4, color: 0, muted: false,
-      filePath: args.filePath, warping: !!args.isWarped, warpMode: 0, warpMarkers: [],
-    });
+  clipslotCreateAudioClip: (h, args, ok, err) => {
+    const c = makeAudioClip(args, 0, false);
+    if (!c) return err();
     c.parentSlot = get(h);
     get(h).clip = c;
     ok(c.handle);
@@ -414,13 +589,9 @@ const dataModel = {
     get(h).clips.push(c);
     ok(c.handle);
   },
-  takelaneCreateAudioClip: (h, args, ok) => {
-    const c = make(["AudioClip", "Clip"], {
-      name: "", startTime: args.startTime, endTime: args.startTime + (args.duration ?? 4),
-      startMarker: 0, endMarker: 4, looping: false, loopStart: 0, loopEnd: 4,
-      color: 0, muted: false, filePath: args.filePath, warping: !!args.isWarped,
-      warpMode: 0, warpMarkers: [],
-    });
+  takelaneCreateAudioClip: (h, args, ok, err) => {
+    const c = makeAudioClip(args, args.startTime, true);
+    if (!c) return err();
     c.parentObj = get(h);
     get(h).clips.push(c);
     ok(c.handle);
@@ -443,7 +614,7 @@ const dataModel = {
   rackdeviceGetChains: (h) => get(h).chains.map((c) => c.handle),
   rackdeviceInsertChain: (h, index, ok) => {
     const rack = get(h);
-    const isDrum = rack.classes.includes("DrumRackDevice");
+    const isDrum = rack.classes.includes("DrumRackDevice") && !plainChains;
     const c = make(isDrum ? ["DrumChain", "Chain"] : ["Chain"], {
       devices: [], mixer: makeMixer("ChainMixerDevice", 0),
       ...(isDrum ? { receivingNote: 60 } : {}),
@@ -500,8 +671,20 @@ function makeActivation(storageDir, tempDir, sink = calls) {
       dataModel,
       environment: { storageDirectory: storageDir, tempDirectory: tempDir, language: "EN" },
       resources: {
-        renderPreFxAudio: (lane, args, ok) => ok(`${tempDir}/render-${args.startTime}-${args.endTime}.wav`),
-        importIntoProject: (fp, ok) => ok(`/mock-project/Samples/Imported/${fp.split("/").pop()}`),
+        // Writes a real WAV file (see renderTrack); AudioTracks only.
+        renderPreFxAudio: (lane, args, ok, err) => {
+          const t = get(lane);
+          if (!t.classes.includes("AudioTrack") || !(args.endTime > args.startTime)) return err();
+          ok(renderTrack(tempDir, t, args.startTime, args.endTime));
+        },
+        // The copy is not written anywhere: its path only stands for it.
+        importIntoProject: (fp, ok, err) => {
+          if (refuseImports) return err(`mock: could not copy ${fp} into the project`);
+          calls.imports.push(fp);
+          const imported = `/mock-project/Samples/Imported/${fp.split(/[\\/]/).pop()}`;
+          if (fileBeats.has(fp)) fileBeats.set(imported, fileBeats.get(fp));
+          ok(imported);
+        },
       },
       ui: {
         registerContextMenuAction: (scope, title, commandId, onOk) => {
@@ -588,6 +771,18 @@ const fixtures = {
   },
   // A handle Live never handed out (a deleted or unknown object).
   bogusHandle: () => ({ id: 987654321n }),
+  // New chains of Drum Racks are plain Chains (on), or DrumChains as usual.
+  plainChains: (on) => { plainChains = on; },
+  // Make importIntoProject fail (with an error message, as its onError allows).
+  refuseImports: (on) => { refuseImports = on; },
+  // The WAV format of renders ({sampleRate, channels, bits, float, extensible,
+  // listChunk, garbage}, merged into the current one), and a track's render level.
+  renderFormat: (fmt) => { renderFormat = { ...renderFormat, ...fmt }; },
+  renderLevel: (trackId, level) => { renderLevels.set(trackId, level); },
+  // A clip's position, markers and loop, which the API can only read.
+  setClipRegion: (clipId, region) => { Object.assign(objects.get(clipId), region); },
+  // A clip's warp markers (read-only in the API).
+  setWarpMarkers: (clipId, markers) => { objects.get(clipId).warpMarkers = markers; },
   // The user picks `title` in the context menu of `scope`, as Live invokes it:
   // the command gets the clicked object's handle, or for selection scopes a
   // ClipSlotSelection ({slots: [ids]}) or an ArrangementSelection ({start,

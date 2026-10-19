@@ -33,11 +33,15 @@ import {
   Track,
   TrackMixer,
   WarpMode,
+  type ClipLoopSettings,
   type ExtensionContext,
   type NoteDescription,
+  type WarpMarker,
 } from "@ableton-extensions/sdk";
 import { UsageError } from "./errors.js";
 import INSTRUCTIONS from "./instructions.md";
+import { renderNotes, type Region } from "./region.js";
+import { AUDIO_EXTENSIONS, configRoots, libraryRoots, searchSamples } from "./samples.js";
 import { SelectionStore, registerSelectionMenus, type Selection } from "./selection.js";
 import { remember, resolve } from "./store.js";
 import {
@@ -52,6 +56,7 @@ import {
   deviceSummary,
   gridName,
   hexToColor,
+  noteName,
   parameterSummary,
   parsePitch,
   parsePitchClass,
@@ -60,6 +65,7 @@ import {
   takeLaneSummary,
   trackSummary,
 } from "./serialize.js";
+import { analyzeWav, ENVELOPE_BUCKETS, SILENCE_DBFS } from "./wav.js";
 
 type Ctx = ExtensionContext<"1.0.0">;
 
@@ -2711,6 +2717,52 @@ function buildServer(
 
   // -- clips -----------------------------------------------------------------
 
+  // clip_create / clip_copy targets: a clip slot, a track (its arrangement, or
+  // with a scene address that scene's slot of the track), or a take lane.
+  function clipTarget(args: { target_id?: string } & TrackAddress & SceneAddress): DataModelObject<"1.0.0"> {
+    const target = findTarget(args);
+    if (!hasSceneAddress(args)) return target;
+    if (!(target instanceof Track))
+      throw new UsageError(`scene_index/scene_id/scene_name require a Track target, got ${classOf(target)}.`);
+    const { index } = findScene(args);
+    const slot = target.clipSlots[index];
+    if (!slot)
+      throw new UsageError(`scene_index ${index} out of range (track has ${target.clipSlots.length} slots).`);
+    return slot;
+  }
+
+  // The track a clip slot or take lane belongs to: its parent, or the track
+  // whose slots or lanes hold it; null when neither tells.
+  function holderTrack(obj: ClipSlot<"1.0.0"> | TakeLane<"1.0.0">): Track<"1.0.0"> | null {
+    const up = parentOf(obj);
+    if (up instanceof Track) return up;
+    const list = (t: Track<"1.0.0">) => (obj instanceof ClipSlot ? t.clipSlots : t.takeLanes);
+    return song().tracks.find((t) => indexIn(list(t), obj) >= 0) ?? null;
+  }
+
+  // A clip's markers and loop, in its own beats.
+  const regionOf = (clip: Clip<"1.0.0">): Region => ({
+    looping: clip.looping,
+    startMarker: num(clip.startMarker),
+    endMarker: num(clip.endMarker),
+    loopStart: num(clip.loopStart),
+    loopEnd: num(clip.loopEnd),
+  });
+
+  // Deletes a clip the way its parent allows (clip_delete, clip_copy move).
+  async function removeClip(clip: Clip<"1.0.0">) {
+    const parent = clip.parent;
+    if (parent instanceof ClipSlot) {
+      await parent.deleteClip();
+    } else if (parent instanceof Track) {
+      await parent.deleteClip(clip);
+    } else if (parent instanceof TakeLane && parent.parent instanceof Track) {
+      await (parent.parent as Track<"1.0.0">).deleteClip(clip);
+    } else {
+      throw new Error(`Cannot determine how to delete clip with parent ${parent ? classOf(parent) : "null"}.`);
+    }
+  }
+
   tool(
     "clip_create",
     { title: "Create clip", annotations: CREATE },
@@ -2772,20 +2824,7 @@ function buildServer(
         const midiOnly = (["notes", "patterns", "repeat"] as const).filter((k) => args[k] !== undefined);
         if (midiOnly.length) throw new UsageError(`${midiOnly.join(", ")} only apply to MIDI clips.`);
       }
-      let target = findTarget(args);
-      if (hasSceneAddress(args)) {
-        if (!(target instanceof Track))
-          throw new UsageError(
-            `scene_index/scene_id/scene_name require a Track target, got ${classOf(target)}.`,
-          );
-        const { index } = findScene(args);
-        const slot = target.clipSlots[index];
-        if (!slot)
-          throw new UsageError(
-            `scene_index ${index} out of range (track has ${target.clipSlots.length} slots).`,
-          );
-        target = slot;
-      }
+      const target = clipTarget(args);
       const need = (cond: unknown, what: string) => {
         if (cond === undefined || cond === null)
           throw new UsageError(`${what} is required for this target/type.`);
@@ -2996,18 +3035,508 @@ function buildServer(
       "is removed.",
     { clip_id: z.string() },
     async ({ clip_id }) => {
-      const clip = resolve(clip_id, Clip);
-      const parent = clip.parent;
-      if (parent instanceof ClipSlot) {
-        await parent.deleteClip();
-      } else if (parent instanceof Track) {
-        await parent.deleteClip(clip);
-      } else if (parent instanceof TakeLane && parent.parent instanceof Track) {
-        await (parent.parent as Track<"1.0.0">).deleteClip(clip);
-      } else {
-        throw new Error(`Cannot determine how to delete clip with parent ${parent ? classOf(parent) : "null"}.`);
-      }
+      await removeClip(resolve(clip_id, Clip));
       return { deleted: clip_id };
+    },
+  );
+
+  // -- copying clips (clip_copy, arrangement_copy_range) --------------------
+
+  // What a copy cannot carry over: Live's API cannot read these.
+  const CLIP_COPY_LOST = [
+    "clip envelopes (automation and modulation)",
+    "groove, launch settings and follow actions",
+  ];
+  const AUDIO_COPY_LOST = [
+    ...CLIP_COPY_LOST,
+    "clip gain, transpose and fades (not in Live's API)",
+    "warp markers: Live warps the copy itself (from the file's .asd analysis or its Auto-Warp " +
+      "preference), so the same beat positions can map to other audio — see warp_markers_match",
+  ];
+  const MIN_LOOP_BEATS = 0.25; // ClipLoopSettings: a loop is at least one 16th note
+
+  // A new audio clip from a source clip: its file and warping, and its markers
+  // and loop as ClipLoopSettings allow them for a new clip (index.d.mts
+  // ClipLoopSettings). Where they do not, the copy starts with the file's own
+  // region, and `lost` says so. Warp markers cannot be set at all.
+  function audioCopySpec(source: AudioClip<"1.0.0">) {
+    const filePath = source.filePath;
+    if (!filePath) throw new Error(`Audio clip ${remember(source)} has no file path, so it cannot be copied.`);
+    const isWarped = source.warping;
+    const r = regionOf(source);
+    const lost = [...AUDIO_COPY_LOST];
+    // an unwarped clip cannot loop (looping enables warping)
+    let looping = r.looping && isWarped;
+    if (looping && r.loopEnd - r.loopStart < MIN_LOOP_BEATS) {
+      looping = false;
+      lost.push("the loop: it is shorter than 0.25 beats, the shortest a new clip allows");
+    }
+    const loopSettings: ClipLoopSettings = {
+      looping,
+      startMarker: r.startMarker,
+      endMarker: r.endMarker,
+      loopStart: looping ? r.loopStart : r.startMarker,
+      loopEnd: looping ? r.loopEnd : r.endMarker,
+    };
+    const positions = [loopSettings.startMarker, loopSettings.endMarker, loopSettings.loopStart, loopSettings.loopEnd];
+    const allowed =
+      loopSettings.startMarker <= loopSettings.endMarker &&
+      loopSettings.loopEnd - loopSettings.loopStart >= MIN_LOOP_BEATS &&
+      (isWarped || positions.every((v) => v >= 0));
+    if (!allowed) lost.push("the start/end markers and loop (a new clip cannot have them): the copy plays the file's own region");
+    return {
+      filePath,
+      isWarped,
+      loopSettings: allowed ? loopSettings : undefined,
+      warpMode: num(source.warpMode),
+      warpMarkers: isWarped ? source.warpMarkers : undefined,
+      lost,
+    };
+  }
+  type AudioCopySpec = ReturnType<typeof audioCopySpec>;
+
+  const sameWarpMarkers = (a: WarpMarker[], b: WarpMarker[]) =>
+    a.length === b.length &&
+    a.every((m, i) => num(m.beatTime) === num(b[i].beatTime) && num(m.sampleTime) === num(b[i].sampleTime));
+
+  // How an audio copy came out compared with its spec: whether Live warped it
+  // like the source, and which region fields (and, in the arrangement, the
+  // length) differ from what was asked.
+  function audioCopyCheck(copy: AudioClip<"1.0.0">, spec: AudioCopySpec, length?: number) {
+    const want = spec.loopSettings;
+    const got = regionOf(copy);
+    const differs: Array<{ field: string; requested: number | boolean; got: number | boolean }> = want
+      ? (["looping", "startMarker", "endMarker", "loopStart", "loopEnd"] as const)
+          .filter((k) => got[k] !== want[k])
+          .map((k) => ({ field: k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`), requested: want[k], got: got[k] }))
+      : [];
+    const duration = num(copy.duration);
+    if (length !== undefined && Math.abs(duration - length) > 1e-9)
+      differs.push({ field: "duration", requested: length, got: duration });
+    return {
+      warp_markers_match: spec.warpMarkers ? sameWarpMarkers(copy.warpMarkers, spec.warpMarkers) : undefined,
+      differs: differs.length ? differs : undefined,
+    };
+  }
+
+  // The properties a copy takes over (or is given), set after it exists.
+  type CopyProps = { name: string; color: number; muted: boolean; looping: boolean };
+  function applyCopyProps(copy: Clip<"1.0.0">, p: CopyProps, notes?: NoteDescription[], warpMode?: number) {
+    if (notes?.length && copy instanceof MidiClip) copy.notes = notes;
+    if (copy.name !== p.name) copy.name = p.name;
+    if (num(copy.color) !== p.color) copy.color = p.color;
+    if (copy.muted !== p.muted) copy.muted = p.muted;
+    // a MIDI copy holds its notes unrolled from 0, so its own loop flag only
+    // decides whether it repeats when it is played past its end (session)
+    if (copy instanceof MidiClip && copy.looping !== p.looping) copy.looping = p.looping;
+    if (copy instanceof AudioClip && warpMode !== undefined && copy.warping && num(copy.warpMode) !== warpMode)
+      copy.warpMode = warpMode;
+  }
+
+  tool(
+    "clip_copy",
+    { title: "Copy or move clip", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Copy a clip to a session slot, an arrangement position or a take lane, or move it there " +
+      "(move:true deletes the source once the copy exists). Live's API has no clip copy or " +
+      "move, so a new clip is created. Target as in clip_create: a clip slot id (target_id, or " +
+      "a track with scene_index/scene_id/scene_name; the slot must be empty), or a track or " +
+      "take lane id with start_time (beats). MIDI clips go to MIDI tracks, audio clips to " +
+      "audio tracks. `duration` sets the copy's length (default: the source's `duration`); a " +
+      "longer MIDI copy repeats the source's loop (or its region, when it does not loop), a " +
+      "longer audio copy only repeats a looping source (Live caps the others). MIDI: the notes are " +
+      "re-based to where the source plays them — the copy starts at its first played beat, " +
+      "since the API cannot set a MIDI clip's markers or loop — so it plays the same; " +
+      "`fidelity` is 'notes'. Audio: the copy uses the source's file, warping, warp mode and " +
+      "markers/loop (as Live allows them for a new clip); Live warps it itself, so " +
+      "`fidelity` is 'approximate', `warp_markers_match` says whether it warped like the " +
+      "source and `differs` lists region fields (or the length) Live set otherwise. `lost` lists what no copy " +
+      "carries over (envelopes, groove, launch settings, ...). name and color default to the " +
+      "source's. An arrangement copy over existing clips reports them in `overlaps`. Undo " +
+      "steps: create, notes and properties, delete (move). If the copy cannot be created, " +
+      "nothing is changed.",
+    {
+      clip_id: z.string().describe("The clip to copy or move"),
+      target_id: z
+        .string()
+        .optional()
+        .describe("ClipSlot, Track or TakeLane id; or give the track by track_id/track_index/track_name"),
+      ...trackAddress,
+      scene_index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("With a track target: copy to this session clip slot instead of the arrangement"),
+      scene_id: z.string().optional().describe("With a track target: the session clip slot of this scene"),
+      scene_name: z.string().optional().describe("With a track target: the session clip slot of the scene with this name"),
+      start_time: z.number().min(0).optional().describe("Arrangement position in beats (track and take-lane targets)"),
+      duration: z
+        .number()
+        .positive()
+        .optional()
+        .describe("Length of the copy in beats; default the source's. Longer: the source's loop (or a MIDI region) repeats"),
+      name: z.string().optional().describe("Name of the copy; default the source's"),
+      color: z.string().optional().describe("#RRGGBB; default the source's"),
+      move: z.boolean().default(false).describe("Delete the source once the copy exists"),
+    },
+    async (args) => {
+      const source = resolve(args.clip_id, Clip);
+      if (!(source instanceof MidiClip) && !(source instanceof AudioClip))
+        throw new UsageError(`Clip ${args.clip_id} is neither a MIDI nor an audio clip.`);
+      const midi = source instanceof MidiClip;
+      const color = args.color !== undefined ? hexToColor(args.color) : undefined;
+
+      // Validate the target before anything is created.
+      const target = clipTarget(args);
+      let holder: Track<"1.0.0"> | null;
+      if (target instanceof ClipSlot) {
+        if (args.start_time !== undefined)
+          throw new UsageError("start_time only applies to arrangement and take-lane targets, not a clip slot.");
+        if (!midi && args.duration !== undefined)
+          throw new UsageError("An audio copy in a clip slot takes no duration: its length follows the source's markers.");
+        const occupant = target.clip;
+        if (occupant)
+          throw new UsageError(
+            occupant.handle.id === source.handle.id
+              ? "The target is the clip's own slot."
+              : `The target slot already holds clip ${remember(occupant)} (${quote(occupant.name)}): ` +
+                  "delete it first or pick an empty slot.",
+          );
+        holder = holderTrack(target);
+      } else if (target instanceof Track || target instanceof TakeLane) {
+        if (args.start_time === undefined)
+          throw new UsageError("start_time is required for arrangement and take-lane targets.");
+        holder = target instanceof Track ? target : holderTrack(target);
+      } else {
+        throw new UsageError(`Clips can be copied to a ClipSlot, Track or TakeLane, got ${classOf(target)}.`);
+      }
+      const kind = midi ? "MIDI" : "audio";
+      const fits = (t: Track<"1.0.0">) => (midi ? t instanceof MidiTrack : t instanceof AudioTrack);
+      if ((target instanceof Track || holder) && !fits(holder!))
+        throw new UsageError(
+          `A ${kind} clip can only be copied to a ${kind} track; ${describeTrack(holder!)} is of type ` +
+            `${trackKind(holder!)}.`,
+        );
+      const length = args.duration ?? num(source.duration);
+      if (!(length > 0)) throw new Error(`Clip ${args.clip_id} has no length (${length} beats), so it cannot be copied.`);
+      const start = args.start_time ?? 0;
+      const home = parentOf(source);
+      if (
+        args.move &&
+        !(target instanceof ClipSlot) &&
+        home?.handle.id === target.handle.id &&
+        num(source.startTime) === start &&
+        length === num(source.duration)
+      )
+        return {
+          ...clipSummary(source, true),
+          location: locate(source),
+          source_id: args.clip_id,
+          moved: false,
+          unchanged: "the clip is already there",
+        };
+
+      // Everything the copy needs is read before the first write.
+      const region = regionOf(source);
+      const props: CopyProps = {
+        name: args.name ?? source.name,
+        color: color ?? num(source.color),
+        muted: source.muted,
+        looping: region.looping,
+      };
+      const notes = source instanceof MidiClip ? renderNotes(source.notes, region, 0, length, MAX_EXPANDED_NOTES) : undefined;
+      const spec = source instanceof AudioClip ? audioCopySpec(source) : undefined;
+      const laneClips = target instanceof Track ? target.arrangementClips : target instanceof TakeLane ? target.clips : [];
+      const overlaps = clipsInRange(laneClips, start, start + length)
+        .filter((c) => !(args.move && c.handle.id === source.handle.id))
+        .map((c) => remember(c));
+
+      let copy: Clip<"1.0.0">;
+      try {
+        if (spec) {
+          const { filePath, isWarped, loopSettings } = spec;
+          copy =
+            target instanceof ClipSlot
+              ? await target.createAudioClip({ filePath, isWarped, loopSettings })
+              : await (target as AudioTrack<"1.0.0"> | TakeLane<"1.0.0">).createAudioClip({
+                  filePath,
+                  startTime: start,
+                  duration: length,
+                  isWarped,
+                  loopSettings,
+                });
+        } else {
+          copy =
+            target instanceof ClipSlot
+              ? await target.createMidiClip(length)
+              : await (target as MidiTrack<"1.0.0"> | TakeLane<"1.0.0">).createMidiClip(start, length);
+        }
+      } catch (e) {
+        throw new Error(`Could not create the copy: ${errorMessage(e)} Nothing was changed.`);
+      }
+      // The copy exists: from here on a failure is reported, not thrown.
+      let error: string | undefined;
+      try {
+        context.withinTransaction(() => applyCopyProps(copy, props, notes, spec?.warpMode));
+      } catch (e) {
+        error = `the copy ${remember(copy)} was created, but its notes or properties could not be set: ${errorMessage(e)}`;
+      }
+      let moved = false;
+      if (args.move && error) {
+        error += "; the source was kept";
+      } else if (args.move) {
+        try {
+          await removeClip(source);
+          moved = true;
+        } catch (e) {
+          error = `copied, but the source ${args.clip_id} could not be deleted: ${errorMessage(e)}`;
+        }
+      }
+      return {
+        ...clipSummary(copy, true),
+        location: locate(copy),
+        source_id: args.clip_id,
+        moved,
+        fidelity: spec ? "approximate" : "notes",
+        lost: spec ? spec.lost : CLIP_COPY_LOST,
+        ...(spec && copy instanceof AudioClip
+          ? audioCopyCheck(copy, spec, target instanceof ClipSlot ? undefined : length)
+          : {}),
+        overlaps: overlaps.length ? overlaps : undefined,
+        error,
+      };
+    },
+  );
+
+  tool(
+    "arrangement_copy_range",
+    { title: "Copy arrangement range", annotations: DESTRUCTIVE },
+    "Copy a stretch of the arrangement to another position, e.g. \"repeat the chorus\": the " +
+      "clips of every audio and MIDI track (or only `tracks`) between start_time and end_time " +
+      "(beats) are copied to to_time, OVERWRITING what is there: the target range is cleared " +
+      "first on every selected track (as track_clear_clips_in_range does: clips crossing its " +
+      "edges are shortened), even where the source range is empty. Live's API cannot insert " +
+      "time, so nothing moves later. MIDI clips crossing the source range's edges are trimmed to " +
+      "it (notes re-based, as in clip_copy; notes starting before the range are left out); " +
+      "audio clips crossing an edge cannot be trimmed and are skipped and listed in `skipped`. " +
+      "Audio copies are approximate as in clip_copy (see `lost`). Take-lane clips are not " +
+      "copied (counted in take_lane_clips_not_copied). include_cue_points also copies the cue " +
+      "points in the range, except onto a beat that already has one. The ranges must not " +
+      "overlap. Undo steps: clear, create, notes and properties, then cue points (create, " +
+      "name). Once the range is cleared, a copy that fails is reported per clip.",
+    {
+      start_time: z.number().min(0).describe("Start of the range to copy, in beats"),
+      end_time: z.number().describe("End of the range to copy (exclusive), in beats"),
+      to_time: z.number().min(0).describe("Where the copy starts, in beats"),
+      tracks: z
+        .array(z.object(trackAddress))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every audio and MIDI track"),
+      include_cue_points: z
+        .boolean()
+        .default(false)
+        .describe("Also copy the cue points in the range (not onto a beat that already has one)"),
+    },
+    async ({ start_time: from, end_time: to, to_time: dest, tracks: list, include_cue_points }) => {
+      if (!(to > from)) throw new UsageError(`end_time ${to} must be after start_time ${from}.`);
+      const length = to - from;
+      if (overlapsRange(dest, dest + length, from, to))
+        throw new UsageError(
+          `The target range ${dest}-${dest + length} overlaps the source range ${from}-${to}: copy it ` +
+            "to a position at least end_time - start_time beats away.",
+        );
+      const regular = song().tracks;
+      const holdsClips = (t: Track<"1.0.0">) => t instanceof AudioTrack || t instanceof MidiTrack;
+      const tracks = list ? trackSelection(list, regular) : regular.filter(holdsClips);
+      for (const t of tracks)
+        if (!holdsClips(t))
+          throw new UsageError(
+            `${describeTrack(t)} is a ${trackKind(t, regular)} track: only audio and MIDI tracks have arrangement clips.`,
+          );
+
+      // Snapshot the source range before the first write.
+      type Plan = {
+        track: Track<"1.0.0">;
+        sourceId: string;
+        start: number;
+        length: number;
+        trimmed: boolean;
+        props: CopyProps;
+        notes?: NoteDescription[];
+        spec?: AudioCopySpec;
+      };
+      let noteTotal = 0;
+      const rows = tracks.map((track) => {
+        const plans: Plan[] = [];
+        const skipped: Array<{ source_id: string; name: string; start_time: number; end_time: number; reason: string }> = [];
+        for (const clip of clipsInRange(track.arrangementClips, from, to)) {
+          const cs = num(clip.startTime);
+          const ce = num(clip.endTime);
+          const a = Math.max(cs, from);
+          const b = Math.min(ce, to);
+          const trimmed = a > cs + 1e-9 || b < ce - 1e-9;
+          const region = regionOf(clip);
+          const base = {
+            track,
+            sourceId: remember(clip),
+            start: dest + (a - from),
+            length: b - a,
+            trimmed,
+            props: { name: clip.name, color: num(clip.color), muted: clip.muted, looping: region.looping },
+          };
+          const skip = (reason: string) =>
+            skipped.push({ source_id: base.sourceId, name: clip.name, start_time: cs, end_time: ce, reason });
+          if (clip instanceof MidiClip) {
+            const notes = renderNotes(clip.notes, region, a - cs, b - a, MAX_EXPANDED_NOTES);
+            noteTotal += notes.length;
+            plans.push({ ...base, notes });
+          } else if (!(clip instanceof AudioClip)) {
+            skip(`a ${classOf(clip)} cannot be copied`);
+          } else if (trimmed) {
+            skip(
+              "the audio clip crosses the edge of the range, and an audio copy cannot be trimmed (Live's API " +
+                "cannot set a clip's markers after creation): copy a range that contains it whole",
+            );
+          } else {
+            try {
+              plans.push({ ...base, spec: audioCopySpec(clip) });
+            } catch (e) {
+              skip(errorMessage(e));
+            }
+          }
+        }
+        const laneClips = track.takeLanes.reduce((n, lane) => n + clipsInRange(lane.clips, from, to).length, 0);
+        return { track, plans, skipped, laneClips };
+      });
+      if (noteTotal > MAX_EXPANDED_NOTES)
+        throw new UsageError(`The copy would write ${noteTotal} notes; at most ${MAX_EXPANDED_NOTES} are allowed.`);
+      const existingCues = song().cuePoints.map((c) => ({ c, time: num(c.time) }));
+      const taken = new Set(existingCues.map((x) => x.time));
+      const cueSources = include_cue_points
+        ? existingCues.filter((x) => x.time >= from && x.time < to).sort((p, q) => p.time - q.time)
+        : [];
+      const cueCopies = cueSources.filter((x) => !taken.has(x.time + dest - from));
+
+      // 1. Clear the target range on every track (one undo step).
+      const cleared = tracks.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(tracks.map((t) => t.clearClipsInRange(dest, dest + length))),
+          )
+        : [];
+      if (cleared.length && cleared.every((r) => r.status === "rejected"))
+        throw new Error(
+          `Could not clear the target range: ${errorMessage((cleared[0] as PromiseRejectedResult).reason)} Nothing was changed.`,
+        );
+      // 2. Create the copies on the cleared tracks (one undo step).
+      const work = rows.flatMap((row, i) => (cleared[i].status === "fulfilled" ? row.plans : []));
+      const created = work.length
+        ? await context.withinTransaction(() =>
+            Promise.allSettled(
+              work.map((p) =>
+                p.spec
+                  ? (p.track as AudioTrack<"1.0.0">).createAudioClip({
+                      filePath: p.spec.filePath,
+                      startTime: p.start,
+                      duration: p.length,
+                      isWarped: p.spec.isWarped,
+                      loopSettings: p.spec.loopSettings,
+                    })
+                  : (p.track as MidiTrack<"1.0.0">).createMidiClip(p.start, p.length),
+              ),
+            ),
+          )
+        : [];
+      // 3. Their notes and properties (one undo step).
+      const outcome = new Map<Plan, { copy?: Clip<"1.0.0">; error?: string }>();
+      work.forEach((p, k) => {
+        const r = created[k];
+        outcome.set(
+          p,
+          r.status === "fulfilled" ? { copy: r.value } : { error: `could not be created: ${errorMessage(r.reason)}` },
+        );
+      });
+      if ([...outcome.values()].some((o) => o.copy))
+        context.withinTransaction(() => {
+          for (const [p, o] of outcome) {
+            if (!o.copy) continue;
+            try {
+              applyCopyProps(o.copy, p.props, p.notes, p.spec?.warpMode);
+            } catch (e) {
+              o.error = `was created, but its notes or properties could not be set: ${errorMessage(e)}`;
+            }
+          }
+        });
+      // 4. Cue points (create, then name).
+      let cuePoints: unknown[] | undefined;
+      const errors: string[] = [];
+      if (include_cue_points) {
+        const skippedCues = cueSources
+          .filter((x) => !cueCopies.includes(x))
+          .map((x) => ({
+            source_id: remember(x.c),
+            name: x.c.name,
+            time: x.time + dest - from,
+            skipped: "a cue point is already at that beat",
+          }));
+        let made: Array<Record<string, unknown>> = [];
+        if (cueCopies.length) {
+          try {
+            const results = await createBatch(
+              cueCopies.map((x) => ({ name: x.c.name })),
+              (i) => song().createCuePoint(cueCopies[i].time + dest - from),
+            );
+            made = results.map((r, i) => ({
+              source_id: remember(cueCopies[i].c),
+              ...(r.created ? cuePointSummary(r.created) : {}),
+              error: r.error,
+            }));
+          } catch (e) {
+            errors.push(`cue points: ${errorMessage(e)}`);
+          }
+        }
+        cuePoints = [...made, ...skippedCues];
+      }
+
+      let copied = 0;
+      const out = rows.map((row, i) => {
+        const clearError = cleared[i].status === "rejected" ? errorMessage((cleared[i] as PromiseRejectedResult).reason) : undefined;
+        if (clearError) errors.push(`${describeTrack(row.track)}: the target range could not be cleared: ${clearError}`);
+        const copies = clearError
+          ? []
+          : row.plans.map((p) => {
+              const o = outcome.get(p)!;
+              if (o.copy && !o.error) copied++;
+              if (o.error) errors.push(`${describeTrack(row.track)}: the copy of clip ${p.sourceId} ${o.error}`);
+              return {
+                source_id: p.sourceId,
+                ...(o.copy ? { id: remember(o.copy), name: o.copy.name } : {}),
+                start_time: o.copy ? num(o.copy.startTime) : p.start,
+                end_time: o.copy ? num(o.copy.endTime) : p.start + p.length,
+                trimmed: p.trimmed || undefined,
+                ...(p.spec && o.copy instanceof AudioClip ? audioCopyCheck(o.copy, p.spec, p.length) : {}),
+                error: o.error,
+              };
+            });
+        return {
+          ...trackRow(row.track, regular),
+          cleared: !clearError,
+          copies,
+          skipped: row.skipped.length ? row.skipped : undefined,
+        };
+      });
+      const laneClips = rows.reduce((n, r) => n + r.laneClips, 0);
+      return {
+        source: { start_time: from, end_time: to },
+        target: { start_time: dest, end_time: dest + length },
+        tracks: out,
+        copied_count: copied,
+        skipped_count: rows.reduce((n, r) => n + r.skipped.length, 0),
+        lost: work.some((p) => p.spec) ? AUDIO_COPY_LOST : CLIP_COPY_LOST,
+        take_lane_clips_not_copied: laneClips || undefined,
+        cue_points: cuePoints,
+        errors: errors.length ? errors : undefined,
+      };
     },
   );
 
@@ -3349,6 +3878,33 @@ function buildServer(
     },
   );
 
+  // A sample file a tool is about to load: an absolute path to a file that
+  // exists. Checked before anything is changed.
+  function checkSamplePath(file: string, what: string) {
+    const problem = mediaProblem(file);
+    if (problem) throw new UsageError(`${what} ${JSON.stringify(file)}: ${problem === "file not found" ? "no such file" : problem}.`);
+  }
+
+  // The path to load: the file's copy in the Live project (import_into_project),
+  // or the file itself.
+  async function samplePathToLoad(file: string, importIt: boolean) {
+    if (!importIt) return { load: file, imported: undefined };
+    try {
+      const imported = await context.resources.importIntoProject(file);
+      return { load: imported, imported };
+    } catch (e) {
+      throw new Error(`Could not import ${file} into the project: ${errorMessage(e)}`);
+    }
+  }
+
+  const importSampleSchema = z
+    .boolean()
+    .default(true)
+    .describe(
+      "Copy the sample into the Live project first and load the copy (recommended: the set keeps " +
+        "working when it is moved or the original is deleted)",
+    );
+
   tool(
     "device_insert",
     { title: "Insert device", annotations: CREATE },
@@ -3357,7 +3913,10 @@ function buildServer(
       "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
       "0-based position in the device chain; omitted = append at the end. The " +
       "target is a Track or Chain id, or a track given by track_id/track_index/track_name. " +
-      "`parameters` sets initial values right after the insert, in one undo step " +
+      "`sample_path` (Simpler only) loads an audio file into the new Simpler — by default " +
+      "its copy in the Live project (import_into_project); if the sample cannot be loaded, " +
+      "the Simpler is removed again and the call fails. " +
+      "`parameters` sets initial values right after the insert (and the sample), in one undo step " +
       "(each {name, value | value_item | reset | delta}, as in device_set); if one " +
       "cannot be set, none are, and the device is still inserted with `errors` saying why.",
     {
@@ -3365,19 +3924,44 @@ function buildServer(
       ...trackAddress,
       device_name: z.string(),
       index: z.number().int().min(0).optional(),
+      sample_path: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Simpler only: absolute path of an audio file to load into it"),
+      import_into_project: importSampleSchema,
       parameters: z.array(initialParameter).min(1).optional().describe("Initial parameter values"),
     },
-    async ({ device_name, index, parameters, ...address }) => {
+    async ({ device_name, index, sample_path, import_into_project, parameters, ...address }) => {
       parameters?.forEach((p, i) => at(`parameters[${i}]`, () => writeKind(p)));
+      if (sample_path !== undefined) {
+        if (device_name.trim().toLowerCase() !== "simpler")
+          throw new UsageError(`sample_path only applies to a Simpler, not ${quote(device_name)}.`);
+        checkSamplePath(sample_path, "sample_path");
+      }
       const target = findTarget(address);
       if (!(target instanceof Track) && !(target instanceof Chain))
         throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
       const device = await target.insertDevice(device_name, index ?? target.devices.length);
-      if (!parameters) return deviceSummary(device);
+      // A sample that cannot be loaded removes the new device again.
+      let imported: string | undefined;
+      if (sample_path !== undefined) {
+        try {
+          if (!(device instanceof Simpler)) throw new Error(`${describeDevice(device)} is not a Simpler.`);
+          const file = await samplePathToLoad(sample_path, import_into_project);
+          imported = file.imported;
+          await device.replaceSample(file.load);
+        } catch (e) {
+          await removeInserted(target, device, `Could not load the sample ${sample_path}: ${errorMessage(e)}`);
+        }
+      }
+      const extra = { imported_path: imported };
+      if (!parameters) return { ...deviceSummary(device), ...extra };
       // The device exists now: a failing value is reported, not thrown.
       const result = await setInitialParameters(device, parameters);
       return {
         ...deviceSummary(device),
+        ...extra,
         parameters: result.parameters,
         errors: result.error ? [result.error] : undefined,
       };
@@ -3925,12 +4509,281 @@ function buildServer(
     "simpler_replace_sample",
     { title: "Replace Simpler sample", annotations: DESTRUCTIVE },
     "Replace the sample loaded in a Simpler device with another audio file " +
-      "(absolute path).",
-    { simpler_device_id: z.string(), file_path: z.string() },
-    async ({ simpler_device_id, file_path }) => {
+      "(absolute path). By default the file is first copied into the Live project " +
+      "(import_into_project) and the copy is loaded, so the set keeps working when it is " +
+      "moved or the original is deleted; the result's file_path is then the copy's and " +
+      "`imported_path` is set.",
+    { simpler_device_id: z.string(), file_path: z.string(), import_into_project: importSampleSchema },
+    async ({ simpler_device_id, file_path, import_into_project }) => {
+      // The Simpler is checked first, so a bad id leaves no copy in the project.
       const simpler = resolve(simpler_device_id, Simpler);
-      const sample = await simpler.replaceSample(file_path);
-      return { id: remember(sample), file_path: sample.filePath };
+      const { load, imported } = await samplePathToLoad(file_path, import_into_project);
+      const sample = await simpler.replaceSample(load);
+      return { id: remember(sample), file_path: sample.filePath, imported_path: imported };
+    },
+  );
+
+  const MAX_KIT_PADS = 128;
+
+  tool(
+    "drum_kit_build",
+    { title: "Build drum kit", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Build or update a drum kit from sample files in one call: for each pad {note, " +
+      "sample_path, volume?, panning?} the Drum Rack's pad (chain) receiving that note is " +
+      "reused, or a new chain is created and set to receive it; a Simpler is inserted into it " +
+      "(a pad that already has a Simpler keeps it, and its sample is REPLACED), the sample is " +
+      "copied into the Live project (import_into_project, default) and loaded, and volume / " +
+      "panning set the pad's chain mixer (0-1, 0.85 = 0 dB; -1..1). The rack: rack_device_id, " +
+      "or a MIDI track (track_id/track_index/track_name) — its Drum Rack, or a new one appended " +
+      "when it has none. Notes are 0-127 or names (C1 = 36 is the usual kick). Every sample " +
+      "path, note and pad is checked before anything is changed; the samples are imported " +
+      "next, and an import that fails changes nothing in the set. After that a pad that fails " +
+      "is reported in its `pads` entry (`error`) while the others are built. Live's API cannot " +
+      "delete a chain, so a chain that was created stays even if its pad fails. Returns the " +
+      "rack and, per pad, the chain, the Simpler, the loaded sample and what was created. " +
+      "Undo steps: rack, chains, notes, Simplers, samples, mixer.",
+    {
+      ...trackAddress,
+      rack_device_id: z.string().optional().describe("The Drum Rack to build in; or give a MIDI track"),
+      pads: z
+        .array(
+          z.object({
+            note: pitchSchema("The pad's MIDI note (its chain's receiving note)"),
+            sample_path: z.string().min(1).describe("Absolute path of the audio file"),
+            volume: z.number().min(0).max(1).optional().describe("Pad volume 0-1 (0.85 = 0 dB)"),
+            panning: z.number().min(-1).max(1).optional().describe("Pad panning, -1 = left, 1 = right"),
+          }),
+        )
+        .min(1)
+        .max(MAX_KIT_PADS),
+      import_into_project: importSampleSchema,
+    },
+    async ({ pads, rack_device_id, import_into_project, ...address }) => {
+      // 0. Check everything before the first change.
+      if ((rack_device_id === undefined) === !hasTrackAddress(address))
+        throw new UsageError("Give rack_device_id or a track (track_id, track_index or track_name), one of them.");
+      const notes = pads.map((p, i) =>
+        at(`pads[${i}]`, () => {
+          const note = parsePitch(p.note, "note");
+          checkSamplePath(p.sample_path, "sample_path");
+          return note;
+        }),
+      );
+      notes.forEach((n, i) => {
+        const first = notes.indexOf(n);
+        if (first !== i) throw new UsageError(`pads[${i}]: note ${n} (${noteName(n)}) is given twice, also by pads[${first}].`);
+      });
+      let rack: DrumRack<"1.0.0"> | undefined;
+      let track: Track<"1.0.0"> | undefined;
+      if (rack_device_id !== undefined) {
+        rack = resolve(rack_device_id, DrumRack);
+        track = devicePath(rack).track;
+      } else {
+        track = findTrack(address);
+        const racks = track.devices.filter((d): d is DrumRack<"1.0.0"> => d instanceof DrumRack);
+        if (racks.length > 1)
+          throw new UsageError(
+            `${describeTrack(track)} has ${racks.length} Drum Racks (${racks.map(describeDevice).join(", ")}): ` +
+              "give rack_device_id.",
+          );
+        rack = racks[0];
+        if (!rack && !(track instanceof MidiTrack))
+          throw new UsageError(`${describeTrack(track)} has no Drum Rack, and only a MIDI track can get one.`);
+      }
+      // A pad's chain in the rack: the drum chain receiving its note, if any.
+      const padChains = (r: DrumRack<"1.0.0">) => {
+        const chains = r.chains.filter((c) => c instanceof DrumChain);
+        return notes.map((note, i) => {
+          const hits = chains.filter((c) => num(c.receivingNote) === note);
+          if (hits.length > 1)
+            throw new UsageError(
+              `pads[${i}]: ${hits.length} chains of ${describeDevice(r)} receive note ${note} ` +
+                `(${hits.map((c) => remember(c)).join(", ")}), so the pad is ambiguous.`,
+            );
+          return hits[0];
+        });
+      };
+      const existing = rack ? padChains(rack) : notes.map(() => undefined);
+
+      // A pad's progress: the first failure stops it.
+      type Pad = {
+        i: number;
+        note: number;
+        chain?: Chain<"1.0.0">;
+        chainCreated: boolean;
+        simpler?: Simpler<"1.0.0">;
+        simplerCreated: boolean;
+        load: string;
+        imported?: string;
+        sample?: Sample<"1.0.0">;
+        error?: string;
+      };
+      const state: Pad[] = pads.map((p, i) => ({
+        i,
+        note: notes[i],
+        chain: existing[i],
+        chainCreated: false,
+        simplerCreated: false,
+        load: p.sample_path,
+      }));
+      const fail = (pad: Pad, step: string, e: unknown) => {
+        pad.error ??= `${step}: ${errorMessage(e)}`;
+      };
+      const live = () => state.filter((p) => !p.error);
+
+      // 1. Import the samples (each file once). A failure changes nothing in the set.
+      if (import_into_project) {
+        const copies = new Map<string, string>();
+        for (const pad of state) {
+          const file = pads[pad.i].sample_path;
+          if (!copies.has(file)) {
+            try {
+              copies.set(file, (await samplePathToLoad(file, true)).load);
+            } catch (e) {
+              const done = [...copies.values()];
+              throw new Error(
+                `pads[${pad.i}]: ${errorMessage(e)} Nothing was changed in the Live Set` +
+                  (done.length ? ` (already copied into the project: ${done.join(", ")}).` : "."),
+              );
+            }
+          }
+          pad.load = pad.imported = copies.get(file)!;
+        }
+      }
+
+      // 2. The rack.
+      let rackCreated = false;
+      if (!rack) {
+        const holder = track!;
+        let inserted: Device<"1.0.0">;
+        try {
+          inserted = await holder.insertDevice("Drum Rack", holder.devices.length);
+        } catch (e) {
+          throw new Error(
+            `Could not insert a Drum Rack on ${describeTrack(holder)}: ${errorMessage(e)} Nothing was changed in the Live Set.`,
+          );
+        }
+        if (!(inserted instanceof DrumRack))
+          await removeInserted(holder, inserted, `Live inserted ${describeDevice(inserted)}, not a Drum Rack.`);
+        rack = inserted as DrumRack<"1.0.0">;
+        rackCreated = true;
+        // a default preset with pads: reuse them like an existing rack's
+        padChains(rack).forEach((c, i) => (state[i].chain = c));
+      }
+      const theRack = rack;
+
+      // 3. Chains for the new pads (one undo step), all inserted at the current
+      // end: an index that is valid in whatever order Live applies them, and in
+      // call order (last pad first) they end up in the pads' order. insertChain
+      // is typed as returning a Chain: only a DrumChain has a receiving note.
+      const newPads = state.filter((p) => !p.chain);
+      if (newPads.length) {
+        const end = theRack.chains.length;
+        const order = [...newPads].reverse();
+        const made = await context.withinTransaction(() =>
+          Promise.allSettled(order.map(() => theRack.insertChain(end))),
+        );
+        made.forEach((r, k) => {
+          const pad = order[k];
+          if (r.status === "rejected") return fail(pad, "creating its chain", r.reason);
+          pad.chainCreated = true;
+          if (r.value instanceof DrumChain) pad.chain = r.value;
+          else
+            fail(
+              pad,
+              "creating its chain",
+              `Live created ${classOf(r.value)} ${remember(r.value)}, not a drum chain, so it has no receiving note`,
+            );
+        });
+        // 4. Their receiving notes (one undo step).
+        const chained = newPads.filter((p) => !p.error);
+        if (chained.length)
+          context.withinTransaction(() => {
+            for (const pad of chained)
+              try {
+                (pad.chain as DrumChain<"1.0.0">).receivingNote = pad.note;
+              } catch (e) {
+                fail(pad, "setting its note", e);
+              }
+          });
+      }
+
+      // 5. A Simpler in every pad that has none (one undo step).
+      for (const pad of live()) pad.simpler = pad.chain!.devices.find((d): d is Simpler<"1.0.0"> => d instanceof Simpler);
+      const needSimpler = live().filter((p) => !p.simpler);
+      if (needSimpler.length) {
+        const made = await context.withinTransaction(() =>
+          Promise.allSettled(needSimpler.map((p) => p.chain!.insertDevice("Simpler", 0))),
+        );
+        made.forEach((r, k) => {
+          const pad = needSimpler[k];
+          if (r.status === "rejected") return fail(pad, "inserting a Simpler", r.reason);
+          if (!(r.value instanceof Simpler))
+            return fail(pad, "inserting a Simpler", `Live inserted ${describeDevice(r.value)}, not a Simpler`);
+          pad.simpler = r.value;
+          pad.simplerCreated = true;
+        });
+      }
+
+      // 6. The samples (one undo step).
+      const loading = live();
+      if (loading.length) {
+        const loaded = await context.withinTransaction(() =>
+          Promise.allSettled(loading.map((p) => p.simpler!.replaceSample(p.load))),
+        );
+        loaded.forEach((r, k) =>
+          r.status === "fulfilled" ? (loading[k].sample = r.value) : fail(loading[k], `loading ${loading[k].load}`, r.reason),
+        );
+      }
+
+      // 7. Pad levels on the chain mixers (one undo step).
+      const levels: Array<{ pad: Pad; param: DeviceParameter<"1.0.0">; value: number; what: string }> = [];
+      for (const pad of live()) {
+        const { volume, panning } = pads[pad.i];
+        try {
+          const mixer = pad.chain!.mixer;
+          if (volume !== undefined)
+            levels.push({ pad, param: mixer.volume, value: planWrite(mixer.volume, { value: volume }).target(volume), what: "volume" });
+          if (panning !== undefined)
+            levels.push({ pad, param: mixer.panning, value: planWrite(mixer.panning, { value: panning }).target(panning), what: "panning" });
+        } catch (e) {
+          fail(pad, "setting its level", e);
+        }
+      }
+      const writes = levels.filter((w) => !w.pad.error);
+      if (writes.length) {
+        const settled = await context.withinTransaction(() =>
+          Promise.allSettled(writes.map((w) => w.param.setValue(w.value))),
+        );
+        settled.forEach((r, k) => {
+          if (r.status === "rejected") fail(writes[k].pad, `setting its ${writes[k].what}`, r.reason);
+        });
+      }
+
+      const out = state.map((pad) => ({
+        note: pad.note,
+        note_name: noteName(pad.note),
+        chain_id: pad.chain ? remember(pad.chain) : undefined,
+        chain_created: pad.chainCreated,
+        simpler_device_id: pad.simpler ? remember(pad.simpler) : undefined,
+        simpler_created: pad.simplerCreated,
+        sample: pad.sample ? { id: remember(pad.sample), file_path: pad.sample.filePath } : undefined,
+        source_path: pads[pad.i].sample_path,
+        imported_path: pad.imported,
+        volume: pads[pad.i].volume,
+        panning: pads[pad.i].panning,
+        error: pad.error,
+      }));
+      const failed = out.filter((p) => p.error);
+      return {
+        rack_device_id: remember(theRack),
+        rack_created: rackCreated,
+        track_id: track ? remember(track) : undefined,
+        track_name: track?.name,
+        pads: out,
+        built_count: out.length - failed.length,
+        errors: failed.length ? failed.map((p) => `note ${p.note} (${p.note_name}): ${p.error}`) : undefined,
+      };
     },
   );
 
@@ -4203,25 +5056,224 @@ function buildServer(
     }),
   );
 
+  const audioTrackOf = (track: Track<"1.0.0">, what = "rendered") => {
+    if (!(track instanceof AudioTrack))
+      throw new UsageError(`Only audio tracks can be ${what}; ${describeTrack(track)} is a ${classOf(track)}.`);
+    return track;
+  };
+
+  // A render's analysis, or why the file could not be analyzed (the render
+  // itself succeeded, so that is not a failure of the call).
+  async function analysisOf(file: string) {
+    try {
+      return { analysis: await analyzeWav(file) };
+    } catch (e) {
+      return { analysis_error: `${file} could not be analyzed: ${errorMessage(e)}` };
+    }
+  }
+
   tool(
     "render_track_audio",
-    { title: "Render track audio", annotations: READ },
+    { title: "Render track audio", annotations: CREATE },
     "Render the pre-FX audio of an audio track between two arrangement beat " +
       "positions and return the path of the WAV file. Pre-FX means the track's " +
       "clip audio before its device chain (no effects, mixer or sends). Since " +
-      "Live 12.4.15 the render is not normalized, so its levels are meaningful. " +
+      "Live 12.4.15 the render is not normalized, so its levels are meaningful " +
+      "(Live's version cannot be detected: on older versions they are not). " +
       "The file is written to the extension's temp directory, which may be " +
-      "cleaned between sessions: pass it to import_file (or clip_create, which " +
-      "imports by default) to keep it. Audio tracks only, addressed by track_id, " +
-      "track_index or track_name.",
-    { ...trackAddress, start_time: z.number(), end_time: z.number() },
-    async ({ start_time, end_time, ...address }) => {
-      const track = findTrack(address);
-      if (!(track instanceof AudioTrack))
-        throw new UsageError(
-          `Only audio tracks can be rendered; ${describeTrack(track)} is a ${classOf(track)}.`,
+      "cleaned between sessions: persist:true copies it into the Live project " +
+      "(`imported_path`; or pass it to import_file, or clip_create, which imports " +
+      "by default). analyze:true reads the WAV and returns `analysis`: overall and " +
+      "per-channel peak and RMS in dBFS (null = digital silence), `clipped_samples` " +
+      `(at or over full scale), \`silent\` (peak below ${SILENCE_DBFS} dBFS) and a ` +
+      `${ENVELOPE_BUCKETS}-part \`envelope\` (peak and RMS per part) — an agent behind a ` +
+      "remote client cannot open the file itself. PCM 8/16/24/32-bit and float 32/64-bit " +
+      "WAVs are read. Audio tracks only, addressed by track_id, track_index or " +
+      "track_name — or `tracks` to render several over the same range (returns {items}).",
+    {
+      ...trackAddress,
+      start_time: z.number(),
+      end_time: z.number(),
+      tracks: z
+        .array(z.object(trackAddress))
+        .min(1)
+        .optional()
+        .describe("Several audio tracks (each by track_id, track_index or track_name), rendered one by one"),
+      analyze: z.boolean().default(false).describe("Return levels, clipping, silence and an envelope of the render"),
+      persist: z.boolean().default(false).describe("Copy the render into the Live project (imported_path)"),
+    },
+    async ({ start_time, end_time, tracks: list, analyze, persist, ...address }) => {
+      if (!(end_time > start_time))
+        throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
+      if (list && hasTrackAddress(address))
+        throw new UsageError("Give tracks, or one track by track_id/track_index/track_name, not both.");
+      // Every track is checked before the first render.
+      const targets = (list ? trackSelection(list, song().tracks) : [findTrack(address)]).map((t) => audioTrackOf(t));
+      const renderOne = async (track: AudioTrack<"1.0.0">) => {
+        const audioPath = await context.resources.renderPreFxAudio(track, start_time, end_time);
+        const result: Record<string, unknown> = { audio_path: audioPath };
+        if (persist)
+          try {
+            result.imported_path = await context.resources.importIntoProject(audioPath);
+          } catch (e) {
+            throw new Error(`Rendered to ${audioPath}, but it could not be copied into the project: ${errorMessage(e)}`);
+          }
+        if (analyze) Object.assign(result, await analysisOf(audioPath));
+        return result;
+      };
+      if (!list) return renderOne(targets[0]);
+      const items: Record<string, unknown>[] = [];
+      for (const track of targets) {
+        const head = { track_id: remember(track), track_name: track.name };
+        try {
+          items.push({ ...head, ...(await renderOne(track)) });
+        } catch (e) {
+          // one track's failure does not lose the renders already made
+          items.push({ ...head, error: errorMessage(e) });
+        }
+      }
+      return { items };
+    },
+  );
+
+  tool(
+    "audio_track_consolidate",
+    { title: "Consolidate audio track range", annotations: DESTRUCTIVE_CUMULATIVE },
+    "Consolidate a range of an audio track into one clip, like Live's Consolidate for audio " +
+      "comps: the track's pre-FX audio between start_time and end_time (beats) is rendered " +
+      "(its clips as they play, before the device chain, which stays on the track), copied " +
+      "into the Live project, the range is CLEARED (clips crossing its edges are shortened), " +
+      "and one unwarped audio clip of the render is created at start_time, optionally named " +
+      "and colored (#RRGGBB). Unwarped, it plays at the current tempo only. Destructive: " +
+      "confirm with the user first. Audio tracks only; the range must hold a clip. If the " +
+      "render, the import or the clearing fails, " +
+      "nothing is changed; if the clip cannot be created after the range was cleared, the " +
+      "error says so and where the render is — undo in Live restores the clips. Undo steps: " +
+      "clear, create, name and color.",
+    {
+      ...trackAddress,
+      start_time: z.number().min(0).describe("Start of the range in beats"),
+      end_time: z.number().describe("End of the range in beats"),
+      name: z.string().optional().describe("Name of the new clip"),
+      color: z.string().optional().describe("#RRGGBB"),
+    },
+    async ({ start_time, end_time, name, color, ...address }) => {
+      if (!(end_time > start_time))
+        throw new UsageError(`end_time ${end_time} must be after start_time ${start_time}.`);
+      const parsedColor = color !== undefined ? hexToColor(color) : undefined;
+      const track = audioTrackOf(findTrack(address), "consolidated");
+      if (!clipsInRange(track.arrangementClips, start_time, end_time).length)
+        throw new UsageError(`${describeTrack(track)} has no arrangement clips between ${start_time} and ${end_time}.`);
+      // Render and import first: until the range is cleared nothing changes.
+      let rendered: string;
+      let imported: string;
+      try {
+        rendered = await context.resources.renderPreFxAudio(track, start_time, end_time);
+        imported = await context.resources.importIntoProject(rendered);
+      } catch (e) {
+        throw new Error(`Could not render and import the range: ${errorMessage(e)} Nothing was changed.`);
+      }
+      try {
+        await track.clearClipsInRange(start_time, end_time);
+      } catch (e) {
+        throw new Error(`Could not clear the range: ${errorMessage(e)} Nothing was changed (the render is at ${imported}).`);
+      }
+      let clip: AudioClip<"1.0.0">;
+      try {
+        clip = await track.createAudioClip({
+          filePath: imported,
+          startTime: start_time,
+          duration: end_time - start_time,
+          isWarped: false,
+        });
+      } catch (e) {
+        throw new Error(
+          `The range ${start_time}-${end_time} was cleared, but the consolidated clip could not be created: ` +
+            `${errorMessage(e)} The render is at ${imported}; undo in Live restores the clips.`,
         );
-      return { audio_path: await context.resources.renderPreFxAudio(track, start_time, end_time) };
+      }
+      let error: string | undefined;
+      if (name !== undefined || parsedColor !== undefined)
+        try {
+          context.withinTransaction(() => {
+            if (name !== undefined) clip.name = name;
+            if (parsedColor !== undefined) clip.color = parsedColor;
+          });
+        } catch (e) {
+          error = `the clip was created, but its name or color could not be set: ${errorMessage(e)}`;
+        }
+      return {
+        ...clipSummary(clip, true),
+        location: locate(clip),
+        rendered_path: rendered,
+        imported_path: imported,
+        cleared: [start_time, end_time],
+        error,
+      };
+    },
+  );
+
+  const MAX_SAMPLE_RESULTS = 500;
+
+  tool(
+    "sample_search",
+    { title: "Search sample files", annotations: READ },
+    "Find audio files (for clip_create, simpler_replace_sample, device_insert sample_path, " +
+      "drum_kit_build) without a shell: a read-only search of the sample folders — the " +
+      "`sample_roots` folders listed in the extension's config.json (read on every call) plus " +
+      "Live's default User Library and Factory Packs folders (~/Music/Ableton or " +
+      "~/Documents/Ableton) when they exist. Live's API has no browser access, so nothing else " +
+      "is searched; links leading outside these folders are not followed. `query` words must " +
+      "all occur in the file's path below its root (case-insensitive), e.g. \"kick 808\". " +
+      "Shallow files come first; the search stops at `limit` results, after max_depth folder " +
+      "levels, after time_limit_s or 20000 folders (`complete` false, `stopped` says why). " +
+      "Returns absolute paths, the `roots` searched (with `exists`) and config `problems`.",
+    {
+      query: z.string().optional().describe("Words that must all occur in the path below the root; omit to list"),
+      extensions: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe(`File extensions, e.g. ["wav", "aif"]; default ${AUDIO_EXTENSIONS.join(", ")}`),
+      roots: z
+        .array(z.string().min(1))
+        .min(1)
+        .optional()
+        .describe("Only the roots with these names or paths (see the result's `roots`)"),
+      limit: z.number().int().min(1).max(MAX_SAMPLE_RESULTS).default(50),
+      max_depth: z.number().int().min(0).max(32).default(12).describe("Folder levels below each root"),
+      time_limit_s: z.number().min(0.1).max(20).default(5).describe("Stop searching after this long"),
+    },
+    async ({ query, extensions, roots: only, limit, max_depth, time_limit_s }) => {
+      const config = configRoots(configFilePath(context));
+      let roots = [...config.roots, ...libraryRoots()];
+      if (only) {
+        const unknown = only.filter((o) => !roots.some((r) => r.name.toLowerCase() === o.toLowerCase() || r.path === o));
+        if (unknown.length)
+          throw new UsageError(
+            `No sample root named ${unknown.map(quote).join(", ")}. Roots: ` +
+              `${roots.map((r) => `${quote(r.name)} (${r.path})`).join(", ") || "none"}.`,
+          );
+        roots = roots.filter((r) => only.some((o) => r.name.toLowerCase() === o.toLowerCase() || r.path === o));
+      }
+      const exts = (extensions ?? AUDIO_EXTENSIONS).map((e) => (e.startsWith(".") ? e : `.${e}`).toLowerCase());
+      const terms = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+      const found = await searchSamples(roots, {
+        terms,
+        extensions: exts,
+        limit,
+        maxDepth: max_depth,
+        timeLimitMs: time_limit_s * 1000,
+        maxDirectories: 20_000,
+      });
+      return {
+        ...found,
+        problems: config.problems.length ? config.problems : undefined,
+        hint: found.roots.some((r) => r.exists)
+          ? undefined
+          : 'No sample folder exists: add folders to "sample_roots" in the extension\'s config.json ' +
+            `(${configFilePath(context) ?? "no storage directory"}), e.g. {"port": 8722, "sample_roots": ["/Users/me/Samples"]}.`,
+      };
     },
   );
 
@@ -4415,11 +5467,17 @@ function buildServer(
 // ---------------------------------------------------------------------------
 // http server (stateless streamable-http MCP endpoint)
 
+// The extension's config.json, in its storage directory.
+function configFilePath(context: Ctx): string | undefined {
+  const dir = context.environment.storageDirectory;
+  return dir ? path.join(dir, "config.json") : undefined;
+}
+
 function readConfig(context: Ctx): { port: number; file?: string } {
   const dir = context.environment.storageDirectory;
   const fallback = { port: DEFAULT_PORT };
-  if (!dir) return fallback;
-  const file = path.join(dir, "config.json");
+  const file = configFilePath(context);
+  if (!dir || !file) return fallback;
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
     const port = (parsed as { port?: unknown }).port;
