@@ -5581,7 +5581,8 @@ function buildServer(
       "poll dialog_result. One dialog at a time: while one is open (also the Status dialog), another is " +
       "refused (dialog_result tells when it closed). Live cannot close a dialog from code, and " +
       "dialogs keep no state between calls: each one starts from what you pass. Results carry " +
-      "`dialog_id` and `status` (closed or failed).",
+      "`dialog_id` and `status`; a dialog Live cannot show fails the call (with wait:false, " +
+      "dialog_result reports status failed).",
     {
       html: z.string().optional().describe("A page of your own (it must post close_and_send)"),
       url: z
