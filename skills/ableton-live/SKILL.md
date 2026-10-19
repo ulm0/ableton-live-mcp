@@ -17,7 +17,9 @@ or the port was changed in the extension's `config.json` (default 8722).
    parameters, chains). `track_get` also accepts `track_name` or `track_index` directly, and
    an `include` selector to skip sections you don't need.
 3. Ids become stale when objects are deleted/moved or a different set is loaded. On a stale-id
-   error, re-run `song_get` and re-resolve.
+   error, re-run `song_get` and re-resolve. Errors about your arguments (index out of range,
+   missing or conflicting fields) come without the stale-id hint: fix the call instead.
+4. Writes apply asynchronously: a read right after a write can still return the old value.
 
 ## Units and conventions
 
@@ -26,12 +28,16 @@ or the port was changed in the extension's `config.json` (default 8722).
 - MIDI pitch: 0–127, C3 = 60 in Live's naming (C-2 = 0). Kick drum pad usually C1 = 36.
 - Colors: `"#RRGGBB"` strings.
 - Velocity 0–127, probability 0–1.
+- Device parameters use internal units within each parameter's `min`/`max` (no dB/Hz/ms
+  display values).
 
 ## MIDI composition
 
 - Create track: `track_create {type:"midi"}`, then create clip + notes in ONE call:
   - Session: `clip_create {type:"midi", target_id:<track_id>, scene_index:0, duration:4, notes:[...], name, color}`
   - Arrangement: `clip_create {type:"midi", target_id:<midi_track_id>, start_time, duration, notes:[...]}`
+  - Take lane: `clip_create {type:"midi", target_id:<take_lane_id>, start_time, duration, ...}`
+  - MIDI clips reject the audio-only `file_path`, `is_warped` and `loop_settings`.
 - Layer more notes: `midi_clip_set_notes {mode:"merge", notes:[...]}` (default mode `replace`
   wipes the clip — only use it when rewriting everything).
 - Mechanical edits (transpose, shift, quantize, velocity, delete a range): use
@@ -66,24 +72,40 @@ or the port was changed in the extension's `config.json` (default 8722).
   imported into the project automatically (keep `import_into_project: true`).
 - Warping: `clip_set {warping, warp_mode}` — modes: Beats, Tones, Texture, Repitch, Complex,
   ComplexPro.
-- `render_track_audio` renders pre-FX audio of an audio track to WAV (path returned) — useful
-  for analysis or resampling; combine with `import_file`/`clip_create` to bounce back in.
+- `render_track_audio` renders the pre-FX audio of an audio track (its clip audio before the
+  device chain: no effects, mixer or sends) to a WAV file and returns the path — useful for
+  analysis or resampling. Since Live 12.4.15 the render is not normalized. The file lives in
+  the extension's temp directory, which may be cleaned: `import_file` it (or `clip_create`
+  with it, which imports by default) to keep it.
 
 ## Interacting with the user in Live
 
 - `show_dialog` displays HTML inside Live and blocks until closed — use sparingly, e.g. to
   confirm a destructive batch edit or present a summary. The HTML must call
-  `close_and_send` (see tool description) to return a value.
+  `close_and_send` (see tool description) to return a value. Dialogs keep no state between
+  calls: each one starts from the HTML you pass.
 
 ## What is NOT possible
 
-Transport (play/stop/record), clip launching, browser access, automation envelopes, loading
-third-party plug-ins, MIDI routing. Don't pretend otherwise — tell the user when asked.
+The Extensions API (1.0.0) has no access to:
+
+- transport (play/stop/record), song position, clip or scene launching;
+- the browser, third-party plug-ins, device presets;
+- automation envelopes, modulation, MIDI/macro mapping;
+- track color, routing and sidechain sources, MIDI routing;
+- reordering or grouping tracks, creating return tracks;
+- metering (no level readouts);
+- editing clip start/end markers or loop positions after creation (a MIDI clip's loop can't
+  be set even at creation);
+- the song time signature (scenes report theirs, read-only).
+
+Don't pretend otherwise or improvise workarounds — tell the user when asked.
 
 ## Destructive operations
 
 `track_delete`, `scene_delete`, `clip_delete`, `cue_point_delete`, `device_delete`,
 `midi_clip_set_notes` (mode `replace`), `midi_clip_edit_notes` (with `delete`),
 `track_clear_clips_in_range`, and `simpler_replace_sample` (discards the current sample)
-change the user's project (each is one undo step in Live). For bulk destructive edits the
-user didn't explicitly enumerate, confirm first.
+change the user's project (each is one undo step in Live). They carry the MCP
+`destructiveHint` annotation; read-only tools carry `readOnlyHint`. For bulk destructive edits
+the user didn't explicitly enumerate, confirm first.

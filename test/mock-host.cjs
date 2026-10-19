@@ -102,7 +102,13 @@ songObj.scenes = [
 songObj.cues = [make(["CuePoint"], { name: "Start", time: 0 })];
 
 // --- api modules -----------------------------------------------------------
-const calls = { dialogs: [], commands: {} };
+// What the extension asked the host to do. `transactions.outer` counts
+// outermost withinTransaction calls — the undo steps a user would see, since
+// nested transactions collapse into the outermost one (index.d.mts
+// withinTransaction); `transactions.all` also counts the nested ones that the
+// SDK opens around every setter and async operation.
+const calls = { dialogs: [], commands: {}, menus: [], transactions: { outer: 0, all: 0 } };
+let transactionDepth = 0;
 
 const dataModel = {
   getObjectIsOfClass: (h, cls) => get(h).classes.includes(cls),
@@ -207,6 +213,7 @@ const dataModel = {
   trackGetMixerDevice: (h) => get(h).mixer.handle,
   trackCreateTakeLane: (h, ok) => {
     const lane = make(["TakeLane"], { name: "Take 1", clips: [] });
+    lane.parentObj = get(h);
     get(h).takeLanes.push(lane);
     ok(lane.handle);
   },
@@ -261,10 +268,22 @@ const dataModel = {
   trackDeleteClip: (h, ch, ok) => {
     const t = get(h);
     t.arrClips = t.arrClips.filter((c) => c.handle.id !== ch.id);
+    // take-lane clips are arrangement clips too: the server deletes them via
+    // their lane's track
+    for (const lane of t.takeLanes) lane.clips = lane.clips.filter((c) => c.handle.id !== ch.id);
     ok();
   },
   trackClearClipsInRange: (h, s, e, ok) => ok(),
-  withinTransaction: (fn) => fn(),
+  withinTransaction: (fn) => {
+    calls.transactions.all++;
+    if (transactionDepth === 0) calls.transactions.outer++;
+    transactionDepth++;
+    try {
+      return fn();
+    } finally {
+      transactionDepth--;
+    }
+  },
   clipGetName: (h) => get(h).name,
   clipSetName: (h, v) => { get(h).name = v; },
   clipGetStartTime: (h) => get(h).startTime,
@@ -311,8 +330,28 @@ const dataModel = {
   takelaneGetClips: (h) => get(h).clips.map((c) => c.handle),
   takelaneGetName: (h) => get(h).name,
   takelaneSetName: (h, v) => { get(h).name = v; },
-  takelaneCreateMidiClip: (h, start, dur, ok) => dataModel.trackCreateMidiClip(h, start, dur, ok),
-  takelaneCreateAudioClip: (h, args, ok) => dataModel.trackCreateAudioClip(h, args, ok),
+  // TakeLane mocks hold their clips in `clips` (not `arrClips`); the clip's
+  // canonical parent is the lane.
+  takelaneCreateMidiClip: (h, start, dur, ok) => {
+    const c = make(["MidiClip", "Clip"], {
+      name: "", startTime: start, endTime: start + dur, startMarker: 0, endMarker: dur,
+      looping: false, loopStart: 0, loopEnd: dur, color: 0, muted: false, notes: [],
+    });
+    c.parentObj = get(h);
+    get(h).clips.push(c);
+    ok(c.handle);
+  },
+  takelaneCreateAudioClip: (h, args, ok) => {
+    const c = make(["AudioClip", "Clip"], {
+      name: "", startTime: args.startTime, endTime: args.startTime + (args.duration ?? 4),
+      startMarker: 0, endMarker: 4, looping: false, loopStart: 0, loopEnd: 4,
+      color: 0, muted: false, filePath: args.filePath, warping: !!args.isWarped,
+      warpMode: 0, warpMarkers: [],
+    });
+    c.parentObj = get(h);
+    get(h).clips.push(c);
+    ok(c.handle);
+  },
   deviceGetName: (h) => get(h).name,
   deviceGetParameters: (h) => get(h).params.map((p) => p.handle),
   sampleGetFilePath: (h) => get(h).filePath,
@@ -365,15 +404,17 @@ const dataModel = {
   chainmixerdeviceGetSends: (h) => get(h).sends.map((s) => s.handle),
 };
 
-function makeActivation(storageDir, tempDir) {
+// `sink` collects commands, dialogs and menu entries of this activation; pass
+// a fresh one to run a second extension instance against the same Live Set.
+function makeActivation(storageDir, tempDir, sink = calls) {
   return {
     hostApiVersion: "1.0.0",
     initializeExtensionHost: () => ({
       commands: {
-        registerCommand: (id, cb) => { calls.commands[id] = cb; },
+        registerCommand: (id, cb) => { sink.commands[id] = cb; },
         executeCommand: (id, ...args) => {
-          if (!calls.commands[id]) throw new Error(`mock: unknown command ${id}`);
-          calls.commands[id](...args);
+          if (!sink.commands[id]) throw new Error(`mock: unknown command ${id}`);
+          sink.commands[id](...args);
         },
       },
       dataModel,
@@ -383,8 +424,11 @@ function makeActivation(storageDir, tempDir) {
         importIntoProject: (fp, ok) => ok(`/mock-project/Samples/Imported/${fp.split("/").pop()}`),
       },
       ui: {
-        registerContextMenuAction: (scope, title, commandId, onOk) => onOk((onUnreg) => onUnreg()),
-        showModalDialog: (url, w, hgt, ok) => { calls.dialogs.push({ url, w, hgt }); ok("mock-dialog-result"); },
+        registerContextMenuAction: (scope, title, commandId, onOk) => {
+          sink.menus.push({ scope, title, commandId });
+          onOk((onUnreg) => onUnreg());
+        },
+        showModalDialog: (url, w, hgt, ok) => { sink.dialogs.push({ url, w, hgt }); ok("mock-dialog-result"); },
         showProgressDialog: (opts, onShow) => onShow({ update: (o, cb) => cb && cb(), close: (cb) => cb && cb() }),
       },
     }),

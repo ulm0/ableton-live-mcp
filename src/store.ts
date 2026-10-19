@@ -1,4 +1,5 @@
 import { DataModelObject, type ApiVersion } from "@ableton-extensions/sdk";
+import { UsageError } from "./errors.js";
 
 type Obj = DataModelObject<ApiVersion>;
 
@@ -25,7 +26,7 @@ export function resolve<T extends Obj>(
     );
   }
   if (!(obj instanceof type)) {
-    throw new Error(
+    throw new UsageError(
       `Object "${id}" is a ${(obj.constructor as { className?: string }).className ?? obj.constructor.name}, ` +
         `expected ${(type as unknown as { className?: string }).className ?? type.name}.`,
     );

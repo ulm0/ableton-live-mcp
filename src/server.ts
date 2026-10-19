@@ -4,6 +4,12 @@ import * as path from "node:path";
 import { z, type ZodRawShape } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type {
+  ServerNotification,
+  ServerRequest,
+  ToolAnnotations,
+} from "@modelcontextprotocol/sdk/types.js";
 import {
   AudioClip,
   AudioTrack,
@@ -29,6 +35,8 @@ import {
   type ExtensionContext,
   type NoteDescription,
 } from "@ableton-extensions/sdk";
+import { UsageError } from "./errors.js";
+import INSTRUCTIONS from "./instructions.md";
 import { remember, resolve } from "./store.js";
 import {
   chainSummary,
@@ -76,6 +84,51 @@ function json(data: unknown) {
 
 const STALE_HINT =
   "If this object was deleted or moved, or the Live Set changed, its id is stale — re-fetch ids via song_get / track_get.";
+
+// Tool annotation presets. The MCP defaults (destructiveHint:true,
+// openWorldHint:true) would make every tool, song_get included, look like a
+// destructive write to the outside world, so every hint is spelled out.
+const READ: ToolAnnotations = { readOnlyHint: true, openWorldHint: false };
+// Sets properties to the given values: repeating the call changes nothing more.
+const SET: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// Adds objects (tracks, clips, devices, ...); each call adds another one.
+const CREATE: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+};
+// Removes or overwrites content. Repeating the call (same ids) has no further effect.
+const DESTRUCTIVE: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+// Destructive and cumulative: a repeated merge or transform applies again.
+const DESTRUCTIVE_CUMULATIVE: ToolAnnotations = { ...DESTRUCTIVE, idempotentHint: false };
+// show_dialog: blocks Live's UI with a modal whose HTML may load https: content.
+const DIALOG: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+// execute_command: runs arbitrary commands, including other extensions' ones.
+const COMMAND: ToolAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+
+type ToolMeta = { title: string; annotations: ToolAnnotations };
+type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 const noteShape = {
   pitch: z.number().int().min(0).max(127).describe("MIDI pitch, 0-127"),
@@ -128,22 +181,29 @@ const loopSettingsShape = z
 // tool registration
 
 function buildServer(context: Ctx, hostApiVersion: string, port: number): McpServer {
-  const server = new McpServer(SERVER_INFO);
+  const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
   const song = () => context.application.song;
+  // Transport-level failures (unparsable bodies, bad headers) are answered to
+  // the client by the SDK; log them so they leave a trace in ExtensionHost.txt.
+  server.server.onerror = (e) => console.error("[ableton-live-mcp] MCP error:", e.message);
 
   function tool<S extends ZodRawShape>(
     name: string,
+    meta: ToolMeta,
     description: string,
     shape: S,
-    handler: (args: z.objectOutputType<S, z.ZodTypeAny>) => Promise<unknown> | unknown,
+    handler: (
+      args: z.objectOutputType<S, z.ZodTypeAny>,
+      extra: ToolExtra,
+    ) => Promise<unknown> | unknown,
   ) {
-    // Spec-legal tools/call may omit `arguments` entirely; a bare z.object(shape)
-    // rejects undefined. Preprocess coerces undefined -> {}, and gluing `shape`
-    // back on keeps the SDK's tools/list schema generation intact.
-    const schema = Object.assign(z.preprocess((v) => v ?? {}, z.object(shape)), { shape });
-    server.registerTool(name, { description, inputSchema: schema as never }, (async (args: never) => {
+    // A tools/call without `arguments` is validated as `{}` by the SDK, so the
+    // plain shape works; `?? {}` only guards the handler contract.
+    const config = { ...meta, description, inputSchema: shape as never };
+    server.registerTool(name, config, (async (args: never, extra: ToolExtra) => {
+      const started = Date.now();
       try {
-        return json(await handler(args ?? ({} as never)));
+        return json(await handler(args ?? ({} as never), extra));
       } catch (e) {
         // The host rejects most async operations with no error value at all —
         // surface something actionable instead of "undefined".
@@ -154,10 +214,11 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
               ? "the Live host rejected the operation without details — check argument " +
                 "values (device name spelling, index ranges, file paths, clip overlaps)."
               : String(e);
-        return {
-          content: [{ type: "text" as const, text: `Error: ${msg}\n${STALE_HINT}` }],
-          isError: true,
-        };
+        // Never log the arguments: they can carry the user's content.
+        console.error(`[ableton-live-mcp] ${name} failed after ${Date.now() - started} ms: ${msg}`);
+        // Argument errors the server detects itself have nothing to do with stale ids.
+        const text = e instanceof UsageError ? `Error: ${msg}` : `Error: ${msg}\n${STALE_HINT}`;
+        return { content: [{ type: "text" as const, text }], isError: true };
       }
     }) as never);
   }
@@ -166,6 +227,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "song_get",
+    { title: "Get Live Set", annotations: READ },
     "Get the state of the current Live Set: tempo, scale, grid, all tracks " +
       "(with ids), return tracks, main track, scenes, cue points, and extension " +
       "environment info. This is the entry point — object ids returned here are " +
@@ -209,6 +271,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "song_set",
+    { title: "Set song properties", annotations: SET },
     "Set song-level properties of the Live Set.",
     { tempo: z.number().min(20).max(999).optional().describe("Tempo in BPM") },
     ({ tempo }) => {
@@ -226,7 +289,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     const s = song();
     if (args.track_index !== undefined) {
       const t = s.tracks[args.track_index];
-      if (!t) throw new Error(`track_index ${args.track_index} out of range (0-${s.tracks.length - 1}).`);
+      if (!t)
+        throw new UsageError(`track_index ${args.track_index} out of range (0-${s.tracks.length - 1}).`);
       return t;
     }
     if (args.track_name !== undefined) {
@@ -236,12 +300,12 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         ? exact
         : all.filter((t) => t.name.toLowerCase() === args.track_name!.toLowerCase());
       if (ci.length === 1) return ci[0];
-      throw new Error(
+      throw new UsageError(
         (ci.length ? `Ambiguous track name` : `No track named`) +
           ` "${args.track_name}". Tracks: ${all.map((t) => JSON.stringify(t.name)).join(", ")}.`,
       );
     }
-    throw new Error("Provide track_id, track_index, or track_name.");
+    throw new UsageError("Provide track_id, track_index, or track_name.");
   }
 
   async function mixerDetail(mixer: TrackMixer<"1.0.0"> | ChainMixer<"1.0.0">) {
@@ -261,6 +325,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "track_get",
+    { title: "Get track", annotations: READ },
     "Get detail for one track: properties, clip slots (session view, with " +
       "clips), take lanes, arrangement clips, devices, and mixer (volume/pan/sends " +
       "with current values). Works for regular, return, and main tracks. Address " +
@@ -293,6 +358,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "track_set",
+    { title: "Set track properties", annotations: SET },
     "Set track properties (name, mute, solo, arm).",
     {
       track_id: z.string(),
@@ -313,6 +379,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "track_create",
+    { title: "Create track", annotations: CREATE },
     "Create a new audio or MIDI track. Inserted after the last selected track, " +
       "or appended if none is selected.",
     { type: z.enum(["audio", "midi"]) },
@@ -323,13 +390,20 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  tool("track_delete", "Delete a track.", { track_id: z.string() }, async ({ track_id }) => {
-    await song().deleteTrack(resolve(track_id, Track));
-    return { deleted: track_id };
-  });
+  tool(
+    "track_delete",
+    { title: "Delete track", annotations: DESTRUCTIVE },
+    "Delete a track.",
+    { track_id: z.string() },
+    async ({ track_id }) => {
+      await song().deleteTrack(resolve(track_id, Track));
+      return { deleted: track_id };
+    },
+  );
 
   tool(
     "track_duplicate",
+    { title: "Duplicate track", annotations: CREATE },
     "Duplicate a track. The copy is inserted right after the original.",
     { track_id: z.string() },
     async ({ track_id }) => trackSummary(await song().duplicateTrack(resolve(track_id, Track))),
@@ -337,6 +411,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "track_clear_clips_in_range",
+    { title: "Clear arrangement clips in range", annotations: DESTRUCTIVE },
     "Delete all arrangement clips of a track within a beat range. Clips " +
       "overlapping a boundary are truncated to the range edge.",
     { track_id: z.string(), start_time: z.number(), end_time: z.number() },
@@ -348,6 +423,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "take_lane_create",
+    { title: "Create take lane", annotations: CREATE },
     "Create a new take lane on a track (appended after existing lanes).",
     { track_id: z.string() },
     async ({ track_id }) => takeLaneSummary(await resolve(track_id, Track).createTakeLane()),
@@ -355,6 +431,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "take_lane_set",
+    { title: "Rename take lane", annotations: SET },
     "Rename a take lane.",
     { take_lane_id: z.string(), name: z.string() },
     ({ take_lane_id, name }) => {
@@ -368,6 +445,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "scene_create",
+    { title: "Create scene", annotations: CREATE },
     "Create a scene at the given index (0-based). Pass -1 to append at the end.",
     { index: z.number().int().min(-1) },
     async ({ index }) => {
@@ -378,6 +456,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "scene_set",
+    { title: "Rename scene", annotations: SET },
     "Rename a scene.",
     { scene_id: z.string(), name: z.string() },
     ({ scene_id, name }) => {
@@ -387,13 +466,20 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
-  tool("scene_delete", "Delete a scene.", { scene_id: z.string() }, async ({ scene_id }) => {
-    await song().deleteScene(resolve(scene_id, Scene));
-    return { deleted: scene_id };
-  });
+  tool(
+    "scene_delete",
+    { title: "Delete scene", annotations: DESTRUCTIVE },
+    "Delete a scene.",
+    { scene_id: z.string() },
+    async ({ scene_id }) => {
+      await song().deleteScene(resolve(scene_id, Scene));
+      return { deleted: scene_id };
+    },
+  );
 
   tool(
     "scene_duplicate",
+    { title: "Duplicate scene", annotations: CREATE },
     "Duplicate a scene. The copy is inserted right after the original.",
     { scene_id: z.string() },
     async ({ scene_id }) => {
@@ -404,6 +490,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "cue_point_create",
+    { title: "Create cue point", annotations: CREATE },
     "Create an arrangement cue point (locator) at a beat position.",
     { time: z.number().describe("Position in the arrangement in beats") },
     async ({ time }) => cuePointSummary(await song().createCuePoint(time)),
@@ -411,6 +498,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "cue_point_set",
+    { title: "Rename cue point", annotations: SET },
     "Rename a cue point.",
     { cue_point_id: z.string(), name: z.string() },
     ({ cue_point_id, name }) => {
@@ -422,6 +510,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "cue_point_delete",
+    { title: "Delete cue point", annotations: DESTRUCTIVE },
     "Delete a cue point.",
     { cue_point_id: z.string() },
     async ({ cue_point_id }) => {
@@ -434,13 +523,15 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_create",
+    { title: "Create clip", annotations: CREATE },
     "Create a MIDI or audio clip. Target: a clip slot id (session view), a track " +
       "id (arrangement — MidiTrack for midi, AudioTrack for audio; requires " +
       "start_time — OR session view when scene_index is given), or a take lane id " +
       "(requires start_time). MIDI clips require duration and can be created with " +
-      "their notes inline. Audio clips require file_path; by default the file is " +
-      "first imported into the Live project (recommended). Optional name/color " +
-      "apply right after creation.",
+      "their notes inline (file_path, is_warped and loop_settings are rejected). " +
+      "Audio clips require file_path; by default the file is first imported " +
+      "into the Live project (recommended). Optional name/color apply right " +
+      "after creation.",
     {
       type: z.enum(["midi", "audio"]),
       target_id: z.string().describe("ClipSlot, Track, or TakeLane id"),
@@ -464,19 +555,27 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         .describe("Audio only: copy the file into the Live project first"),
     },
     async (args) => {
+      if (args.type === "midi") {
+        const audioOnly = (["file_path", "is_warped", "loop_settings"] as const).filter(
+          (k) => args[k] !== undefined,
+        );
+        if (audioOnly.length)
+          throw new UsageError(`MIDI clips take no ${audioOnly.join(", ")} (audio clips only).`);
+      }
       let target = resolve(args.target_id, DataModelObject);
       if (args.scene_index !== undefined) {
         if (!(target instanceof Track))
-          throw new Error(`scene_index requires a Track target, got ${classOf(target)}.`);
+          throw new UsageError(`scene_index requires a Track target, got ${classOf(target)}.`);
         const slot = target.clipSlots[args.scene_index];
         if (!slot)
-          throw new Error(
+          throw new UsageError(
             `scene_index ${args.scene_index} out of range (track has ${target.clipSlots.length} slots).`,
           );
         target = slot;
       }
       const need = (cond: unknown, what: string) => {
-        if (cond === undefined || cond === null) throw new Error(`${what} is required for this target/type.`);
+        if (cond === undefined || cond === null)
+          throw new UsageError(`${what} is required for this target/type.`);
       };
       const parsedColor = args.color !== undefined ? hexToColor(args.color) : undefined;
       const finish = (clip: Clip<"1.0.0">, extra?: Record<string, unknown>) => {
@@ -494,7 +593,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           need(args.start_time, "start_time");
           clip = await target.createMidiClip(args.start_time!, args.duration!);
         } else {
-          throw new Error(
+          throw new UsageError(
             `MIDI clips need a ClipSlot, MidiTrack, or TakeLane target, got ${classOf(target)}.`,
           );
         }
@@ -506,10 +605,13 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       // Validate the target before importing so a bad target doesn't leave an
       // orphan copy in the project folder.
       if (!(target instanceof ClipSlot) && !(target instanceof AudioTrack) && !(target instanceof TakeLane))
-        throw new Error(
+        throw new UsageError(
           `Audio clips need a ClipSlot, AudioTrack, or TakeLane target, got ${classOf(target)}.`,
         );
-      if (args.notes) throw new Error("notes only apply to MIDI clips.");
+      if (args.notes) throw new UsageError("notes only apply to MIDI clips.");
+      if (!(target instanceof ClipSlot)) need(args.start_time, "start_time");
+      if (args.loop_settings && args.is_warped === undefined)
+        throw new UsageError("is_warped is required when loop_settings is set.");
       const filePath = args.import_into_project
         ? await context.resources.importIntoProject(args.file_path!)
         : args.file_path!;
@@ -524,7 +626,6 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       if (target instanceof ClipSlot) {
         clip = await target.createAudioClip({ filePath, isWarped: args.is_warped, loopSettings });
       } else {
-        need(args.start_time, "start_time");
         clip = await target.createAudioClip({
           filePath,
           startTime: args.start_time!,
@@ -539,6 +640,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_get",
+    { title: "Get clip", annotations: READ },
     "Get full detail for one clip (MIDI: note count; audio: file, warp settings " +
       "and warp markers). Use midi_clip_get_notes for the actual notes.",
     { clip_id: z.string() },
@@ -547,6 +649,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_set",
+    { title: "Set clip properties", annotations: SET },
     "Set clip properties. color is '#RRGGBB'. warping/warp_mode apply to audio " +
       "clips only. Note: enabling looping on an unwarped audio clip enables warping.",
     {
@@ -564,7 +667,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       // own host transaction, so a late throw would leave partial changes.
       const parsedColor = color !== undefined ? hexToColor(color) : undefined;
       if ((warping !== undefined || warp_mode !== undefined) && !(clip instanceof AudioClip))
-        throw new Error("warping/warp_mode only apply to audio clips.");
+        throw new UsageError("warping/warp_mode only apply to audio clips.");
       if (name !== undefined) clip.name = name;
       if (parsedColor !== undefined) clip.color = parsedColor;
       if (muted !== undefined) clip.muted = muted;
@@ -579,6 +682,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "clip_delete",
+    { title: "Delete clip", annotations: DESTRUCTIVE },
     "Delete a clip (session or arrangement). The clip's parent determines how it " +
       "is removed.",
     { clip_id: z.string() },
@@ -600,6 +704,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "midi_clip_get_notes",
+    { title: "Get MIDI notes", annotations: READ },
     "Get all MIDI notes of a clip. Times/durations in beats relative to clip start.",
     { clip_id: z.string() },
     ({ clip_id }) => {
@@ -622,6 +727,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "midi_clip_set_notes",
+    { title: "Write MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
     "Write notes to a MIDI clip. mode 'replace' (default) replaces ALL notes; " +
       "mode 'merge' adds the given notes on top of the existing ones (layering " +
       "without re-sending the current content). For mechanical edits of existing " +
@@ -641,6 +747,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "midi_clip_edit_notes",
+    { title: "Edit MIDI notes", annotations: DESTRUCTIVE_CUMULATIVE },
     "Transform existing notes of a MIDI clip server-side — no need to read and " +
       "rewrite the note list. Optional `select` restricts which notes are " +
       "affected (by pitch/time range); others pass through untouched. Transforms " +
@@ -710,6 +817,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_get",
+    { title: "Get device", annotations: READ },
     "Get detail for one device: parameters (metadata + ids), rack chains, drum " +
       "rack pads, or Simpler sample. Big devices have 100+ parameters — use " +
       "parameter_filter (case-insensitive substring on the name) to fetch only " +
@@ -749,6 +857,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_insert",
+    { title: "Insert device", annotations: CREATE },
     "Insert a built-in Live device (by name, e.g. 'Reverb', 'Auto Filter', 'EQ " +
       "Eight', 'Compressor', 'Simpler', 'Drum Rack', 'Operator', 'Wavetable') into " +
       "a track or rack chain. Third-party plug-ins cannot be loaded. index is the " +
@@ -761,7 +870,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     async ({ target_id, device_name, index }) => {
       const target = resolve(target_id, DataModelObject);
       if (!(target instanceof Track) && !(target instanceof Chain))
-        throw new Error(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
+        throw new UsageError(`Devices can be inserted into a Track or Chain, got ${classOf(target)}.`);
       const device = await target.insertDevice(device_name, index ?? target.devices.length);
       return deviceSummary(device);
     },
@@ -769,6 +878,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_delete",
+    { title: "Delete device", annotations: DESTRUCTIVE },
     "Delete a device from its track or chain.",
     { device_id: z.string() },
     async ({ device_id }) => {
@@ -785,6 +895,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "device_duplicate",
+    { title: "Duplicate device", annotations: CREATE },
     "Duplicate a device; the copy is inserted right after the original.",
     { device_id: z.string() },
     async ({ device_id }) => {
@@ -800,6 +911,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "chain_get",
+    { title: "Get rack chain", annotations: READ },
     "Get detail for a rack chain: its devices and mixer (volume/pan/sends with " +
       "values). Drum chains also report their receiving note.",
     { chain_id: z.string() },
@@ -815,6 +927,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "rack_insert_chain",
+    { title: "Insert rack chain", annotations: CREATE },
     "Insert a new chain into a rack device at the given 0-based index.",
     { rack_device_id: z.string(), index: z.number().int().min(0) },
     async ({ rack_device_id, index }) => {
@@ -825,6 +938,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "drum_chain_set",
+    { title: "Set drum pad note", annotations: SET },
     "Set the MIDI note a drum rack chain (pad) responds to.",
     {
       drum_chain_id: z.string(),
@@ -839,6 +953,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "simpler_replace_sample",
+    { title: "Replace Simpler sample", annotations: DESTRUCTIVE },
     "Replace the sample loaded in a Simpler device with another audio file " +
       "(absolute path).",
     { simpler_device_id: z.string(), file_path: z.string() },
@@ -853,6 +968,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "parameter_get",
+    { title: "Get parameter values", annotations: READ },
     "Read current values (and metadata) of one or more device/mixer parameters.",
     { parameter_ids: z.array(z.string()).min(1) },
     async ({ parameter_ids }) =>
@@ -861,6 +977,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "parameter_set",
+    { title: "Set parameter values", annotations: SET },
     "Set one or more device/mixer parameter values. Values must be within the " +
       "parameter's [min, max]; quantized parameters take the value_items index. " +
       "Multiple values are grouped into a single undo step.",
@@ -883,6 +1000,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "mixer_get",
+    { title: "Get mixer", annotations: READ },
     "Get the mixer of a track or rack chain: volume, panning, and sends with " +
       "current values and parameter ids (settable via parameter_set).",
     { target_id: z.string().describe("Track, Chain, or mixer id") },
@@ -894,13 +1012,14 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           : target instanceof TrackMixer || target instanceof ChainMixer
             ? target
             : null;
-      if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
+      if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
       return await mixerDetail(mixer);
     },
   );
 
   tool(
     "mixer_set",
+    { title: "Set mixer", annotations: SET },
     "Set volume, panning, and/or sends of a track or rack chain mixer in one " +
       "call (single undo step). Volume is normalized 0-1 (0.85 = 0 dB unity, " +
       "1.0 = +6 dB); panning is -1..1; sends are addressed by index (order " +
@@ -921,16 +1040,16 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           : target instanceof TrackMixer || target instanceof ChainMixer
             ? target
             : null;
-      if (!mixer) throw new Error(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
+      if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(target)}.`);
       const writes: Array<() => Promise<void>> = [];
       if (volume !== undefined) writes.push(() => mixer.volume.setValue(volume));
       if (panning !== undefined) writes.push(() => mixer.panning.setValue(panning));
       for (const send of sends ?? []) {
         const p = mixer.sends[send.index];
-        if (!p) throw new Error(`send index ${send.index} out of range (${mixer.sends.length} sends).`);
+        if (!p) throw new UsageError(`send index ${send.index} out of range (${mixer.sends.length} sends).`);
         writes.push(() => p.setValue(send.value));
       }
-      if (!writes.length) throw new Error("Nothing to set — provide volume, panning, and/or sends.");
+      if (!writes.length) throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
       await context.withinTransaction(() => Promise.all(writes.map((w) => w())));
       return await mixerDetail(mixer);
     },
@@ -940,6 +1059,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "import_file",
+    { title: "Import file into project", annotations: CREATE },
     "Copy a file into the Live project folder so Live manages it. Returns the " +
       "imported path — use that path (not the original) in subsequent calls.",
     { file_path: z.string() },
@@ -950,9 +1070,14 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "render_track_audio",
-    "Render the pre-effects audio of an audio track between two arrangement beat " +
-      "positions. Returns the path of an audio file (WAV/AIFF) in the extension's " +
-      "temp directory.",
+    { title: "Render track audio", annotations: READ },
+    "Render the pre-FX audio of an audio track between two arrangement beat " +
+      "positions and return the path of the WAV file. Pre-FX means the track's " +
+      "clip audio before its device chain (no effects, mixer or sends). Since " +
+      "Live 12.4.15 the render is not normalized, so its levels are meaningful. " +
+      "The file is written to the extension's temp directory, which may be " +
+      "cleaned between sessions: pass it to import_file (or clip_create, which " +
+      "imports by default) to keep it. Audio tracks only.",
     { track_id: z.string(), start_time: z.number(), end_time: z.number() },
     async ({ track_id, start_time, end_time }) => ({
       audio_path: await context.resources.renderPreFxAudio(
@@ -967,12 +1092,14 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "show_dialog",
+    { title: "Show dialog in Live", annotations: DIALOG },
     "Show a modal HTML dialog inside Ableton Live and wait for the user to close " +
       "it. The HTML can return a result by posting " +
       "{method:'close_and_send', params:[resultString]} to " +
       "window.webkit.messageHandlers.live (macOS) or window.chrome.webview " +
       "(Windows). Useful to ask the user something or show a report. Blocks until " +
-      "closed.",
+      "closed. Dialogs keep no state between calls: each one starts from the " +
+      "given HTML, so include everything it needs.",
     {
       html: z.string(),
       width: z.number().int().min(100).max(2000).default(480),
@@ -989,6 +1116,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   tool(
     "execute_command",
+    { title: "Execute host command", annotations: COMMAND },
     "Invoke a command registered with the Extension Host by its string id. " +
       "This extension registers 'ableton-live-mcp.status' (shows a status dialog " +
       "in Live). Commands registered by other extensions can also be invoked if " +
@@ -1006,7 +1134,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 // ---------------------------------------------------------------------------
 // http server (stateless streamable-http MCP endpoint)
 
-function readConfig(context: Ctx): { port: number } {
+function readConfig(context: Ctx): { port: number; file?: string } {
   const dir = context.environment.storageDirectory;
   const fallback = { port: DEFAULT_PORT };
   if (!dir) return fallback;
@@ -1015,15 +1143,15 @@ function readConfig(context: Ctx): { port: number } {
     const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
     const port = (parsed as { port?: unknown }).port;
     if (typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535) {
-      return { port };
+      return { port, file };
     }
     console.error(`[ableton-live-mcp] invalid port in ${file}, using ${DEFAULT_PORT}`);
-    return fallback;
+    return { ...fallback, file };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
       // exists but unreadable/malformed — leave the user's file alone
       console.error(`[ableton-live-mcp] could not read ${file}, using defaults:`, e);
-      return fallback;
+      return { ...fallback, file };
     }
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -1031,23 +1159,139 @@ function readConfig(context: Ctx): { port: number } {
     } catch {
       // storage dir not writable — run with defaults
     }
-    return fallback;
+    return { ...fallback, file };
+  }
+}
+
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+// DNS-rebinding protection (the Streamable HTTP spec requires servers to
+// validate Origin). A web page whose domain rebinds to 127.0.0.1 reaches this
+// port, but the browser still sends the page's Host and, on cross-origin
+// requests, its Origin. Accept only a loopback Host (any port) and, when an
+// Origin is sent, only an http(s) loopback one; "null" is refused too.
+// Returns why the request is refused, or undefined to let it through.
+function foreignRequestReason(req: http.IncomingMessage): string | undefined {
+  const isLoopback = (url: string, schemes: string[]) => {
+    try {
+      const u = new URL(url);
+      return schemes.includes(u.protocol) && LOOPBACK_HOSTNAMES.has(u.hostname);
+    } catch {
+      return false;
+    }
+  };
+  const host = req.headers.host;
+  if (!host) return "missing Host header";
+  if (!isLoopback(`http://${host}`, ["http:"])) return `invalid Host header: ${host}`;
+  const origin = req.headers.origin;
+  if (origin !== undefined && !isLoopback(origin, ["http:", "https:"]))
+    return `invalid Origin header: ${origin}`;
+  return undefined;
+}
+
+function sendJsonRpcError(
+  res: http.ServerResponse,
+  status: number,
+  code: number,
+  message: string,
+  headers: Record<string, string> = {},
+) {
+  res.writeHead(status, { ...headers, "content-type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", error: { code, message }, id: null }));
+}
+
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+type ServerState =
+  | { kind: "starting" }
+  | { kind: "listening" }
+  | { kind: "failed"; error: string; code?: string };
+
+// In-Live status dialog, reachable from track context menus. Registered before
+// listen so that a failed start (e.g. EADDRINUSE) can be seen from inside Live.
+function registerStatus(
+  context: Ctx,
+  port: number,
+  configFile: string | undefined,
+  state: () => ServerState,
+) {
+  const statusHtml = () => {
+    const s = state();
+    const config = configFile
+      ? `<code>${escapeHtml(configFile)}</code>`
+      : "the extension's config.json (no storage directory available)";
+    const body =
+      s.kind === "listening"
+        ? `<p>MCP endpoint: <code>http://127.0.0.1:${port}/mcp</code></p>` +
+          `<p>Add it to an MCP client as a streamable-http server.</p>` +
+          `<p style="font-size:smaller">Port set in ${config}</p>`
+        : s.kind === "failed"
+          ? `<p style="color:#ff8a80">The MCP server is not running: <code>${escapeHtml(s.error)}</code></p>` +
+            (s.code === "EADDRINUSE"
+              ? `<p>Port ${port} is already in use by another program.</p>`
+              : "") +
+            `<p>Set another <code>"port"</code> in ${config}, then restart Live.</p>`
+          : `<p>The MCP server is starting on port ${port}...</p>`;
+    return (
+      // charset: the config path or error text may be non-ASCII
+      `<!doctype html><meta charset="utf-8">` +
+      `<body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
+      `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
+      body +
+      `<button onclick="(window.webkit?.messageHandlers?.live??window.chrome?.webview).postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
+      `</body>`
+    );
+  };
+  context.commands.registerCommand("ableton-live-mcp.status", () => {
+    context.ui
+      .showModalDialog(`data:text/html,${encodeURIComponent(statusHtml())}`, 480, 280)
+      .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
+  });
+  for (const scope of ["AudioTrack", "MidiTrack"] as const) {
+    void context.ui.registerContextMenuAction(
+      scope,
+      "Ableton Live MCP: Status",
+      "ableton-live-mcp.status",
+    );
   }
 }
 
 export async function startServer(context: Ctx, hostApiVersion: string): Promise<void> {
-  const { port } = readConfig(context);
+  const { port, file: configFile } = readConfig(context);
+  let state: ServerState = { kind: "starting" };
+  try {
+    registerStatus(context, port, configFile, () => state);
+  } catch (e) {
+    // a convenience only: never let it keep the endpoint from starting
+    console.error("[ableton-live-mcp] could not register the status command:", e);
+  }
 
   const httpServer = http.createServer(async (req, res) => {
     try {
-      if (req.url === "/health") {
+      // Before routing, so a rebinding page can't even probe /health.
+      const refused = foreignRequestReason(req);
+      if (refused) {
+        console.error(`[ableton-live-mcp] refused request: ${refused}`);
+        sendJsonRpcError(res, 403, -32000, `Forbidden: ${refused}`);
+        return;
+      }
+      const pathname = (req.url ?? "").split("?")[0];
+      if (pathname === "/health") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, ...SERVER_INFO }));
         return;
       }
-      if (!req.url?.startsWith("/mcp")) {
+      if (pathname !== "/mcp") {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("Not found. MCP endpoint: POST /mcp");
+        return;
+      }
+      if (req.method !== "POST") {
+        // Stateless server: no standalone SSE stream to GET, no session to DELETE.
+        // Clients treat 405 on GET as "no server-initiated stream".
+        sendJsonRpcError(res, 405, -32000, "Method not allowed. MCP endpoint: POST /mcp", {
+          allow: "POST",
+        });
         return;
       }
       if (Number(req.headers["content-length"]) > 16_000_000) {
@@ -1072,47 +1316,26 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
       await transport.handleRequest(req, res);
     } catch (e) {
       console.error("[ableton-live-mcp] request error:", e);
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal server error" },
-            id: null,
-          }),
-        );
-      }
+      if (!res.headersSent) sendJsonRpcError(res, 500, -32603, "Internal server error");
     }
   });
 
-  await new Promise<void>((res, rej) => {
-    httpServer.once("error", rej);
-    httpServer.listen(port, "127.0.0.1", res);
-  });
-  // The startup once-handler is spent; keep a persistent one so a later server
-  // 'error' (e.g. EMFILE on accept) is logged instead of crashing the host.
+  try {
+    await new Promise<void>((res, rej) => {
+      httpServer.once("error", rej);
+      httpServer.listen(port, "127.0.0.1", () => {
+        httpServer.off("error", rej);
+        res();
+      });
+    });
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    state = { kind: "failed", error: err?.message ?? String(e), code: err?.code };
+    throw e;
+  }
+  state = { kind: "listening" };
+  // Keep a persistent handler so a later server 'error' (e.g. EMFILE on
+  // accept) is logged instead of crashing the host.
   httpServer.on("error", (e) => console.error("[ableton-live-mcp] server error:", e));
   console.log(`[ableton-live-mcp] MCP server listening on http://127.0.0.1:${port}/mcp`);
-
-  // In-Live conveniences, registered only once the endpoint is actually up:
-  // a status dialog reachable from track context menus.
-  const statusHtml = () =>
-    `<!doctype html><body style="font-family:sans-serif;background:#363636;color:#b5b5b5;padding:16px">` +
-    `<h3 style="margin-top:0;color:#fff">Ableton Live MCP</h3>` +
-    `<p>MCP endpoint: <code>http://127.0.0.1:${port}/mcp</code></p>` +
-    `<p>Add it to an MCP client as a streamable-http server.</p>` +
-    `<button onclick="(window.webkit?.messageHandlers?.live??window.chrome?.webview).postMessage({method:'close_and_send',params:['ok']})">Close</button>` +
-    `</body>`;
-  context.commands.registerCommand("ableton-live-mcp.status", () => {
-    context.ui
-      .showModalDialog(`data:text/html,${encodeURIComponent(statusHtml())}`, 420, 220)
-      .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
-  });
-  for (const scope of ["AudioTrack", "MidiTrack"] as const) {
-    void context.ui.registerContextMenuAction(
-      scope,
-      "Ableton Live MCP: Status",
-      "ableton-live-mcp.status",
-    );
-  }
 }

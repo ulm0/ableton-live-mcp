@@ -78,7 +78,32 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 - Ids stay valid until the object is deleted or moved, or another Live Set is loaded. Stale ids
   return an error telling the client to re-list.
 - All times/positions are in **beats**; colors are `#RRGGBB`; MIDI pitches are 0–127.
-- Multi-value writes (`parameter_set`) are grouped into a single undo step in Live.
+- Multi-value writes (`parameter_set`, `mixer_set`) are grouped into a single undo step in Live.
+- On `initialize` the server sends short **instructions** (a digest of the
+  [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
+  and what the API cannot do. Clients that support server instructions (Claude Code) add them
+  to the agent's prompt.
+- Every tool has a **title and MCP annotations**, so clients can auto-approve reads and single
+  out destructive calls:
+  - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `render_track_audio`
+    (it only writes a temp file);
+  - setters (`*_set`): non-destructive, idempotent;
+  - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`): non-destructive;
+  - destructive (`destructiveHint`): the deletes, `track_clear_clips_in_range`,
+    `midi_clip_set_notes`, `midi_clip_edit_notes`, `simpler_replace_sample`;
+  - `show_dialog` (non-destructive) and `execute_command` (destructive) are open-world.
+
+## Security
+
+The endpoint binds to `127.0.0.1` only and has no authentication. To stop web pages from
+reaching it through DNS rebinding, every request is checked before routing: the `Host` header
+must be `127.0.0.1`, `localhost` or `[::1]` (any port), and an `Origin` header, if sent, must
+be an `http(s)` origin on one of those hosts (`Origin: null` is refused). Anything else gets
+`403` with a JSON-RPC error. MCP clients such as Claude Code and `mcp-remote` send a loopback
+`Host` and no `Origin`, so they are unaffected.
+
+The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`,
+`Allow: POST`), plus `GET /health`.
 
 ## Tools
 
@@ -109,7 +134,7 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 ### Clips
 | Tool | Description |
 |------|-------------|
-| `clip_create` | Create MIDI or audio clips in a session slot (by id or track + `scene_index`), arrangement track, or take lane. MIDI clips take inline `notes`; `name`/`color` apply at creation. Audio files are imported into the project automatically. |
+| `clip_create` | Create MIDI or audio clips in a session slot (by id or track + `scene_index`), arrangement track, or take lane. MIDI clips take inline `notes` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count). |
 | `clip_set` | Name, color, mute, looping, warping, warp mode. |
 | `clip_delete` | Delete a session or arrangement clip. |
@@ -140,19 +165,20 @@ run; the path is reported by `song_get` under `environment.storage_directory`). 
 | Tool | Description |
 |------|-------------|
 | `import_file` | Copy a file into the Live project. |
-| `render_track_audio` | Render pre-FX audio of an audio track to a WAV. |
+| `render_track_audio` | Render the pre-FX audio of an audio track (clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — import it to keep it. Not normalized since Live 12.4.15. |
 
 ### UI & commands
 | Tool | Description |
 |------|-------------|
-| `show_dialog` | Show a modal HTML dialog inside Live (ask the user, show reports). |
+| `show_dialog` | Show a modal HTML dialog inside Live (ask the user, show reports). Dialogs keep no state between calls. |
 | `execute_command` | Invoke Extension Host commands, e.g. `ableton-live-mcp.status`. |
 
 ## Skills
 
 `skills/ableton-live/SKILL.md` is an installable [agent skill](https://docs.claude.com/en/docs/claude-code/skills)
 that teaches an MCP client how to use these tools well (id discovery flow, beats vs. seconds,
-note-editing patterns, device workflows). Install it for Claude Code with:
+note-editing patterns, device workflows). The server sends a short digest of it as MCP
+instructions anyway; the full skill adds the detailed workflows. Install it for Claude Code with:
 
 ```bash
 mkdir -p ~/.claude/skills && cp -r skills/ableton-live ~/.claude/skills/
@@ -171,15 +197,21 @@ Typical things you can ask a connected assistant to do:
 - The extension (and thus the MCP endpoint) only runs while Live is open.
 - Only built-in Live devices can be inserted; third-party plug-ins can't be loaded by the SDK.
 - No transport control (play/stop/record) or clip launching — the Extensions API v1.0.0 does not
-  expose them. Same for browser access and parameter automation curves.
+  expose them. Same for browser access, parameter automation curves, track color, routing and
+  sidechain, reordering or grouping tracks, creating return tracks, metering, editing clip
+  markers or loops after creation, and the song time signature.
 - `show_dialog` blocks until the user closes the dialog in Live.
 
 ## Tests
 
 ```bash
-npm test                  # E2E against a mock Extension Host: MCP client ↔ HTTP ↔ all tools
+npm test                  # E2E against a mock Extension Host: MCP client ↔ HTTP ↔ all tools,
+                          # then the bundle loaded in a bare VM context (test/vm-context.mjs)
 node test/live-smoke.mjs  # against a real running Live with the extension loaded
 ```
+
+`test/vm-context.mjs` evaluates `dist/extension.cjs` the way the Extension Host does (no
+`global`, no web globals), so a broken `build.ts` banner fails CI instead of failing in Live.
 
 The live smoke test creates its own tracks/clips/devices, verifies every tool family
 (MIDI notes, warping, drum racks, rendering, ...), and deletes everything it created.
@@ -208,11 +240,15 @@ Also: if the dev Extension Host crashes, Live may refuse the next control-channe
 
 - **Endpoint not responding**: check `curl http://127.0.0.1:8722/health`. Right-click any
   track in Live — the "Ableton Live MCP: Status" context-menu action shows the endpoint the
-  extension actually bound.
+  extension actually bound, or why it failed to start, and the path of its `config.json`.
 - **Port already in use**: if another process holds the configured port, the server logs the
-  failure to `ExtensionHost.txt` and does not start. Change `port` in the extension's
-  `config.json` (path shown by `song_get` under `environment.storage_directory`) — the file
-  is read once at startup, so restart Live afterwards.
+  failure to `ExtensionHost.txt` and does not start; the Status dialog shows the error
+  (`EADDRINUSE`) and the `config.json` path. Change `port` there — the file is read once at
+  startup, so restart Live afterwards.
+- **403 Forbidden**: the request's `Host` or `Origin` is not a loopback address (see
+  [Security](#security)). Connect to `http://127.0.0.1:<port>/mcp` or `http://localhost:<port>/mcp`.
+- **Failed tool calls** are logged to `ExtensionHost.txt` with the tool name, duration and
+  error message (never the arguments).
 - **Changed config.json but nothing happened**: config is only read when the extension
   starts. Restart Live (or the dev Extension Host).
 

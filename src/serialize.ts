@@ -20,6 +20,7 @@ import {
   WarpMode,
   type ApiVersion,
 } from "@ableton-extensions/sdk";
+import { UsageError } from "./errors.js";
 import { remember } from "./store.js";
 
 type V = ApiVersion;
@@ -43,7 +44,7 @@ export function colorToHex(color: number | bigint): string {
 
 export function hexToColor(hex: string): number {
   const m = /^#?([0-9a-fA-F]{6})$/.exec(hex);
-  if (!m) throw new Error(`Invalid color "${hex}", expected "#RRGGBB".`);
+  if (!m) throw new UsageError(`Invalid color "${hex}", expected "#RRGGBB".`);
   return parseInt(m[1], 16);
 }
 

@@ -2,6 +2,7 @@
 // drive the MCP server over HTTP with the real MCP client.
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -16,6 +17,15 @@ fs.writeFileSync(path.join(storageDir, "config.json"), JSON.stringify({ port: PO
 
 const { makeActivation, calls } = require("./mock-host.cjs");
 const { activate } = require("../dist/extension.cjs");
+
+// Capture the extension's error log (still printed) to check what it records.
+const errorLog = [];
+const consoleError = console.error;
+console.error = (...a) => {
+  errorLog.push(a.map(String).join(" "));
+  consoleError(...a);
+};
+
 activate(makeActivation(storageDir, storageDir));
 
 // wait for the server
@@ -42,6 +52,44 @@ const call = async (name, args = {}) => {
 // tools/list
 const { tools } = await client.listTools();
 assert.equal(tools.length, 40, `expected exactly 40 tools, got ${tools.length}`);
+
+// every tool has a title and explicit hints — the spec defaults
+// (destructiveHint/openWorldHint true) must never apply by omission
+for (const t of tools) {
+  assert.ok(t.title, `${t.name}: missing title`);
+  const a = t.annotations ?? {};
+  assert.equal(typeof a.readOnlyHint, "boolean", `${t.name}: readOnlyHint not set`);
+  assert.equal(typeof a.openWorldHint, "boolean", `${t.name}: openWorldHint not set`);
+  if (!a.readOnlyHint) assert.equal(typeof a.destructiveHint, "boolean", `${t.name}: destructiveHint not set`);
+}
+// annotation snapshot of the tool groups
+const toolByName = Object.fromEntries(tools.map((t) => [t.name, t]));
+const write = (destructive, idempotent) => ({
+  readOnlyHint: false, destructiveHint: destructive, idempotentHint: idempotent, openWorldHint: false,
+});
+const annotationGroups = [
+  [{ readOnlyHint: true, openWorldHint: false }, ["song_get", "track_get", "clip_get",
+    "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get", "render_track_audio"]],
+  [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
+    "clip_set", "drum_chain_set", "parameter_set", "mixer_set"]],
+  [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
+    "scene_duplicate", "cue_point_create", "clip_create", "device_insert", "device_duplicate",
+    "rack_insert_chain", "import_file"]],
+  [write(true, true), ["track_delete", "scene_delete", "clip_delete", "cue_point_delete",
+    "device_delete", "track_clear_clips_in_range", "simpler_replace_sample"]],
+  [write(true, false), ["midi_clip_set_notes", "midi_clip_edit_notes"]],
+  [{ ...write(false, false), openWorldHint: true }, ["show_dialog"]],
+  [{ ...write(true, false), openWorldHint: true }, ["execute_command"]],
+];
+for (const [expected, names] of annotationGroups)
+  for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
+assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 40, "snapshot lists the 40 original tools once");
+
+// server instructions: a short digest, sent on initialize
+const instructions = client.getInstructions();
+assert.match(instructions, /song_get/);
+assert.match(instructions, /beats/);
+assert.ok(instructions.trim().split("\n").length <= 25, "instructions should stay a short digest");
 
 // song_get with NO arguments key at all (spec-legal; regression for empty-shape validation)
 const noArgs = await client.callTool({ name: "song_get" });
@@ -84,6 +132,11 @@ assert.equal(byName.name, "Drums");
 const badName = await client.callTool({ name: "track_get", arguments: { track_name: "nope" } });
 assert.equal(badName.isError, true);
 assert.match(badName.content[0].text, /No track named/);
+// the server's own argument errors carry no stale-id hint
+const badIndex = await client.callTool({ name: "track_get", arguments: { track_index: 99 } });
+assert.equal(badIndex.isError, true);
+assert.match(badIndex.content[0].text, /out of range/);
+assert.doesNotMatch(badIndex.content[0].text, /stale/);
 const clipId = track.clip_slots[0].clip.id;
 const emptySlotId = track.clip_slots[1].id;
 const deviceId = track.devices[0].id;
@@ -141,6 +194,19 @@ assert.equal(newClip.duration, 8);
 assert.equal(newClip.name, "Lead");
 assert.equal(newClip.color, "#00ff88");
 assert.equal(newClip.note_count, 2);
+// midi clips reject audio-only arguments before creating anything
+const slotsOf = async (id) => (await call("track_get", { track_id: id, include: ["clip_slots"] })).clip_slots;
+const slotClipBefore = (await slotsOf(midiTrackId))[1].clip;
+for (const extra of [{ file_path: "/tmp/kick.wav" }, { is_warped: true },
+  { loop_settings: { looping: false, start_marker: 0, end_marker: 4, loop_start: 0, loop_end: 4 } }]) {
+  const r = await client.callTool({
+    name: "clip_create", arguments: { type: "midi", target_id: emptySlotId, duration: 8, ...extra },
+  });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /audio clips only/);
+  assert.doesNotMatch(r.content[0].text, /stale/);
+}
+assert.deepEqual((await slotsOf(midiTrackId))[1].clip, slotClipBefore);
 assert.equal((await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8 })).class, "MidiClip");
 
 // clip_set roundtrip
@@ -162,9 +228,14 @@ assert.equal(filtered.parameters[0].name, "Filter Freq");
 assert.equal(typeof filtered.parameters[0].value, "number");
 const paramId = device.parameters[1].id;
 
-// parameter set/get roundtrip
-const setRes = await call("parameter_set", { values: [{ parameter_id: paramId, value: 90 }] });
+// parameter set/get roundtrip; several values form exactly one undo step
+const tx0 = calls.transactions.outer;
+const setRes = await call("parameter_set", {
+  values: [{ parameter_id: paramId, value: 90 }, { parameter_id: device.parameters[0].id, value: 0.25 }],
+});
 assert.equal(setRes[0].value, 90);
+assert.equal(setRes[1].value, 0.25);
+assert.equal(calls.transactions.outer - tx0, 1, "parameter_set must be one undo step");
 const got = await call("parameter_get", { parameter_ids: [paramId] });
 assert.equal(got[0].value, 90);
 
@@ -179,8 +250,10 @@ assert.equal(mixer.volume.name, "Volume");
 assert.equal(mixer.sends.length, 1);
 assert.equal(mixer.sends[0].return_track, "A-Reverb");
 
-// mixer_set: volume + pan + send in one call
+// mixer_set: volume + pan + send in one call, one undo step
+const tx1 = calls.transactions.outer;
 const mixed = await call("mixer_set", { target_id: audioTrackId, volume: 0.7, panning: -0.25, sends: [{ index: 0, value: 0.3 }] });
+assert.equal(calls.transactions.outer - tx1, 1, "mixer_set must be one undo step");
 assert.equal(mixed.volume.value, 0.7);
 assert.equal(mixed.panning.value, -0.25);
 assert.equal(mixed.sends[0].value, 0.3);
@@ -234,6 +307,27 @@ await call("track_delete", { track_id: newTrack.id });
 // take lanes
 const lane = await call("take_lane_create", { track_id: midiTrackId });
 await call("take_lane_set", { take_lane_id: lane.id, name: "Take A" });
+// clip on a take lane: lands in the lane (not the track's arrangement clips)
+const laneClip = await call("clip_create", {
+  type: "midi", target_id: lane.id, start_time: 8, duration: 4, name: "Take clip",
+  notes: [{ pitch: 60, start_time: 0, duration: 1 }],
+});
+assert.equal(laneClip.start_time, 8);
+assert.equal(laneClip.note_count, 1);
+const laneSections = { track_id: midiTrackId, include: ["take_lanes", "arrangement_clips"] };
+let laneTrack = await call("track_get", laneSections);
+const laneView = laneTrack.take_lanes.find((l) => l.id === lane.id);
+assert.equal(laneView.name, "Take A");
+assert.deepEqual(laneView.clips.map((c) => c.id), [laneClip.id]);
+assert.ok(!laneTrack.arrangement_clips.some((c) => c.id === laneClip.id));
+const laneNoStart = await client.callTool({
+  name: "clip_create", arguments: { type: "midi", target_id: lane.id, duration: 4 },
+});
+assert.equal(laneNoStart.isError, true);
+assert.match(laneNoStart.content[0].text, /start_time is required/);
+await call("clip_delete", { clip_id: laneClip.id });
+laneTrack = await call("track_get", laneSections);
+assert.equal(laneTrack.take_lanes.find((l) => l.id === lane.id).clips.length, 0);
 
 // arrangement clips: midi on track, audio on audio track (auto-import)
 const arrClip = await call("clip_create", { type: "midi", target_id: midiTrackId, start_time: 16, duration: 4 });
@@ -255,9 +349,14 @@ assert.ok(render.audio_path.endsWith(".wav"));
 const imp = await call("import_file", { file_path: "/tmp/loop.wav" });
 assert.ok(imp.imported_path.includes("loop.wav"));
 
-// ui + commands
+// ui + commands; the status command and its menu entries are registered
 await call("execute_command", { command_id: "ableton-live-mcp.status" });
 assert.equal(calls.dialogs.length, 1);
+const statusPage = decodeURIComponent(calls.dialogs[0].url);
+assert.match(statusPage, new RegExp(`http://127\\.0\\.0\\.1:${PORT}/mcp`));
+assert.ok(statusPage.includes(path.join(storageDir, "config.json")), "status shows the config path");
+assert.deepEqual(calls.menus.map((m) => m.scope).sort(), ["AudioTrack", "MidiTrack"]);
+assert.ok(calls.menus.every((m) => m.commandId === "ableton-live-mcp.status"));
 const dlg = await call("show_dialog", { html: "<b>hi</b>" });
 assert.equal(dlg.result, "mock-dialog-result");
 
@@ -274,6 +373,10 @@ const badColor = await client.callTool({
 assert.equal(badColor.isError, true);
 assert.match(badColor.content[0].text, /Invalid color/);
 assert.equal((await call("clip_get", { clip_id: clipId })).name, "Bassline");
+// failed calls are logged with tool name and duration, never with arguments
+const failLog = errorLog.filter((l) => l.includes("clip_set failed after"));
+assert.ok(failLog.some((l) => /clip_set failed after \d+ ms: Invalid color/.test(l)), "failure logged");
+assert.ok(!errorLog.some((l) => l.includes("SHOULD NOT APPLY")), "arguments must not be logged");
 
 // error path: warp args on a MIDI clip rejected before any mutation
 const badWarp = await client.callTool({
@@ -291,6 +394,101 @@ const rawRes = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
 });
 assert.equal(rawRes.status, 400);
 assert.equal((await rawRes.json()).error.code, -32700);
+// ...and the transport error reaches the server's onerror log
+assert.ok(errorLog.some((l) => l.includes("MCP error: Parse error")), "transport errors are logged");
+
+// http layer: raw requests with full control over Host/Origin/method
+const raw = (method, urlPath, headers = {}, body) =>
+  new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: "127.0.0.1", port: PORT, method, path: urlPath, agent: false,
+        headers: { connection: "close", ...headers } },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+      },
+    );
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+const rpc = (headers = {}, urlPath = "/mcp") =>
+  raw("POST", urlPath, {
+    "content-type": "application/json", accept: "application/json, text/event-stream", ...headers,
+  }, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+const assertForbidden = (r, what) => {
+  assert.equal(r.status, 403, `${what}: expected 403, got ${r.status}`);
+  const b = JSON.parse(r.body);
+  assert.equal(b.jsonrpc, "2.0");
+  assert.equal(b.id, null);
+  assert.equal(b.error.code, -32000);
+};
+// DNS rebinding: foreign Host, foreign or opaque Origin are refused before routing
+const tempo = (await call("song_get", { include: [] })).tempo;
+const rebound = await raw("POST", "/mcp", {
+  host: `evil.example:${PORT}`, origin: "http://evil.example", "content-type": "application/json",
+  accept: "application/json, text/event-stream",
+}, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
+  params: { name: "song_set", arguments: { tempo: 133 } } }));
+assertForbidden(rebound, "rebinding song_set");
+assert.equal((await call("song_get", { include: [] })).tempo, tempo, "rebound request must not run");
+assertForbidden(await rpc({ host: `evil.example:${PORT}` }), "foreign Host");
+assertForbidden(await rpc({ host: "127.0.0.1.evil.example" }), "loopback-prefixed Host");
+assertForbidden(await rpc({ host: `127.0.0.1:${PORT}@evil.example` }), "userinfo Host");
+assertForbidden(await raw("GET", "/health", { host: "evil.example" }), "foreign Host on /health");
+assertForbidden(await rpc({ origin: "http://evil.example" }), "foreign Origin");
+assertForbidden(await rpc({ origin: "null" }), "Origin: null");
+assertForbidden(await rpc({ origin: `ws://localhost:${PORT}` }), "non-http loopback Origin");
+assertForbidden(await rpc({ origin: "http://localhost.evil.example" }), "localhost-prefixed Origin");
+// loopback Host on any port, and loopback http(s) Origins, are fine
+for (const headers of [
+  { host: "localhost" }, { host: "localhost:1234" }, { host: `[::1]:${PORT}` },
+  { origin: "http://localhost:3000" }, { origin: "https://127.0.0.1" }, { origin: "http://[::1]:8080" },
+]) {
+  const r = await rpc(headers);
+  assert.equal(r.status, 200, `${JSON.stringify(headers)}: expected 200, got ${r.status} ${r.body}`);
+  assert.equal(JSON.parse(r.body).result.tools.length, tools.length);
+}
+// exact routing; the query string is ignored
+assert.equal((await raw("GET", "/health?x=1")).status, 200);
+assert.equal(JSON.parse((await raw("GET", "/health")).body).ok, true);
+assert.equal((await rpc({}, "/mcp?x=1")).status, 200);
+assert.equal((await rpc({}, "/mcpfoo")).status, 404);
+assert.equal((await raw("GET", "/healthz")).status, 404);
+// stateless server: no GET stream, no DELETE session
+for (const method of ["GET", "DELETE"]) {
+  const r = await raw(method, "/mcp", { accept: "text/event-stream" });
+  assert.equal(r.status, 405, `${method} /mcp`);
+  assert.equal(r.headers.allow, "POST");
+  assert.equal(JSON.parse(r.body).error.code, -32000);
+}
+// declared body over the limit is refused without reading it
+const huge = await raw("POST", "/mcp", {
+  "content-type": "application/json", accept: "application/json, text/event-stream",
+  "content-length": "16000001",
+});
+assert.equal(huge.status, 413);
+
+// a second instance on the same port fails to listen; its Status dialog says why
+const storageDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-test-"));
+fs.writeFileSync(path.join(storageDir2, "config.json"), JSON.stringify({ port: PORT }));
+const second = { dialogs: [], commands: {}, menus: [] };
+activate(makeActivation(storageDir2, storageDir2, second));
+assert.ok(second.commands["ableton-live-mcp.status"], "status command registered before listen");
+assert.equal(second.menus.length, 2, "context-menu entries registered before listen");
+let failedPage = "";
+for (let i = 0; i < 50 && !failedPage.includes("EADDRINUSE"); i++) {
+  await new Promise((r) => setTimeout(r, 20));
+  second.dialogs.length = 0;
+  second.commands["ableton-live-mcp.status"]();
+  failedPage = decodeURIComponent(second.dialogs[0].url);
+}
+assert.match(failedPage, /EADDRINUSE/);
+assert.match(failedPage, new RegExp(`Port ${PORT} is already in use`));
+assert.ok(failedPage.includes(path.join(storageDir2, "config.json")), "failed status shows the config path");
+fs.rmSync(storageDir2, { recursive: true, force: true });
 
 await client.close();
 fs.rmSync(storageDir, { recursive: true, force: true });
