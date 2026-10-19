@@ -130,6 +130,24 @@ deleting a file deletes the preset.
   `device_preset_load` / `device_preset_list` keep the same kind of snapshot as named JSON files
   in the extension's storage directory (`presets/`) — not Live `.adv` presets. Racks are refused
   by both.
+- **Whole-set reads**: `song_get` lists every track with its `index`, `depth` in the group
+  hierarchy and, for group tracks, type `group` and `child_track_ids`; `include: ["devices",
+  "mixer", "clips"]` adds each track's device tree (through racks, with each device's on-state),
+  mixer values (sends labeled with return names) and clips (session and arrangement, in brief),
+  capped at 500 devices / 500 clips (`truncated` says where it stopped). `scene_get` returns one
+  session row across all tracks, `session_grid` a compact track × scene matrix, and
+  `arrangement_get {start_time, end_time, tracks?, include_take_lanes?}` the cue points and every
+  track's clips in a beat range, plus a derived `song_end` (the API has no song length).
+  `song_audit` lists missing media files, Simplers without a sample, empty drum pads and track
+  names that make `track_name` ambiguous. `clip_get`, `device_get` and `chain_get` report a
+  `location` (track, scene index or take lane, path through racks).
+- **The user's selection**: Live's API has no selection getter; it hands the selection to an
+  extension only through context-menu commands. So the extension adds **"MCP: Use as selection"**
+  to every context menu it can (clips, clip slots, tracks, scenes, Drum Racks, Simplers, samples,
+  clip-slot selections and arrangement time selections). The user right-clicks and picks it;
+  `selection_get` returns the last capture (ids, summaries, locations; for a time selection the
+  start/end beats and the selected lanes with their overlapping clips), `selection_wait` waits up
+  to 55 s for the next one. Captures are kept until the next one (or a restart of Live).
 - On `initialize` the server sends short **instructions** (a digest of the
   [skill](#skills), kept in `src/instructions.md`): ids, beats, pitch and volume conventions,
   and what the API cannot do. Clients that support server instructions (Claude Code) add them
@@ -137,7 +155,8 @@ deleting a file deletes the preset.
 - Every tool has a **title and MCP annotations**, so clients can auto-approve reads and single
   out destructive calls:
   - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `parameter_find`,
-    `device_preset_list`, `render_track_audio` (it only writes a temp file);
+    `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `render_track_audio`
+    (it only writes a temp file);
   - setters (`*_set`): non-destructive, idempotent;
   - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`): non-destructive;
   - destructive (`destructiveHint`): the deletes, `track_clear_clips_in_range`,
@@ -163,13 +182,14 @@ The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`
 ### Song
 | Tool | Description |
 |------|-------------|
-| `song_get` | Live Set state: tempo, scale, grid, tracks, return/main tracks, scenes, cue points, environment info. The entry point — returns the object ids used everywhere else. `include` fetches only selected sections. |
+| `song_get` | Live Set state: tempo, scale, grid, tracks (with `index`, group hierarchy: `depth`, `child_track_ids`, type `group`), return/main tracks, scenes, cue points, environment info (incl. `server_version`). The entry point — returns the object ids used everywhere else. `include` fetches only selected sections; the opt-in `devices`, `mixer` and `clips` add every track's device tree (with on-states), mixer values and clips in one call (capped, see `truncated`). |
 | `song_set` | Set song properties (tempo). |
+| `song_audit` | Read-only check for missing media files (audio clips, Simpler samples), Simplers without a sample, empty drum pads and duplicate track names, each entry with ids and location. |
 
 ### Tracks
 | Tool | Description |
 |------|-------------|
-| `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. |
+| `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. Group tracks have type `group`. |
 | `track_set` | Name / mute / solo / arm, by id, index or name; `items` changes many tracks in one undo step. |
 | `track_create` | New audio or MIDI track, optionally with a `name` and `devices` (names, or `{name, parameters}` with initial values). Returns the track's `index` (Live inserts it after the selected track); a failing device is reported in `errors` instead of failing the call. |
 | `track_delete` | Delete track (by id, index, or exact name). |
@@ -180,9 +200,12 @@ The server is stateless: only `POST /mcp` is served (`GET`/`DELETE` answer `405`
 
 Every tool above except `take_lane_set` takes the track as `track_id`, `track_index` or `track_name`.
 
-### Scenes & cue points
+### Scenes, session & arrangement
 | Tool | Description |
 |------|-------------|
+| `scene_get` | One session row: a scene (by id, index or name) with every regular track's clip slot and clip in it (`only_clips` drops the empty ones). |
+| `session_grid` | The Session View as a compact track × scene matrix (`null` or a brief clip per cell); narrow with `tracks` and `scene_index_min`/`scene_index_max`. |
+| `arrangement_get` | A beat range of the arrangement (`start_time`/`end_time`, default the whole song): cue points in it and each track's overlapping clips (`tracks` to pick, `include_take_lanes` for take lanes), plus a derived `song_end`. |
 | `scene_create` / `scene_set` / `scene_delete` / `scene_duplicate` | Manage scenes, addressed by `scene_id`, `scene_index` or `scene_name` (exact for delete). `scene_create` takes a `name`, or `items` to create several in order; `scene_set` renames many with `items` in one undo step. |
 | `cue_point_create` / `cue_point_set` / `cue_point_delete` | Manage arrangement locators. Create with a `name`, or several with `items`. `cue_point_set` renames (`items` for many) and moves: with `time` it re-creates the locator at the new position with its name, deletes the old one and returns the new id plus `replaced_id`. |
 
@@ -190,7 +213,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | Tool | Description |
 |------|-------------|
 | `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes`, step `patterns` and `repeat` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
-| `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count). |
+| `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count) and its `location`: session (track, scene, slot), arrangement (track) or take lane. |
 | `clip_set` | Name, color, mute, looping, warping, warp mode — for one clip, several (`items`), or every clip of a track (`select: {track_name, scope, name_contains}`), in one undo step. |
 | `clip_delete` | Delete a session or arrangement clip. |
 | `midi_clip_get_notes` | Read MIDI notes: all, or those matching `select` (pitch/time range, `in_scale`, `every_nth`, `only_selected`); `format: "compact"` returns tuples. Notes carry `selected` when Live reports it. |
@@ -200,13 +223,13 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 ### Devices & racks
 | Tool | Description |
 |------|-------------|
-| `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample. |
+| `device_get` | Device detail: parameters with ranges/value items (`parameter_filter` substring, `include_values`, `include_value_items`), rack chains (`include_chain_devices` inlines pad devices), Simpler sample, and its `location` (track, path through racks, position). |
 | `device_insert` | Insert a built-in Live device into a track (by id, index or name) or rack chain, optionally with initial `parameters` (one more undo step). |
 | `device_set` | Switch a device on/off (`enabled`: its "Device On" parameter, or a two-state first parameter as a reported fallback) and set several of its parameters by name, `value_item`, `reset` or `delta` — one undo step. The device is `device_id` or track + `device` (name, index or rack path). |
 | `device_delete` / `device_duplicate` | Remove or copy devices (the duplicate lands right after the original). |
 | `device_copy` | Copy a device to another track or chain, or with `move: true` move/reorder it: inserts the built-in device by name and copies parameter values by name (Simpler: and its sample). Lossy — automation, mappings and non-parameter state are lost, ids change; racks are refused. |
 | `device_preset_save` / `device_preset_load` / `device_preset_list` | Named parameter snapshots (plus a Simpler's sample path) stored as JSON under the extension's storage directory. Load onto an existing device or insert a new one. Not Live presets. |
-| `chain_get` | Rack chain detail: devices + chain mixer; drum chains report `receiving_note` and `receiving_note_name`. |
+| `chain_get` | Rack chain detail: devices + chain mixer and `location`; drum chains report `receiving_note` and `receiving_note_name`. |
 | `rack_insert_chain` | Add a chain to a rack. |
 | `drum_chain_set` | Set the MIDI note of a drum rack pad (a number or a name like `"D1"`). |
 | `simpler_replace_sample` | Swap the sample in a Simpler. |
@@ -225,6 +248,12 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 |------|-------------|
 | `import_file` | Copy a file into the Live project. |
 | `render_track_audio` | Render the pre-FX audio of an audio track (by id, index or name; clip audio before the device chain) to a WAV in the extension's temp directory, which may be cleaned — import it to keep it. Not normalized since Live 12.4.15. |
+
+### Selection
+| Tool | Description |
+|------|-------------|
+| `selection_get` | The selection the user last handed over with the context-menu entry "MCP: Use as selection": ids, summaries and locations of the clicked object or selected clip slots, or an arrangement time selection (start/end beats, selected lanes with their overlapping clips). |
+| `selection_wait` | Wait (up to `timeout_s` ≤ 55 s) for the user's next "MCP: Use as selection", then return it like `selection_get`. |
 
 ### UI & commands
 | Tool | Description |
@@ -252,6 +281,8 @@ Typical things you can ask a connected assistant to do:
 - "Replace the sample in Simpler with /path/to/kick.wav and map it to C1"
 - "Bypass the compressor on the vocals and switch the bass filter to high-pass"
 - "Move the reverb before the EQ" (a lossy copy-and-delete: see `device_copy`)
+- "What happens in bars 17 to 33?" / "Check the set for missing samples"
+- "Quantize the clip I selected" (after right-clicking it → "MCP: Use as selection")
 
 ## Limitations
 
@@ -263,6 +294,8 @@ Typical things you can ask a connected assistant to do:
   expose them. Same for browser access, parameter automation curves, track color, routing and
   sidechain, reordering or grouping tracks, creating return tracks, metering, editing clip
   markers or loops after creation, and the song time signature.
+- The user's selection can't be read directly: it is only available once the user hands it over
+  with the "MCP: Use as selection" context-menu entry.
 - `show_dialog` blocks until the user closes the dialog in Live.
 
 ## Tests
@@ -304,6 +337,9 @@ Also: if the dev Extension Host crashes, Live may refuse the next control-channe
 - **Endpoint not responding**: check `curl http://127.0.0.1:8722/health`. Right-click any
   track in Live — the "Ableton Live MCP: Status" context-menu action shows the endpoint the
   extension actually bound, or why it failed to start, and the path of its `config.json`.
+- **`selection_get` returns an error per item**: the object was deleted or moved after the user
+  chose "MCP: Use as selection", or Live passed something the extension could not resolve —
+  ask the user to select again.
 - **Port already in use**: if another process holds the configured port, the server logs the
   failure to `ExtensionHost.txt` and does not start; the Status dialog shows the error
   (`EADDRINUSE`) and the `config.json` path. Change `port` there — the file is read once at

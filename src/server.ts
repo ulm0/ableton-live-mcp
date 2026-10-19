@@ -26,6 +26,7 @@ import {
   MidiClip,
   MidiTrack,
   RackDevice,
+  Sample,
   Scene,
   Simpler,
   TakeLane,
@@ -37,11 +38,13 @@ import {
 } from "@ableton-extensions/sdk";
 import { UsageError } from "./errors.js";
 import INSTRUCTIONS from "./instructions.md";
+import { SelectionStore, registerSelectionMenus, type Selection } from "./selection.js";
 import { remember, resolve } from "./store.js";
 import {
   chainSummary,
   classOf,
   num,
+  clipBrief,
   clipSlotSummary,
   clipSummary,
   colorToHex,
@@ -774,7 +777,12 @@ function presetStore(storageDirectory: string | undefined) {
 // ---------------------------------------------------------------------------
 // tool registration
 
-function buildServer(context: Ctx, hostApiVersion: string, port: number): McpServer {
+function buildServer(
+  context: Ctx,
+  hostApiVersion: string,
+  port: number,
+  selections: SelectionStore,
+): McpServer {
   const server = new McpServer(SERVER_INFO, { instructions: INSTRUCTIONS });
   const song = () => context.application.song;
   // Transport-level failures (unparsable bodies, bad headers) are answered to
@@ -811,23 +819,68 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
 
   // -- song ------------------------------------------------------------------
 
+  // song_get sections: the default ones, and the deep ones that are only
+  // included when asked for. The deep ones add to every track entry.
+  const SONG_SECTIONS = ["tracks", "scenes", "cue_points", "environment"] as const;
+  const DEEP_SECTIONS = ["devices", "mixer", "clips"] as const;
+  // Deep sections stop at this many devices / clips (payload size).
+  const MAX_SONG_DEVICES = 500;
+  const MAX_SONG_CLIPS = 500;
+  // Racks inside racks are followed this deep (song_get, song_audit).
+  const MAX_RACK_DEPTH = 8;
+
   tool(
     "song_get",
     { title: "Get Live Set", annotations: READ },
     "Get the state of the current Live Set: tempo, scale, grid, all tracks " +
-      "(with ids), return tracks, main track, scenes, cue points, and extension " +
-      "environment info. This is the entry point — object ids returned here are " +
-      "used by every other tool. Times are in beats throughout the API. Use " +
-      "`include` to fetch only some sections (tempo/grid/scale always included).",
+      "(with ids, `index`, and the group hierarchy: `depth`, `group_track_id`, type " +
+      "'group' with `child_track_ids` for group tracks), return tracks (with " +
+      "`send_index`), main track, scenes, cue points, and extension environment " +
+      "info. This is the entry point — object ids returned here are used by every " +
+      "other tool. Times are in beats throughout the API. Use `include` to fetch " +
+      "only some sections (tempo/grid/scale always included). Deep sections, only " +
+      "included when listed, add to every track entry (and imply the tracks): " +
+      "`devices` (each track's device tree through racks: chains with their devices; " +
+      "every device with its on-state `enabled`), `mixer` (volume, panning and sends " +
+      "with values and return track names; mixer_get has the parameter ids), " +
+      "`clips` (regular tracks: session clips with their scene_index and arrangement " +
+      "clips with their position, in brief — clip_get has the detail). Deep sections " +
+      `stop at ${MAX_SONG_DEVICES} devices and ${MAX_SONG_CLIPS} clips: from the track ` +
+      "that does not fit on, tracks lack that section and `truncated` says so " +
+      "(use track_get / device_get for them).",
     {
       include: z
-        .array(z.enum(["tracks", "scenes", "cue_points", "environment"]))
+        .array(z.enum([...SONG_SECTIONS, ...DEEP_SECTIONS]))
         .optional()
-        .describe("Sections to include; omit for everything"),
+        .describe(
+          "Sections to include; omit for tracks, scenes, cue_points and environment. " +
+            "devices, mixer and clips are only included when listed",
+        ),
     },
-    ({ include }) => {
+    async ({ include }) => {
       const s = song();
-      const want = (k: string) => !include || include.includes(k as never);
+      const want = (k: string) =>
+        include ? include.includes(k as never) : (SONG_SECTIONS as readonly string[]).includes(k);
+      const deep = DEEP_SECTIONS.filter(want);
+      const withTracks = want("tracks") || deep.length > 0;
+      let tracks: Record<string, unknown>[] | undefined;
+      let returnTracks: Record<string, unknown>[] | undefined;
+      let mainTrack: Record<string, unknown> | undefined;
+      let truncated: Record<string, string> | undefined;
+      if (withTracks) {
+        const regular = s.tracks;
+        const returns = s.returnTracks;
+        tracks = groupHierarchy(regular.map((t, index) => ({ ...summarizeTrack(t, regular), index })));
+        returnTracks = returns.map((t, i) => ({ ...trackSummary(t, "return"), send_index: i }));
+        mainTrack = trackSummary(s.mainTrack, "main");
+        if (deep.length)
+          truncated = await addDeepSections(
+            [...regular, ...returns, s.mainTrack],
+            [...tracks, ...returnTracks, mainTrack],
+            regular.length,
+            deep,
+          );
+      }
       return {
         tempo: num(s.tempo),
         grid: { quantization: gridName(s.gridQuantization), is_triplet: s.gridIsTriplet },
@@ -837,9 +890,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
           mode_enabled: s.scaleMode,
           intervals: s.scaleIntervals.map(num),
         },
-        tracks: want("tracks") ? s.tracks.map((t) => trackSummary(t)) : undefined,
-        return_tracks: want("tracks") ? s.returnTracks.map((t) => trackSummary(t, "return")) : undefined,
-        main_track: want("tracks") ? trackSummary(s.mainTrack, "main") : undefined,
+        tracks,
+        return_tracks: returnTracks,
+        main_track: mainTrack,
         scenes: want("scenes") ? s.scenes.map(sceneSummary) : undefined,
         cue_points: want("cue_points") ? s.cuePoints.map(cuePointSummary) : undefined,
         environment: want("environment")
@@ -848,12 +901,141 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
               temp_directory: context.environment.tempDirectory,
               language: context.environment.language,
               host_api_version: hostApiVersion,
+              server_version: SERVER_INFO.version,
               mcp_port: port,
             }
           : undefined,
+        truncated,
       };
     },
   );
+
+  // The group hierarchy of song_get's track entries, from their group_track_id:
+  // `depth` (0 = top level) on every track, `child_track_ids` (direct children,
+  // in track order) on group tracks.
+  function groupHierarchy<T extends { id: string; type: string; group_track_id: string | null }>(rows: T[]) {
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const children = new Map<string, string[]>();
+    for (const r of rows)
+      if (r.group_track_id !== null) children.set(r.group_track_id, [...(children.get(r.group_track_id) ?? []), r.id]);
+    return rows.map((r) => {
+      let depth = 0;
+      for (let g = r.group_track_id; g !== null && depth < 64; g = byId.get(g)?.group_track_id ?? null) depth++;
+      return { ...r, depth, child_track_ids: r.type === "group" ? (children.get(r.id) ?? []) : undefined };
+    });
+  }
+
+  // song_get's deep sections, added to the track entries (rows[i] belongs to
+  // tracks[i]; the first `regularCount` are the regular tracks). All parameter
+  // values (on-states, mixers) are read in one batch. Returns what was cut.
+  async function addDeepSections(
+    tracks: Track<"1.0.0">[],
+    rows: Record<string, unknown>[],
+    regularCount: number,
+    deep: ReadonlyArray<(typeof DEEP_SECTIONS)[number]>,
+  ): Promise<Record<string, string> | undefined> {
+    const truncated: Record<string, string> = {};
+    const cut = (what: string, limit: number, track: Track<"1.0.0">, instead: string) =>
+      `Only ${limit} ${what} are listed: ${describeTrack(track)} and the tracks after it have no ` +
+      `\`${what}\`. Use ${instead} for them.`;
+    const states: OnState[] = [];
+    if (deep.includes("devices")) {
+      const budget = { left: MAX_SONG_DEVICES };
+      for (const [i, track] of tracks.entries()) {
+        const own: OnState[] = [];
+        const tree = deviceTree(track.devices, budget, own);
+        if (!tree) {
+          truncated.devices = cut("devices", MAX_SONG_DEVICES, track, "track_get or device_get {include_chain_devices}");
+          break;
+        }
+        rows[i].devices = tree;
+        states.push(...own);
+      }
+    }
+    const returnNames = song().returnTracks.map((t) => t.name);
+    const [onValues, mixers] = await Promise.all([
+      Promise.all(states.map((st) => st.param.getValue().then(num, () => undefined))),
+      deep.includes("mixer") ? Promise.all(tracks.map((t) => mixerSnapshot(t.mixer, returnNames))) : undefined,
+    ]);
+    states.forEach((st, i) => {
+      if (onValues[i] !== undefined) st.node.enabled = onValues[i] !== st.off;
+    });
+    mixers?.forEach((m, i) => (rows[i].mixer = m));
+    if (deep.includes("clips")) {
+      let left = MAX_SONG_CLIPS;
+      for (const [i, track] of tracks.slice(0, regularCount).entries()) {
+        const slots = track.clipSlots.map((slot) => ({ slot, clip: slot.clip }));
+        const arrangement = track.arrangementClips;
+        const count = slots.filter((x) => x.clip).length + arrangement.length;
+        if (count > left) {
+          truncated.clips = cut("clips", MAX_SONG_CLIPS, track, "track_get or session_grid / arrangement_get");
+          break;
+        }
+        left -= count;
+        rows[i].clips = {
+          session: slots.flatMap(({ slot, clip }, scene_index) =>
+            clip ? [{ scene_index, slot_id: remember(slot), ...clipBrief(clip) }] : [],
+          ),
+          arrangement: arrangement.map((c) => clipBrief(c, true)),
+        };
+      }
+    }
+    return Object.keys(truncated).length ? truncated : undefined;
+  }
+
+  // A device on/off switch whose value song_get reads in its batch.
+  type OnState = { node: Record<string, unknown>; param: DeviceParameter<"1.0.0">; off: number };
+
+  // song_get devices: a device list as a tree through racks, or null when the
+  // budget runs out. On-states to read are collected in `states`.
+  function deviceTree(
+    devices: Device<"1.0.0">[],
+    budget: { left: number },
+    states: OnState[],
+    depth = 0,
+  ): Record<string, unknown>[] | null {
+    const nodes: Record<string, unknown>[] = [];
+    for (const device of devices) {
+      if (budget.left <= 0) return null;
+      budget.left--;
+      const node = deviceSummary(device);
+      node.enabled = undefined; // filled in once the values are read (keeps the key order)
+      try {
+        const onOff = onOffParameter(device);
+        states.push({ node, param: onOff.param, off: onOff.off });
+        // not "Device On": say which parameter tells the on-state
+        if (onOff.fallback) node.on_parameter = onOff.param.name;
+      } catch {
+        // no on/off switch: no `enabled`
+      }
+      if (device instanceof RackDevice && depth < MAX_RACK_DEPTH) {
+        const chains: Record<string, unknown>[] = [];
+        for (const chain of device.chains) {
+          const inner = deviceTree(chain.devices, budget, states, depth + 1);
+          if (!inner) return null;
+          chains.push({ ...chainSummary(chain), devices: inner });
+        }
+        delete node.chain_ids; // `chains` carries them
+        node.chains = chains;
+      }
+      nodes.push(node);
+    }
+    return nodes;
+  }
+
+  // song_get mixer: values only (mixer_get has the parameter ids and ranges).
+  async function mixerSnapshot(mixer: TrackMixer<"1.0.0">, returnNames: string[]) {
+    const sends = mixer.sends;
+    const [volume, panning, ...sendValues] = await Promise.all(
+      [mixer.volume, mixer.panning, ...sends].map((p) => p.getValue()),
+    );
+    return {
+      id: remember(mixer),
+      volume: num(volume),
+      panning: num(panning),
+      sends: sendValues.map((v, index) => ({ index, return_track: returnNames[index], value: num(v) })),
+    };
+  }
 
   tool(
     "song_set",
@@ -863,6 +1045,175 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     ({ tempo }) => {
       if (tempo !== undefined) song().tempo = tempo;
       return { tempo: num(song().tempo) };
+    },
+  );
+
+  const AUDIT_CHECKS = ["missing_media", "empty_simplers", "empty_drum_chains", "duplicate_track_names"] as const;
+  type AuditCheck = (typeof AUDIT_CHECKS)[number];
+  const MAX_AUDIT_ENTRIES = 100; // listed per check; `counts` has them all
+  const MAX_AUDIT_DEVICES = 5000;
+  const MAX_AUDIT_CLIPS = 10_000;
+
+  // Why a media file a clip or sample refers to is unusable, or undefined if
+  // it is a readable file. The paths are assumed to be absolute paths on this
+  // computer (the SDK only calls them file paths).
+  function mediaProblem(file: string): string | undefined {
+    if (!file) return "no file path";
+    if (!path.isAbsolute(file)) return "not an absolute path, so it could not be checked";
+    try {
+      return fs.statSync(file).isFile() ? undefined : "not a file";
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ENOTDIR" ? "file not found" : `cannot be read (${code ?? errorMessage(e)})`;
+    }
+  }
+
+  tool(
+    "song_audit",
+    { title: "Audit Live Set", annotations: READ },
+    "Check the Live Set for common problems without changing anything: " +
+      "`missing_media` (audio clips — session, arrangement and take lanes — and " +
+      "Simpler samples whose file is not found on this computer, or that have no " +
+      "file path), `empty_simplers` (Simplers without a sample), `empty_drum_chains` " +
+      "(Drum Rack pads without devices) and `duplicate_track_names` (track names " +
+      "that are equal ignoring case, which makes track_name ambiguous). Searches " +
+      "regular, return and main tracks, through racks. Every entry has the ids to act " +
+      "on and a `location` (track, path through racks, or a clip's slot or lane); at " +
+      `most ${MAX_AUDIT_ENTRIES} entries are listed per check, \`counts\` has the totals. ` +
+      "`checks` runs only some of them.",
+    {
+      checks: z
+        .array(z.enum(AUDIT_CHECKS))
+        .min(1)
+        .optional()
+        .describe("Checks to run; omit for all four"),
+    },
+    ({ checks }) => {
+      const run = (c: AuditCheck) => !checks || checks.includes(c);
+      const ran = AUDIT_CHECKS.filter(run);
+      const s = song();
+      const regular = s.tracks;
+      const all = [...regular, ...s.returnTracks, s.mainTrack];
+      const counts = Object.fromEntries(ran.map((c) => [c, 0])) as Record<AuditCheck, number>;
+      const lists = Object.fromEntries(ran.map((c) => [c, [] as unknown[]])) as Record<AuditCheck, unknown[]>;
+      const add = (check: AuditCheck, entry: () => unknown) => {
+        counts[check]++;
+        if (lists[check].length < MAX_AUDIT_ENTRIES) lists[check].push(entry());
+      };
+      const refs = new Map<bigint, ReturnType<typeof trackRef>>();
+      const ref = (track: Track<"1.0.0">) => {
+        if (!refs.has(track.handle.id)) refs.set(track.handle.id, trackRef(track, regular));
+        return refs.get(track.handle.id)!;
+      };
+      const files = new Map<string, string | undefined>();
+      const fileProblem = (file: string) => {
+        if (!files.has(file)) files.set(file, mediaProblem(file));
+        return files.get(file);
+      };
+      const incomplete: string[] = [];
+      let devicesSearched = 0;
+      let devicesStopped = false;
+      let clipsSearched = 0;
+
+      // devices: Simplers and their samples, Drum Rack pads
+      if (run("missing_media") || run("empty_simplers") || run("empty_drum_chains")) {
+        const walk = (devices: Device<"1.0.0">[], track: Track<"1.0.0">, labels: string[], depth: number) => {
+          for (const device of devices) {
+            if (devicesSearched >= MAX_AUDIT_DEVICES) {
+              devicesStopped = true;
+              return;
+            }
+            devicesSearched++;
+            const here = [...labels, device.name];
+            const location = () => ({ ...ref(track), path: here.join(" > ") });
+            if (device instanceof Simpler) {
+              const sample = device.sample;
+              if (!sample) {
+                if (run("empty_simplers")) add("empty_simplers", () => ({ device_id: remember(device), location: location() }));
+              } else if (run("missing_media")) {
+                const filePath = sample.filePath;
+                const problem = fileProblem(filePath);
+                if (problem)
+                  add("missing_media", () => ({
+                    kind: "simpler_sample",
+                    device_id: remember(device),
+                    sample_id: remember(sample),
+                    file_path: filePath,
+                    problem,
+                    location: location(),
+                  }));
+              }
+            }
+            if (device instanceof RackDevice && depth < MAX_RACK_DEPTH)
+              device.chains.forEach((chain, i) => {
+                const label = chainLabel(chain, i);
+                const inner = chain.devices;
+                if (chain instanceof DrumChain && !inner.length && run("empty_drum_chains"))
+                  add("empty_drum_chains", () => ({
+                    ...chainSummary(chain),
+                    rack_device_id: remember(device),
+                    location: { ...ref(track), path: [...here, label].join(" > ") },
+                  }));
+                walk(inner, track, [...here, label], depth + 1);
+              });
+          }
+        };
+        for (const track of all) walk(track.devices, track, [track.name], 0);
+        if (devicesStopped)
+          incomplete.push(`Stopped after ${MAX_AUDIT_DEVICES} devices: later devices were not checked.`);
+      }
+
+      // audio clips' files
+      if (run("missing_media")) {
+        clips: for (const track of regular)
+          for (const clip of clipsOf(track, "all")) {
+            if (clipsSearched >= MAX_AUDIT_CLIPS) {
+              incomplete.push(`Stopped after ${MAX_AUDIT_CLIPS} clips: later clips were not checked.`);
+              break clips;
+            }
+            clipsSearched++;
+            if (!(clip instanceof AudioClip)) continue;
+            const filePath = clip.filePath;
+            const problem = fileProblem(filePath);
+            if (problem)
+              add("missing_media", () => ({
+                kind: "audio_clip",
+                clip_id: remember(clip),
+                clip_name: clip.name,
+                file_path: filePath,
+                problem,
+                location: clipLocation(clip),
+              }));
+          }
+      }
+
+      // names that make track_name ambiguous
+      if (run("duplicate_track_names")) {
+        const byName = new Map<string, Track<"1.0.0">[]>();
+        for (const track of all) {
+          const key = track.name.toLowerCase();
+          byName.set(key, [...(byName.get(key) ?? []), track]);
+        }
+        for (const same of byName.values())
+          if (same.length > 1)
+            add("duplicate_track_names", () => ({
+              name: same[0].name,
+              case_differs: same.some((t) => t.name !== same[0].name) || undefined,
+              tracks: same.map(ref),
+            }));
+      }
+
+      const issues = ran.reduce((n, c) => n + counts[c], 0);
+      return {
+        issue_count: issues,
+        counts,
+        ...lists,
+        truncated: ran.some((c) => counts[c] > lists[c].length)
+          ? `At most ${MAX_AUDIT_ENTRIES} entries are listed per check; counts has the totals.`
+          : undefined,
+        searched: { tracks: all.length, devices: devicesSearched, clips: clipsSearched, files: files.size },
+        incomplete: incomplete.length ? incomplete : undefined,
+      };
     },
   );
 
@@ -997,6 +1348,195 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     if (!mixer) throw new UsageError(`Expected a Track, Chain, or mixer id, got ${classOf(owner)}.`);
     return { mixer, owner };
   }
+
+  // -- track kinds and object locations ---------------------------------------
+
+  const indexIn = (list: DataModelObject<"1.0.0">[], obj: DataModelObject<"1.0.0">) =>
+    list.findIndex((x) => x.handle.id === obj.handle.id);
+
+  // The API has no group-track class: a regular track that is neither an audio
+  // nor a MIDI track is a group track. `regular` is song().tracks, passed in
+  // by callers that already hold it.
+  const isGroupTrack = (track: Track<"1.0.0">, regular = song().tracks) =>
+    !(track instanceof AudioTrack) && !(track instanceof MidiTrack) && indexIn(regular, track) >= 0;
+
+  // audio, midi, group, return or main.
+  function trackKind(track: Track<"1.0.0">, regular = song().tracks): string {
+    if (track instanceof AudioTrack) return "audio";
+    if (track instanceof MidiTrack) return "midi";
+    if (indexIn(regular, track) >= 0) return "group";
+    const s = song();
+    if (indexIn(s.returnTracks, track) >= 0) return "return";
+    return track.handle.id === s.mainTrack.handle.id ? "main" : "other";
+  }
+
+  // trackSummary with type "group" for group tracks (return and main tracks
+  // keep "other" here; song_get labels them by section).
+  const summarizeTrack = (track: Track<"1.0.0">, regular = song().tracks) =>
+    trackSummary(track, isGroupTrack(track, regular) ? "group" : undefined);
+
+  // A track as locations name it: track_index only for regular tracks.
+  function trackRef(track: Track<"1.0.0">, regular = song().tracks) {
+    const i = indexIn(regular, track);
+    return {
+      track_id: remember(track),
+      track_name: track.name,
+      track_index: i >= 0 ? i : undefined,
+      track_type: trackKind(track, regular),
+    };
+  }
+
+  // Locations are derived from DataModelObject.parent, which the SDK only
+  // documents as the "canonical parent". Assumed, as in Live's object model:
+  // a clip slot's parent is its track; a clip's its slot, track (arrangement)
+  // or take lane; a take lane's its track; a device's its track or chain; a
+  // chain's its rack; a sample's its Simpler. A parent that is not what is
+  // expected makes the location say less, never fail the call.
+  function parentOf(obj: DataModelObject<"1.0.0">): DataModelObject<"1.0.0"> | null {
+    try {
+      return obj.parent;
+    } catch {
+      return null; // e.g. a parent of a class the SDK does not know
+    }
+  }
+
+  // Session: the track and scene of a clip slot. When the slot's parent is not
+  // its track, the tracks' slot lists are searched instead.
+  function slotLocation(slot: ClipSlot<"1.0.0">) {
+    const regular = song().tracks;
+    let track = parentOf(slot);
+    let index = track instanceof Track ? indexIn(track.clipSlots, slot) : -1;
+    for (let t = 0; index < 0 && t < regular.length; t++) {
+      index = indexIn(regular[t].clipSlots, slot);
+      if (index >= 0) track = regular[t];
+    }
+    if (!(track instanceof Track) || index < 0) return { view: "session", clip_slot_id: remember(slot) };
+    const scene = song().scenes[index];
+    return {
+      view: "session",
+      ...trackRef(track, regular),
+      scene_index: index,
+      scene_id: scene ? remember(scene) : undefined,
+      scene_name: scene?.name,
+      clip_slot_id: remember(slot),
+    };
+  }
+
+  function laneLocation(lane: TakeLane<"1.0.0">) {
+    let track = parentOf(lane);
+    if (!(track instanceof Track)) track = song().tracks.find((t) => indexIn(t.takeLanes, lane) >= 0) ?? null;
+    const own = { take_lane_id: remember(lane), take_lane_name: lane.name };
+    if (!(track instanceof Track)) return { view: "take_lane", ...own };
+    return { view: "take_lane", ...trackRef(track), ...own, take_lane_index: indexIn(track.takeLanes, lane) };
+  }
+
+  function clipLocation(clip: Clip<"1.0.0">) {
+    const parent = parentOf(clip);
+    if (parent instanceof ClipSlot) return slotLocation(parent);
+    if (parent instanceof TakeLane) return laneLocation(parent);
+    if (parent instanceof Track) return { view: "arrangement", ...trackRef(parent) };
+    return null;
+  }
+
+  // The track a device is on, and the labels from there down to it: racks and
+  // their chains (as chainLabel names them), then the device.
+  function devicePath(device: Device<"1.0.0">): { track?: Track<"1.0.0">; labels: string[] } {
+    const labels = [device.name];
+    let up = parentOf(device);
+    for (let depth = 0; up && depth < 16; depth++) {
+      if (up instanceof Track) return { track: up, labels };
+      const chain = up;
+      const rack = chain instanceof Chain ? parentOf(chain) : null;
+      if (!(chain instanceof Chain) || !(rack instanceof RackDevice)) break;
+      labels.unshift(rack.name, chainLabel(chain, indexIn(rack.chains, chain)));
+      up = parentOf(rack);
+    }
+    return { labels };
+  }
+  // "Kit > Drum Rack > pad 36 > Simpler", as parameter_find shows paths.
+  const pathText = (track: Track<"1.0.0"> | undefined, labels: string[]) =>
+    (track ? [track.name, ...labels] : labels).join(" > ");
+
+  function deviceLocation(device: Device<"1.0.0">) {
+    const holder = parentOf(device);
+    const rack = holder instanceof Chain ? parentOf(holder) : null;
+    const { track, labels } = devicePath(device);
+    return {
+      ...(track ? trackRef(track) : {}),
+      path: pathText(track, labels),
+      device_index: holder instanceof Track || holder instanceof Chain ? indexIn(holder.devices, device) : undefined,
+      chain_id: holder instanceof Chain ? remember(holder) : undefined,
+      rack_device_id: rack instanceof RackDevice ? remember(rack) : undefined,
+    };
+  }
+
+  function chainLocation(chain: Chain<"1.0.0">) {
+    const rack = parentOf(chain);
+    if (!(rack instanceof RackDevice)) return null;
+    const index = indexIn(rack.chains, chain);
+    const { track, labels } = devicePath(rack);
+    return {
+      ...(track ? trackRef(track) : {}),
+      path: pathText(track, [...labels, chainLabel(chain, index)]),
+      rack_device_id: remember(rack),
+      chain_index: index,
+    };
+  }
+
+  // Where an object sits (clip_get, device_get, chain_get, selection_get), or
+  // null when that cannot be told.
+  function locate(obj: DataModelObject<"1.0.0">): object | null {
+    try {
+      if (obj instanceof Clip) return clipLocation(obj);
+      if (obj instanceof ClipSlot) return slotLocation(obj);
+      if (obj instanceof TakeLane) return laneLocation(obj);
+      if (obj instanceof Device) return deviceLocation(obj);
+      if (obj instanceof Chain) return chainLocation(obj);
+      if (obj instanceof Track) return trackRef(obj);
+      if (obj instanceof Scene) {
+        const index = indexIn(song().scenes, obj);
+        return index >= 0 ? { scene_index: index } : null;
+      }
+      if (obj instanceof Sample) {
+        const simpler = parentOf(obj);
+        return simpler instanceof Simpler ? { simpler_device_id: remember(simpler), ...deviceLocation(simpler) } : null;
+      }
+    } catch {
+      // a location is extra information: never fail the call over it
+    }
+    return null;
+  }
+
+  // Whether a clip spanning [start, end) overlaps the range [from, to); an
+  // empty range (from = to) is a point in time, covered from a clip's start.
+  const overlapsRange = (start: number, end: number, from: number, to: number) =>
+    to > from ? start < to && end > from : start <= from && end > from;
+  // The clips overlapping [from, to), by start time.
+  function clipsInRange(clips: Clip<"1.0.0">[], from: number, to: number) {
+    return clips
+      .map((clip) => ({ clip, start: num(clip.startTime), end: num(clip.endTime) }))
+      .filter((c) => overlapsRange(c.start, c.end, from, to))
+      .sort((a, b) => a.start - b.start)
+      .map((c) => c.clip);
+  }
+
+  // Overviews (session_grid, arrangement_get): the given tracks, in that order
+  // and each once, or every regular track. Every address is checked first.
+  function trackSelection(list: TrackAddress[] | undefined, regular: Track<"1.0.0">[]) {
+    if (!list) return regular;
+    const picked = list.map((a, i) => at(`tracks[${i}]`, () => findTrack(a)));
+    return picked.filter((t, i) => indexIn(picked, t) === i);
+  }
+  // A track as an overview row.
+  const trackRow = (track: Track<"1.0.0">, regular: Track<"1.0.0">[]) => {
+    const index = indexIn(regular, track);
+    return {
+      id: remember(track),
+      name: track.name,
+      index: index >= 0 ? index : undefined,
+      type: trackKind(track, regular),
+    };
+  };
 
   // -- devices and parameters by name ----------------------------------------
 
@@ -1446,7 +1986,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     { title: "Get track", annotations: READ },
     "Get detail for one track: properties, clip slots (session view, with " +
       "clips), take lanes, arrangement clips, devices, and mixer (volume/pan/sends " +
-      "with current values). Works for regular, return, and main tracks. Address " +
+      "with current values). Works for regular, return, and main tracks; group " +
+      "tracks have type 'group' (return and main tracks 'other'). Address " +
       "by track_id, track_index (0-based, regular tracks only), or track_name. " +
       "Use `include` to fetch only some sections.",
     {
@@ -1460,7 +2001,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       const track = findTrack(args);
       const want = (k: string) => !args.include || args.include.includes(k as never);
       return {
-        ...trackSummary(track),
+        ...summarizeTrack(track),
         clip_slots: want("clip_slots") ? track.clipSlots.map(clipSlotSummary) : undefined,
         take_lanes: want("take_lanes") ? track.takeLanes.map(takeLaneSummary) : undefined,
         arrangement_clips: want("arrangement_clips")
@@ -1516,7 +2057,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
             if (it.arm !== undefined) track.arm = it.arm;
           }
         });
-      const out = plan.map(({ track }) => trackSummary(track));
+      const regular = song().tracks;
+      const out = plan.map(({ track }) => summarizeTrack(track, regular));
       return batch ? { items: out } : out[0];
     },
   );
@@ -1615,7 +2157,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     { title: "Duplicate track", annotations: CREATE },
     "Duplicate a track. The copy is inserted right after the original.",
     { ...trackAddress },
-    async (args) => trackSummary(await song().duplicateTrack(findTrack(args))),
+    async (args) => summarizeTrack(await song().duplicateTrack(findTrack(args))),
   );
 
   tool(
@@ -1812,6 +2354,107 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
   );
 
   tool(
+    "scene_get",
+    { title: "Get scene", annotations: READ },
+    "Get one session row: a scene (scene_id, scene_index or scene_name) and, for " +
+      "every regular track in order, its clip slot in that scene with the clip in it " +
+      "(clip summary, or null for an empty slot; group tracks' slots hold no clips). " +
+      "only_clips leaves out the empty slots. For the whole session at a glance use " +
+      "session_grid.",
+    {
+      ...sceneAddress,
+      only_clips: z.boolean().default(false).describe("Leave out the tracks whose slot in this scene is empty"),
+    },
+    ({ only_clips, ...address }) => {
+      const { scene, index } = findScene(address);
+      const regular = song().tracks;
+      const slots = regular.map((track, i) => {
+        // group tracks may not have a slot per scene: tolerate a missing one
+        const slot = track.clipSlots[index];
+        const clip = slot?.clip ?? null;
+        return {
+          track_index: i,
+          track_id: remember(track),
+          track_name: track.name,
+          track_type: trackKind(track, regular),
+          slot_id: slot ? remember(slot) : null,
+          clip: clip ? clipSummary(clip) : null,
+        };
+      });
+      return {
+        ...sceneSummary(scene, index),
+        clip_count: slots.filter((x) => x.clip).length,
+        slots: only_clips ? slots.filter((x) => x.clip) : slots,
+      };
+    },
+  );
+
+  const MAX_GRID_CELLS = 10_000;
+
+  tool(
+    "session_grid",
+    { title: "Get session grid", annotations: READ },
+    "The Session View at a glance, as a track × scene matrix: `scenes` are the " +
+      "columns (index, id, name); each entry of `tracks` (id, name, index, type, " +
+      "group_track_id) has one cell per column — null for an empty slot, or the clip " +
+      "in brief {id, class, name, duration, muted, looping} (clip_get has the " +
+      "detail). Narrow it with `tracks` (in that order) and scene_index_min / " +
+      `scene_index_max (inclusive); at most ${MAX_GRID_CELLS} cells per call. For ` +
+      "one scene with full clip summaries use scene_get.",
+    {
+      tracks: z
+        .array(z.object(trackAddress))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
+      scene_index_min: z.number().int().min(0).optional().describe("First scene (0-based); default 0"),
+      scene_index_max: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Last scene, inclusive; default (and at most) the last scene"),
+    },
+    ({ tracks: list, scene_index_min, scene_index_max }) => {
+      const scenes = song().scenes;
+      const first = scene_index_min ?? 0;
+      if (scene_index_max !== undefined && scene_index_max < first)
+        throw new UsageError(`scene_index_max ${scene_index_max} is before scene_index_min ${first}.`);
+      if (first > 0 && first >= scenes.length) throw outOfRange("scene_index_min", first, scenes.length);
+      const last = Math.min(scene_index_max ?? scenes.length - 1, scenes.length - 1);
+      const columns = scenes.slice(first, last + 1).map((scene, k) => ({
+        index: first + k,
+        id: remember(scene),
+        name: scene.name,
+      }));
+      const regular = song().tracks;
+      const tracks = trackSelection(list, regular);
+      const cells = tracks.length * columns.length;
+      if (cells > MAX_GRID_CELLS)
+        throw new UsageError(
+          `${tracks.length} tracks × ${columns.length} scenes = ${cells} cells, at most ${MAX_GRID_CELLS} ` +
+            "per call: narrow it with tracks or scene_index_min / scene_index_max.",
+        );
+      let clipCount = 0;
+      const rows = tracks.map((track) => {
+        const slots = track.clipSlots;
+        const group = track.groupTrack;
+        return {
+          ...trackRow(track, regular),
+          group_track_id: group ? remember(group) : null,
+          cells: columns.map(({ index }) => {
+            const clip = slots[index]?.clip;
+            if (!clip) return null;
+            clipCount++;
+            return clipBrief(clip);
+          }),
+        };
+      });
+      return { scenes: columns, tracks: rows, clip_count: clipCount };
+    },
+  );
+
+  tool(
     "cue_point_create",
     { title: "Create cue point", annotations: CREATE },
     "Create an arrangement cue point (locator) at a beat position, optionally " +
@@ -1988,6 +2631,84 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  const MAX_ARRANGEMENT_CLIPS = 500;
+
+  tool(
+    "arrangement_get",
+    { title: "Get arrangement range", annotations: READ },
+    "What happens in the arrangement between start_time and end_time (beats; " +
+      "default: from 0 to the end of the song): the cue points in the range, and for " +
+      "every regular track (or only `tracks`) the arrangement clips that overlap it — " +
+      "clip summaries by start time, a clip overlaps when it starts before end_time " +
+      "and ends after start_time — plus, with include_take_lanes, each take lane's " +
+      "overlapping clips. `song_end` is derived: the latest end of any arrangement " +
+      "clip on a regular track (Live's API has no song length; take lanes and cue " +
+      "points do not count). At 4/4, bar n starts at beat (n - 1) × 4. At most " +
+      `${MAX_ARRANGEMENT_CLIPS} clips are listed: \`clip_count\` counts them all and ` +
+      "`truncated` says when some were left out.",
+    {
+      start_time: z.number().optional().describe("Range start in beats; default 0"),
+      end_time: z
+        .number()
+        .optional()
+        .describe("Range end in beats (exclusive); default: everything after start_time"),
+      tracks: z
+        .array(z.object(trackAddress))
+        .min(1)
+        .optional()
+        .describe("Only these tracks (each by track_id, track_index or track_name); omit for every regular track"),
+      include_take_lanes: z.boolean().default(false).describe("Also list each take lane's clips in the range"),
+    },
+    ({ start_time, end_time, tracks: list, include_take_lanes }) => {
+      const from = start_time ?? 0;
+      if (end_time !== undefined && end_time <= from)
+        throw new UsageError(`end_time ${end_time} must be after start_time ${from}.`);
+      const to = end_time ?? Infinity;
+      const regular = song().tracks;
+      const tracks = trackSelection(list, regular);
+      let songEnd = 0;
+      for (const track of regular) for (const clip of track.arrangementClips) songEnd = Math.max(songEnd, num(clip.endTime));
+      let listed = 0;
+      let total = 0;
+      const pick = (clips: Clip<"1.0.0">[]) => {
+        const hits = clipsInRange(clips, from, to);
+        const room = Math.max(0, MAX_ARRANGEMENT_CLIPS - listed);
+        total += hits.length;
+        listed += Math.min(room, hits.length);
+        return hits.slice(0, room).map((c) => clipSummary(c));
+      };
+      const rows = tracks.map((track) => ({
+        ...trackRow(track, regular),
+        clips: pick(track.arrangementClips),
+        take_lanes: include_take_lanes
+          ? track.takeLanes.map((lane, index) => ({
+              id: remember(lane),
+              name: lane.name,
+              index,
+              clips: pick(lane.clips),
+            }))
+          : undefined,
+      }));
+      const cuePoints = song()
+        .cuePoints.map(cuePointSummary)
+        .filter((c) => c.time >= from && c.time < to)
+        .sort((a, b) => a.time - b.time);
+      return {
+        start_time: from,
+        end_time: end_time ?? Math.max(songEnd, from),
+        song_end: songEnd,
+        cue_points: cuePoints,
+        tracks: rows,
+        clip_count: total,
+        truncated:
+          total > listed
+            ? `Only the first ${MAX_ARRANGEMENT_CLIPS} of ${total} clips are listed (tracks in order): ` +
+              "narrow the range or the tracks."
+            : undefined,
+      };
+    },
+  );
+
   // -- clips -----------------------------------------------------------------
 
   tool(
@@ -2135,9 +2856,14 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "clip_get",
     { title: "Get clip", annotations: READ },
     "Get full detail for one clip (MIDI: note count; audio: file, warp settings " +
-      "and warp markers). Use midi_clip_get_notes for the actual notes.",
+      "and warp markers) and its `location`: view 'session' (track, scene_index, " +
+      "scene and clip slot), 'arrangement' (track) or 'take_lane' (track and take " +
+      "lane). Use midi_clip_get_notes for the actual notes.",
     { clip_id: z.string() },
-    ({ clip_id }) => clipSummary(resolve(clip_id, Clip), true),
+    ({ clip_id }) => {
+      const clip = resolve(clip_id, Clip);
+      return { ...clipSummary(clip, true), location: locate(clip) };
+    },
   );
 
   const clipProps = {
@@ -2588,7 +3314,9 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
       "parameter_filter (case-insensitive substring on the name) to fetch only " +
       "what you need, include_values to read current values in the same call, " +
       "and include_chain_devices to inline each rack chain's devices (e.g. map " +
-      "a whole drum kit pad→note→sample in one call).",
+      "a whole drum kit pad→note→sample in one call). `location` says where the " +
+      "device sits: its track, the path through racks (\"Kit > Drum Rack > pad 36 > " +
+      "Simpler\"), its device_index, and the chain and rack it is in.",
     {
       device_id: z.string(),
       parameter_filter: z.string().optional(),
@@ -2616,6 +3344,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
                 devices: include_chain_devices ? c.devices.map(deviceSummary) : undefined,
               }))
             : undefined,
+        location: locate(device),
       };
     },
   );
@@ -3151,7 +3880,8 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     "chain_get",
     { title: "Get rack chain", annotations: READ },
     "Get detail for a rack chain: its devices and mixer (volume/pan/sends with " +
-      "values). Drum chains also report their receiving note.",
+      "values). Drum chains also report their receiving note. `location` gives the " +
+      "track, the path to the chain, its rack and chain_index.",
     { chain_id: z.string() },
     async ({ chain_id }) => {
       const chain = resolve(chain_id, Chain);
@@ -3159,6 +3889,7 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
         ...chainSummary(chain),
         devices: chain.devices.map(deviceSummary),
         mixer: await mixerDetail(chain.mixer),
+        location: locate(chain),
       };
     },
   );
@@ -3494,6 +4225,150 @@ function buildServer(context: Ctx, hostApiVersion: string, port: number): McpSer
     },
   );
 
+  // -- the user's selection (captured through context menus) ----------------
+
+  const HOW_TO_SELECT =
+    'In Live, the user right-clicks a clip, clip slot, track, scene, Drum Rack, Simpler or sample — or a ' +
+    "selection of clip slots, or a time selection in the arrangement — and chooses \"MCP: Use as selection\".";
+
+  // A captured object as selection_get reports it: its summary and location.
+  function describeCaptured(obj: DataModelObject<"1.0.0">): Record<string, unknown> {
+    const location = locate(obj);
+    if (obj instanceof Clip) return { ...clipSummary(obj), location };
+    if (obj instanceof ClipSlot) {
+      const clip = obj.clip;
+      return { id: remember(obj), class: "ClipSlot", clip: clip ? clipSummary(clip) : null, location };
+    }
+    if (obj instanceof Track) return { class: classOf(obj), ...summarizeTrack(obj), location };
+    if (obj instanceof Scene) return { class: "Scene", ...sceneSummary(obj, indexIn(song().scenes, obj)) };
+    if (obj instanceof Sample) return { id: remember(obj), class: "Sample", file_path: obj.filePath, location };
+    if (obj instanceof Device) return { ...deviceSummary(obj), location };
+    if (obj instanceof Chain) return { ...chainSummary(obj), location };
+    if (obj instanceof TakeLane) return { id: remember(obj), class: "TakeLane", name: obj.name, location };
+    return { id: remember(obj), class: classOf(obj), location };
+  }
+
+  // A lane of an arrangement selection (a track or take lane, as assumed: the
+  // SDK only says "lanes") with its clips that overlap the time selection.
+  function describeLane(obj: DataModelObject<"1.0.0">, time: Selection["time"]): Record<string, unknown> {
+    const base = { id: remember(obj), class: classOf(obj) };
+    let clips: Clip<"1.0.0">[];
+    let described: Record<string, unknown>;
+    if (obj instanceof Track) {
+      clips = obj.arrangementClips;
+      described = { ...base, name: obj.name, location: trackRef(obj) };
+    } else if (obj instanceof TakeLane) {
+      clips = obj.clips;
+      described = { ...base, name: obj.name, location: laneLocation(obj) };
+    } else {
+      return { ...base, location: locate(obj), error: "not a track or take lane, so no clips are listed" };
+    }
+    const hits = time ? clipsInRange(clips, time.start, time.end) : clips;
+    return { ...described, clips: hits.map((c) => clipSummary(c)) };
+  }
+
+  // A capture as selection_get / selection_wait return it. Objects are
+  // described now, not at capture time, so the result is current; one that
+  // was deleted since reports an error instead.
+  function describeSelection(sel: Selection) {
+    const item = (c: Selection["objects"][number], describe: (o: DataModelObject<"1.0.0">) => Record<string, unknown>) => {
+      if ("error" in c) return { error: c.error };
+      try {
+        return describe(c.object);
+      } catch (e) {
+        return {
+          id: c.id,
+          class: classOf(c.object),
+          error: `${errorMessage(e)} (was it deleted or moved since it was captured?)`,
+        };
+      }
+    };
+    const time = sel.time;
+    return {
+      captured: true,
+      seq: sel.seq,
+      captured_at: new Date(sel.capturedAt).toISOString(),
+      age_s: Math.round((Date.now() - sel.capturedAt) / 100) / 10,
+      scope: sel.scope,
+      kind: sel.kind,
+      problems: sel.problems,
+      ...(sel.kind === "arrangement"
+        ? {
+            time_selection: time && { start_time: time.start, end_time: time.end, length: time.end - time.start },
+            lanes: sel.objects.map((c) => item(c, (o) => describeLane(o, time))),
+          }
+        : { items: sel.objects.map((c) => item(c, describeCaptured)) }),
+    };
+  }
+
+  const SELECTION_RESULT =
+    "`seq` (increases with every capture), `captured_at`, `age_s`, the menu `scope`, `kind` and: for a " +
+    "clicked object (kind 'object') or a clip-slot selection ('clip_slots'), `items` — each with its id " +
+    "(usable in every other tool), a summary and its `location` (track, scene index or take lane, device " +
+    "path); for an arrangement time selection ('arrangement'), `time_selection` {start_time, end_time, " +
+    "length} in beats and `lanes`, each selected track or take lane with its clips overlapping the time " +
+    "selection. An object Live could not resolve, or that was deleted since, carries `error`.";
+
+  tool(
+    "selection_get",
+    { title: "Get the user's selection", annotations: READ },
+    "Get what the user last handed over from Live with the context-menu entry \"MCP: Use as " +
+      "selection\": Live's API has no selection getter, so this is how \"quantize this\", " +
+      "\"these slots\" or \"the selected range\" become ids. " +
+      HOW_TO_SELECT +
+      " Returns " +
+      SELECTION_RESULT +
+      " Check age_s: an old capture may not be what the user means now. Nothing captured yet: " +
+      "captured false, seq 0. To wait for the user to choose, use selection_wait.",
+    {},
+    () => {
+      const sel = selections.latest();
+      return sel ? describeSelection(sel) : { captured: false, seq: 0, hint: HOW_TO_SELECT };
+    },
+  );
+
+  tool(
+    "selection_wait",
+    { title: "Wait for the user's selection", annotations: READ },
+    "Wait until the user hands over a selection from Live (" +
+      HOW_TO_SELECT +
+      ") and return it as selection_get does: " +
+      SELECTION_RESULT +
+      " Tell the user what to select and to choose \"MCP: Use as selection\" first, then call " +
+      "this. It returns as soon as there is a capture newer than `after_seq` (default: the latest " +
+      "capture when the call starts), or after timeout_s seconds with timed_out: true — then ask " +
+      "again or call it again. Keep timeout_s under the client's request timeout (often 60 s).",
+    {
+      timeout_s: z
+        .number()
+        .min(1)
+        .max(55)
+        .default(50)
+        .describe("Seconds to wait, 1-55"),
+      after_seq: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Return as soon as the latest capture's seq is higher than this (a seq from selection_get), " +
+            "also for a capture made before this call; default: the latest seq now",
+        ),
+    },
+    async ({ timeout_s, after_seq }, extra) => {
+      // a seq that was never handed out would hide every capture until the timeout
+      const after = Math.min(after_seq ?? Infinity, selections.latestSeq);
+      const sel = await selections.wait(after, timeout_s * 1000, extra.signal);
+      if (sel) return describeSelection(sel);
+      return {
+        captured: selections.latestSeq > 0,
+        timed_out: true,
+        seq: selections.latestSeq,
+        hint: `No new selection within ${timeout_s} s. ${HOW_TO_SELECT}`,
+      };
+    },
+  );
+
   // -- ui / commands ---------------------------------------------------------
 
   tool(
@@ -3654,11 +4529,9 @@ function registerStatus(
       .catch((e) => console.error("[ableton-live-mcp] status dialog:", e));
   });
   for (const scope of ["AudioTrack", "MidiTrack"] as const) {
-    void context.ui.registerContextMenuAction(
-      scope,
-      "Ableton Live MCP: Status",
-      "ableton-live-mcp.status",
-    );
+    context.ui
+      .registerContextMenuAction(scope, "Ableton Live MCP: Status", "ableton-live-mcp.status")
+      .catch((e: unknown) => console.error(`[ableton-live-mcp] could not add the ${scope} status entry:`, e));
   }
 }
 
@@ -3670,6 +4543,14 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
   } catch (e) {
     // a convenience only: never let it keep the endpoint from starting
     console.error("[ableton-live-mcp] could not register the status command:", e);
+  }
+  // The user's selection arrives through context-menu commands; captures
+  // outlive the per-request McpServer, so the store lives here.
+  const selections = new SelectionStore(context);
+  try {
+    registerSelectionMenus(context, selections);
+  } catch (e) {
+    console.error("[ableton-live-mcp] could not register the selection menu entries:", e);
   }
 
   const httpServer = http.createServer(async (req, res) => {
@@ -3711,7 +4592,7 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
-      const mcp = buildServer(context, hostApiVersion, port);
+      const mcp = buildServer(context, hostApiVersion, port, selections);
       res.on("close", () => {
         void transport.close();
         void mcp.close();

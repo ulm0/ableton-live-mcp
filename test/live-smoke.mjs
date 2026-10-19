@@ -300,6 +300,37 @@ assert.ok((await call("device_preset_list")).presets.some((p) => p.name === pres
 fs.rmSync(path.join(savedPreset.directory, `${presetName}.json`), { force: true });
 step(`device preset saved to ${savedPreset.directory}, loaded as a new device, removed`);
 
+// --- whole-set reads and locations: canonical parents the mock can only assume
+const clipLoc = (await call("clip_get", { clip_id: clip.id })).location;
+assert.deepEqual([clipLoc?.view, clipLoc?.track_id, clipLoc?.scene_index], ["session", midi.id, 0],
+  `clip location (ClipSlot -> Track parents): ${JSON.stringify(clipLoc)}`);
+const aclipLoc = (await call("clip_get", { clip_id: aclip.id })).location;
+assert.deepEqual([aclipLoc?.view, aclipLoc?.track_id], ["arrangement", audio.id], `arrangement clip location: ${JSON.stringify(aclipLoc)}`);
+const rackLoc = (await call("device_get", { device_id: rack.id })).location;
+assert.equal(rackLoc?.track_id, drumTrack.id, `device location (Device -> Track parent): ${JSON.stringify(rackLoc)}`);
+const chainLoc = (await call("chain_get", { chain_id: chain.id })).location;
+assert.equal(chainLoc?.rack_device_id, rack.id, `chain location (Chain -> RackDevice parent): ${JSON.stringify(chainLoc)}`);
+step(`locations: session clip in scene "${clipLoc.scene_name}", chain at "${chainLoc.path}"`);
+const deepSong = await call("song_get", { include: ["devices", "mixer", "clips"] });
+const smokeRow = deepSong.tracks.find((t) => t.id === midi.id);
+assert.ok(smokeRow.devices.length >= 1 && smokeRow.mixer && smokeRow.clips.session.some((c) => c.id === clip.id));
+const groupCount = deepSong.tracks.filter((t) => t.type === "group").length;
+step(`song_get deep: ${deepSong.tracks.length} tracks (${groupCount} group tracks), ` +
+  `${smokeRow.devices[0].name} enabled=${smokeRow.devices[0].enabled}, truncated=${JSON.stringify(deepSong.truncated ?? null)}`);
+const sceneRow = await call("scene_get", { scene_index: 0 });
+assert.ok(sceneRow.slots.some((s) => s.clip?.id === clip.id));
+const smokeGrid = await call("session_grid", { scene_index_max: 3 });
+const smokeArr = await call("arrangement_get", { start_time: 0, end_time: 8, tracks: [{ track_id: audio.id }] });
+assert.ok(smokeArr.tracks[0].clips.some((c) => c.id === aclip.id));
+const smokeAudit = await call("song_audit");
+step(`scene_get, session_grid (${smokeGrid.clip_count} clips in scenes 0-3), arrangement_get ` +
+  `(song_end ${smokeArr.song_end}), song_audit (${smokeAudit.issue_count} issues: ${JSON.stringify(smokeAudit.counts)})`);
+// The selection arrives only through "MCP: Use as selection" (right-click in Live): report what is there.
+const lastSelection = await call("selection_get");
+step(`selection_get: ${lastSelection.captured
+  ? `seq ${lastSelection.seq} from ${lastSelection.scope}: ${JSON.stringify(lastSelection.items ?? lastSelection.lanes).slice(0, 200)}`
+  : 'nothing captured yet (right-click a clip -> "MCP: Use as selection", then rerun)'}`);
+
 // --- tempo ------------------------------------------------------------------
 const origTempo = song.tempo;
 await call("song_set", { tempo: origTempo + 5 });

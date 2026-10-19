@@ -65,41 +65,47 @@ const midiClip = make(["MidiClip", "Clip"], {
   ],
 });
 
-function makeSlot(clip) {
-  return make(["ClipSlot"], { clip: clip ?? null });
+// Canonical parents (DataModelObject.parent), as in Live's object model: a
+// clip slot's is its track, a track's the song, a sample's its Simpler; clips,
+// devices, chains and take lanes set theirs where they are created.
+function makeSlot(clip, track) {
+  return make(["ClipSlot"], { clip: clip ?? null, parentObj: track });
 }
 // A regular track has one clip slot per scene (index-aligned with Song.scenes).
-const sceneSlots = () => songObj.scenes.map(() => makeSlot(null));
 function makeTrack(classes, name, extra = {}) {
-  return make(classes, {
+  const t = make(classes, {
     name, mute: false, solo: false, arm: false,
-    slots: sceneSlots(), takeLanes: [], arrClips: [], devices: [],
-    mixer: makeMixer("MixerDevice", songObj.returns.length), group: null, ...extra,
+    slots: [], takeLanes: [], arrClips: [], devices: [],
+    mixer: makeMixer("MixerDevice", songObj.returns.length), group: null, parentObj: songObj, ...extra,
   });
+  t.slots = songObj.scenes.map(() => makeSlot(null, t));
+  return t;
 }
-const midiSlots = [makeSlot(midiClip), makeSlot(null)];
 const midiTrack = make(["MidiTrack", "Track"], {
   name: "Bass", mute: false, solo: false, arm: false,
-  slots: midiSlots, takeLanes: [], arrClips: [], devices: [operatorDev],
-  mixer: makeMixer("MixerDevice", 1), group: null,
+  slots: [], takeLanes: [], arrClips: [], devices: [operatorDev],
+  mixer: makeMixer("MixerDevice", 1), group: null, parentObj: songObj,
 });
+const midiSlots = [makeSlot(midiClip, midiTrack), makeSlot(null, midiTrack)];
+midiTrack.slots = midiSlots;
 midiClip.parentSlot = midiSlots[0];
 operatorDev.parentObj = midiTrack;
 
 const audioTrack = make(["AudioTrack", "Track"], {
   name: "Drums", mute: false, solo: false, arm: false,
-  slots: [makeSlot(null), makeSlot(null)], takeLanes: [], arrClips: [], devices: [],
-  mixer: makeMixer("MixerDevice", 1), group: null,
+  slots: [], takeLanes: [], arrClips: [], devices: [],
+  mixer: makeMixer("MixerDevice", 1), group: null, parentObj: songObj,
 });
+audioTrack.slots = [makeSlot(null, audioTrack), makeSlot(null, audioTrack)];
 const returnTrack = make(["Track"], {
   name: "A-Reverb", mute: false, solo: false, arm: false,
   slots: [], takeLanes: [], arrClips: [], devices: [],
-  mixer: makeMixer("MixerDevice", 0), group: null,
+  mixer: makeMixer("MixerDevice", 0), group: null, parentObj: songObj,
 });
 const mainTrack = make(["Track"], {
   name: "Main", mute: false, solo: false, arm: false,
   slots: [], takeLanes: [], arrClips: [], devices: [],
-  mixer: makeMixer("MixerDevice", 0), group: null,
+  mixer: makeMixer("MixerDevice", 0), group: null, parentObj: songObj,
 });
 songObj.tracks = [midiTrack, audioTrack];
 songObj.returns = [returnTrack];
@@ -149,6 +155,12 @@ function insertAfterSelection(song, track) {
 }
 
 // --- api modules -----------------------------------------------------------
+// The context-menu scopes of API 1.0.0 (index.d.mts ContextMenuScope), and the
+// argument each passes to its command: the clicked object's handle, or a
+// selection.
+const HANDLE_SCOPES = ["AudioClip", "AudioTrack", "ClipSlot", "DrumRack", "MidiClip", "MidiTrack", "Sample", "Scene", "Simpler"];
+const SELECTION_SCOPES = ["ClipSlotSelection", "AudioTrack.ArrangementSelection", "MidiTrack.ArrangementSelection"];
+
 // What the extension asked the host to do. `transactions.outer` counts
 // outermost withinTransaction calls — the undo steps a user would see, since
 // nested transactions collapse into the outermost one (index.d.mts
@@ -207,7 +219,7 @@ const dataModel = {
     const sc = make(["Scene"], { name: "", tempo: 120, sigN: 4, sigD: 4 });
     const at = i < 0 ? s.scenes.length : i;
     s.scenes.splice(at, 0, sc);
-    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null));
+    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null, t));
     ok(sc.handle);
   },
   songDeleteScene: (h, sh, ok) => {
@@ -233,7 +245,7 @@ const dataModel = {
     const s = get(h);
     const at = s.scenes.findIndex((x) => x.handle.id === sh.id) + 1;
     s.scenes.splice(at, 0, sc);
-    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null));
+    for (const t of s.tracks) t.slots.splice(at, 0, makeSlot(null, t));
     ok(sc.handle);
   },
   // Arrangement positions start at 0: the mock rejects earlier ones (without
@@ -419,7 +431,7 @@ const dataModel = {
   simplerGetSample: (h) => (get(h).sample ? get(h).sample.handle : null),
   simplerReplaceSample: (h, fp, ok, err) => {
     if (refuseSamples) return err(); // without details, like most host rejections
-    const s = make(["Sample"], { filePath: fp });
+    const s = make(["Sample"], { filePath: fp, parentObj: get(h) });
     get(h).sample = s;
     ok(s.handle);
   },
@@ -493,6 +505,8 @@ function makeActivation(storageDir, tempDir, sink = calls) {
       },
       ui: {
         registerContextMenuAction: (scope, title, commandId, onOk) => {
+          if (!HANDLE_SCOPES.includes(scope) && !SELECTION_SCOPES.includes(scope))
+            throw new Error(`mock: unknown context-menu scope ${scope}`);
           sink.menus.push({ scope, title, commandId });
           onOk((onUnreg) => onUnreg());
         },
@@ -536,6 +550,58 @@ const fixtures = {
     songObj.rootNote = BigInt(root);
     songObj.scaleName = name;
     songObj.scaleIntervals = intervals.map(BigInt);
+  },
+  // Append `count` plain devices to a track (a big set, without MCP calls).
+  addDevices: (trackId, count, name = "Utility") => {
+    const t = objects.get(trackId);
+    for (let i = 0; i < count; i++) {
+      const d = make(["Device"], { name, params: BUILTIN_DEVICES.Utility() });
+      d.parentObj = t;
+      t.devices.push(d);
+    }
+  },
+  // Append `count` 4-beat MIDI clips to a track's arrangement, back to back.
+  addClips: (trackId, count) => {
+    const t = objects.get(trackId);
+    const from = t.arrClips.reduce((end, c) => Math.max(end, c.endTime), 0);
+    for (let i = 0; i < count; i++) {
+      const start = from + 4 * i;
+      const c = make(["MidiClip", "Clip"], {
+        name: `Clip ${i}`, startTime: start, endTime: start + 4, startMarker: 0, endMarker: 4,
+        looping: false, loopStart: 0, loopEnd: 4, color: 0, muted: false, notes: [],
+      });
+      c.parentTrack = t;
+      t.arrClips.push(c);
+    }
+  },
+  // Append `count` scenes (every track gets their slots), or drop the scenes
+  // from index `keep` on again, as Live's UI can.
+  addScenes: (count) => {
+    for (let i = 0; i < count; i++) {
+      songObj.scenes.push(make(["Scene"], { name: `Scene ${i}`, tempo: 120, sigN: 4, sigD: 4, parentObj: songObj }));
+      for (const t of songObj.tracks) t.slots.push(makeSlot(null, t));
+    }
+  },
+  removeScenes: (keep) => {
+    for (const sc of songObj.scenes.splice(keep)) objects.delete(sc.handle.id.toString());
+    for (const t of songObj.tracks) t.slots.splice(keep);
+  },
+  // A handle Live never handed out (a deleted or unknown object).
+  bogusHandle: () => ({ id: 987654321n }),
+  // The user picks `title` in the context menu of `scope`, as Live invokes it:
+  // the command gets the clicked object's handle, or for selection scopes a
+  // ClipSlotSelection ({slots: [ids]}) or an ArrangementSelection ({start,
+  // end, lanes: [ids]}). Ids are object ids; handle objects pass as they are.
+  contextMenu: (scope, target, { title = "MCP: Use as selection", sink = calls } = {}) => {
+    const menu = sink.menus.find((m) => m.scope === scope && m.title === title);
+    if (!menu) throw new Error(`mock: no "${title}" entry in the ${scope} context menu`);
+    const handle = (x) => (typeof x === "string" ? objects.get(x).handle : x);
+    const arg =
+      scope === "ClipSlotSelection" ? { selected_clip_slots: target.slots.map(handle) }
+      : scope.endsWith(".ArrangementSelection")
+        ? { time_selection_start: target.start, time_selection_end: target.end, selected_lanes: target.lanes.map(handle) }
+        : handle(target);
+    sink.commands[menu.commandId](arg);
   },
 };
 

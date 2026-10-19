@@ -12,7 +12,9 @@ or the port was changed in the extension's `config.json` (default 8722).
 ## Core workflow
 
 1. **Always start with `song_get`.** It returns the set with object ids. Every other tool
-   takes those ids. Pass `include` to fetch only some sections.
+   takes those ids. Pass `include` to fetch only some sections. To read the whole set in one
+   call, add the deep sections: `song_get {include:["tracks", "devices", "mixer", "clips"]}`
+   (see [Reading the whole set](#reading-the-whole-set)).
 2. Drill down with `track_get` / `device_get` / `clip_get` — they return child ids (clips,
    parameters, chains). `track_get` takes an `include` selector to skip sections you don't
    need.
@@ -31,6 +33,49 @@ or the port was changed in the extension's `config.json` (default 8722).
    out of range, missing or conflicting fields) come without the stale-id hint: fix the call
    instead.
 5. Writes apply asynchronously: a read right after a write can still return the old value.
+
+## Reading the whole set
+
+- `song_get` tracks carry `index` (the `track_index`), `depth` in the group hierarchy and
+  `group_track_id`; group tracks have type `"group"` and `child_track_ids` ("the drum bus" is
+  the group whose children are the drums). Return tracks carry `send_index` (their send).
+- Deep sections, only when listed in `include` (they imply the tracks): `devices` (each track's
+  device tree through racks — chains with `receiving_note_name` and their devices — and every
+  device's on-state `enabled`), `mixer` (volume, panning, sends labeled with `return_track`),
+  `clips` (session clips with `scene_index`, arrangement clips with start/end, in brief). They
+  stop at 500 devices / 500 clips: then `truncated` names the first track left out — read the
+  rest with `track_get` / `device_get`.
+- One scene across all tracks ("what's in the chorus?"): `scene_get {scene_name:"Chorus",
+  only_clips?}`. The whole session at a glance: `session_grid` (a track × scene matrix, cells
+  `null` or a brief clip; narrow with `tracks` and `scene_index_min`/`scene_index_max`).
+- A stretch of the arrangement ("what happens from bar 17 to bar 33?" = beats 64 to 128 at 4/4):
+  `arrangement_get {start_time:64, end_time:128, tracks?, include_take_lanes?}` returns the cue
+  points in the range and every track's overlapping clips, plus `song_end` (the end of the last
+  arrangement clip — the API has no song length). Without a range it covers the whole song.
+- Housekeeping: `song_audit` lists missing media files (audio clips and Simpler samples whose file
+  is gone), Simplers without a sample, empty drum pads and duplicate track names, each with ids
+  and a location. It changes nothing; offer fixes (`simpler_replace_sample`, `track_set` names)
+  and confirm before deleting anything.
+- `clip_get`, `device_get` and `chain_get` include a `location`: a clip's view (`session` with
+  track and scene, `arrangement`, `take_lane`), a device's track, path through racks
+  (`"Kit > Drum Rack > pad 36 > Simpler"`) and position.
+
+## The user's selection ("this clip", "these slots", "the selected range")
+
+- Live's API cannot read the selection. The extension adds **"MCP: Use as selection"** to Live's
+  context menus (clips, clip slots, tracks, scenes, Drum Racks, Simplers, samples, a selection of
+  clip slots, an arrangement time selection). When the user refers to something they selected,
+  ask them to right-click it and choose that entry, then call `selection_wait` (waits up to
+  `timeout_s`, at most 55 s; on `timed_out`, ask again). `selection_get` returns the last capture
+  without waiting — check `age_s` before trusting an old one.
+- The result: `items` (the clicked object, or each selected clip slot) with ids, summaries and
+  `location`; for an arrangement time selection, `time_selection {start_time, end_time}` in
+  beats and `lanes` (the selected tracks or take lanes) with the clips overlapping it. Pass the
+  ids to the other tools: "quantize this" = `midi_clip_edit_notes {clip_id:<items[0].id>,
+  quantize:{grid:0.25}}`; "render the selected range" = `render_track_audio {track_id, start_time,
+  end_time}` from the time selection.
+- An item with `error` was deleted or moved since, or Live passed something unexpected: ask the
+  user to select again. Don't guess ids instead.
 
 ## Batch edits (one call, one undo step)
 
@@ -112,6 +157,8 @@ or the port was changed in the extension's `config.json` (default 8722).
   note reports a selection, results carry a `warning` — then ask the user which notes they
   mean instead of guessing.
 - Respect the song scale from `song_get` (`scale.root_note`, `scale.intervals`) when composing.
+- Notes the user selected inside a clip's editor are `only_selected` (above); which clip, slot or
+  range they mean is the context-menu selection (see [The user's selection](#the-users-selection-this-clip-these-slots-the-selected-range)).
 
 ## Devices & sound design
 
@@ -222,6 +269,9 @@ or the port was changed in the extension's `config.json` (default 8722).
 The Extensions API (1.0.0) has no access to:
 
 - transport (play/stop/record), song position, clip or scene launching;
+- reading the user's selection or focused object directly (only the "MCP: Use as selection"
+  context-menu handoff);
+- the song length (`arrangement_get` derives `song_end` from the clips);
 - the browser, third-party plug-ins, Live's own device presets (`.adv`/`.adg`) — the
   `device_preset_*` tools keep this server's JSON snapshots instead;
 - moving, reordering or renaming devices (`device_copy` emulates move/reorder, lossily);

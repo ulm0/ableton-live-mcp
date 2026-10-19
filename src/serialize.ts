@@ -104,7 +104,9 @@ export function parsePitchClass(value: number | string, what = "root"): number {
 export function trackType(track: Track<V>): string {
   if (track instanceof AudioTrack) return "audio";
   if (track instanceof MidiTrack) return "midi";
-  return "other"; // main, return, or group track
+  // main, return, or group track: only the song's track lists tell them apart,
+  // so the server passes the role ("group", "return", "main") to trackSummary
+  return "other";
 }
 
 export function trackSummary(track: Track<V>, role?: string) {
@@ -156,6 +158,22 @@ export function clipSummary(clip: Clip<V>, detail = false) {
     }
   }
   return base;
+}
+
+// A clip in bulk overviews (song_get clips, session_grid): enough to tell
+// clips apart, no notes or markers — clip_get has the full detail. Arrangement
+// clips also carry their position.
+export function clipBrief(clip: Clip<V>, withPosition = false) {
+  return {
+    id: remember(clip),
+    class: classOf(clip),
+    name: clip.name,
+    duration: num(clip.duration),
+    muted: clip.muted,
+    looping: clip.looping,
+    start_time: withPosition ? num(clip.startTime) : undefined,
+    end_time: withPosition ? num(clip.endTime) : undefined,
+  };
 }
 
 export function clipSlotSummary(slot: ClipSlot<V>, index: number) {

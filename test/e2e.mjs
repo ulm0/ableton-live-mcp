@@ -60,7 +60,7 @@ const usageError = async (name, args, pattern) => {
 
 // tools/list
 const { tools } = await client.listTools();
-assert.equal(tools.length, 46, `expected exactly 46 tools, got ${tools.length}`);
+assert.equal(tools.length, 52, `expected exactly 52 tools, got ${tools.length}`);
 
 // every tool has a title and explicit hints — the spec defaults
 // (destructiveHint/openWorldHint true) must never apply by omission
@@ -79,7 +79,8 @@ const write = (destructive, idempotent) => ({
 const annotationGroups = [
   [{ readOnlyHint: true, openWorldHint: false }, ["song_get", "track_get", "clip_get",
     "midi_clip_get_notes", "device_get", "chain_get", "parameter_get", "mixer_get", "render_track_audio",
-    "parameter_find", "device_preset_list"]],
+    "parameter_find", "device_preset_list", "scene_get", "session_grid", "arrangement_get", "song_audit",
+    "selection_get", "selection_wait"]],
   [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
     "clip_set", "drum_chain_set", "parameter_set", "mixer_set", "device_set"]],
   [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
@@ -95,7 +96,7 @@ const annotationGroups = [
 ];
 for (const [expected, names] of annotationGroups)
   for (const n of names) assert.deepEqual(toolByName[n]?.annotations, expected, `${n}: annotations`);
-assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 46, "snapshot lists every tool once");
+assert.equal(new Set(annotationGroups.flatMap(([, n]) => n)).size, 52, "snapshot lists every tool once");
 
 // server instructions: a short digest, sent on initialize
 const instructions = client.getInstructions();
@@ -1230,14 +1231,333 @@ assert.deepEqual([untouched.steps, untouched.result.changed_count, untouched.res
 await call("track_delete", { track_id: notesTrack.id });
 assert.equal((await tracksNow()).length, 2);
 
+// --- whole-set reads: song_get hierarchy and deep sections --------------------
+const SELECT_TITLE = "MCP: Use as selection";
+const presentWav = path.join(storageDir, "present.wav");
+const missingWav = path.join(storageDir, "missing.wav");
+fs.writeFileSync(presentWav, "RIFF");
+const busId = fixtures.addTrack({ kind: "group", name: "Bus" });
+const synthIn = fixtures.addTrack({ kind: "midi", name: "Lead Synth", group: busId });
+const subId = fixtures.addTrack({ kind: "group", name: "Sub", group: busId });
+const voxId = fixtures.addTrack({ kind: "audio", name: "Vox", group: subId });
+song = await call("song_get");
+let rowOf = (id) => song.tracks.find((t) => t.id === id);
+assert.deepEqual(song.tracks.map((t) => t.index), [0, 1, 2, 3, 4, 5]);
+assert.deepEqual([rowOf(busId).type, rowOf(busId).depth, rowOf(busId).child_track_ids], ["group", 0, [synthIn, subId]]);
+assert.deepEqual([rowOf(subId).type, rowOf(subId).depth, rowOf(subId).child_track_ids], ["group", 1, [voxId]]);
+assert.deepEqual([rowOf(voxId).type, rowOf(voxId).depth, rowOf(voxId).child_track_ids, rowOf(voxId).group_track_id],
+  ["audio", 2, undefined, subId]);
+assert.deepEqual([rowOf(midiTrackId).depth, rowOf(midiTrackId).child_track_ids], [0, undefined]);
+assert.deepEqual(song.return_tracks.map((t) => [t.name, t.type, t.send_index, t.index]), [["A-Reverb", "return", 0, undefined]]);
+assert.equal(song.main_track.type, "main");
+assert.equal(song.environment.server_version, JSON.parse((await (await fetch(`http://127.0.0.1:${PORT}/health`)).text())).version);
+assert.ok(!("devices" in rowOf(midiTrackId)) && !("mixer" in rowOf(midiTrackId)) && !song.truncated, "deep sections are opt-in");
+// group tracks are "group" everywhere; return tracks keep "other" outside song_get
+assert.equal((await call("track_get", { track_id: subId, include: [] })).type, "group");
+assert.equal((await call("track_set", { items: [{ track_id: busId, mute: false }] })).items[0].type, "group");
+
+// a kit: pad C1 with a Simpler, an empty pad D1, a Reverb switched off; and a return device
+const kitT = await call("track_create", { type: "midi", name: "Kit 2", devices: ["Drum Rack", "Reverb"] });
+const [rackK, reverbK] = kitT.devices.map((d) => d.id);
+const padK = await call("rack_insert_chain", { rack_device_id: rackK, index: 0 });
+await call("drum_chain_set", { drum_chain_id: padK.id, receiving_note: "C1" });
+const kickK = await call("device_insert", { target_id: padK.id, device_name: "Simpler" });
+const kickSample = await call("simpler_replace_sample", { simpler_device_id: kickK.id, file_path: presentWav });
+const emptyPad = await call("rack_insert_chain", { rack_device_id: rackK, index: 1 });
+await call("drum_chain_set", { drum_chain_id: emptyPad.id, receiving_note: "D1" });
+await call("device_set", { device_id: reverbK, enabled: false });
+const returnFx = await call("device_insert", { track_name: "A-Reverb", device_name: "Reverb" });
+const hook = await call("clip_create", { type: "midi", track_id: synthIn, scene_index: 1, duration: 4, name: "Hook" });
+
+let deep = await call("song_get", { include: ["devices", "mixer", "clips"] });
+rowOf = (id) => deep.tracks.find((t) => t.id === id);
+assert.ok(deep.tracks && !deep.scenes && !deep.cue_points && !deep.environment, "deep sections imply tracks only");
+assert.equal(deep.truncated, undefined);
+const kitTree = rowOf(kitT.id).devices;
+assert.deepEqual(kitTree.map((d) => [d.id, d.name, d.enabled]), [[rackK, "Drum Rack", true], [reverbK, "Reverb", false]]);
+assert.equal(kitTree[0].chain_ids, undefined, "chains carry the chain ids");
+assert.deepEqual(kitTree[0].chains.map((c) => [c.id, c.receiving_note_name, c.devices.map((d) => [d.id, d.enabled, d.sample?.file_path])]),
+  [[padK.id, "C1", [[kickK.id, true, presentWav]]], [emptyPad.id, "D1", []]]);
+assert.equal(rowOf(midiTrackId).devices[0].enabled, undefined, "a device without an on/off switch has no enabled");
+assert.deepEqual(deep.return_tracks[0].devices.map((d) => [d.id, d.enabled]), [[returnFx.id, true]]);
+// mixer values with return names, as mixer_get reads them
+const drumsMixer = await call("mixer_get", { track_id: audioTrackId });
+assert.deepEqual(rowOf(audioTrackId).mixer, {
+  id: drumsMixer.id, volume: drumsMixer.volume.value, panning: drumsMixer.panning.value,
+  sends: [{ index: 0, return_track: "A-Reverb", value: drumsMixer.sends[0].value }],
+});
+assert.deepEqual(deep.main_track.mixer.sends, []);
+// clips: session (with scene_index) and arrangement (with position), in brief
+const bassClips = rowOf(midiTrackId).clips;
+assert.deepEqual(bassClips.session.map((c) => [c.scene_index, c.id, c.name]), [[0, clipId, "Bassline"]]);
+assert.equal(bassClips.session[0].slot_id, (await slotsOf(midiTrackId))[0].id);
+assert.deepEqual(bassClips.arrangement.map((c) => [c.id, c.start_time, c.end_time, c.duration]), [[arrClip.id, 16, 20, 4]]);
+assert.equal(bassClips.arrangement[0].loop_start, undefined, "brief entries: clip_get has the detail");
+assert.deepEqual(rowOf(synthIn).clips, { session: [{ scene_index: 1, slot_id: (await slotsOf(synthIn))[1].id,
+  id: hook.id, class: "MidiClip", name: "Hook", duration: 4, muted: false, looping: true }], arrangement: [] });
+assert.equal(deep.return_tracks[0].clips, undefined, "return tracks have no clips");
+deep = await call("song_get", { include: ["mixer"] });
+assert.ok(deep.tracks.every((t) => t.mixer && !t.devices && !t.clips));
+// payload caps: a track that does not fit, and the tracks after it, lack the section
+const big = fixtures.addTrack({ kind: "midi", name: "Big" });
+fixtures.addDevices(big, 520);
+fixtures.addClips(big, 520);
+deep = await call("song_get", { include: ["devices", "clips"] });
+rowOf = (id) => deep.tracks.find((t) => t.id === id);
+assert.match(deep.truncated.devices, /^Only 500 devices are listed: "Big" \(track_index 7, id \d+\) and the tracks after it/);
+assert.match(deep.truncated.clips, /^Only 500 clips are listed: "Big"/);
+assert.ok(rowOf(kitT.id).devices && !rowOf(big).devices && !deep.return_tracks[0].devices && !deep.main_track.devices);
+assert.ok(rowOf(kitT.id).clips && !rowOf(big).clips);
+
+// --- scene_get, session_grid, arrangement_get --------------------------------
+let scenes = await scenesNow();
+let row = await call("scene_get", { scene_name: "verse" });
+assert.deepEqual([row.id, row.index, row.name, row.clip_count, row.slots.length], [scenes[0].id, 0, "Verse", 1, 8]);
+assert.deepEqual(row.slots[0], { track_index: 0, track_id: midiTrackId, track_name: "Bass 2", track_type: "midi",
+  slot_id: (await slotsOf(midiTrackId))[0].id, clip: (await slotsOf(midiTrackId))[0].clip });
+assert.deepEqual(row.slots.map((x) => x.track_type), ["midi", "audio", "group", "midi", "group", "audio", "midi", "midi"]);
+row = await call("scene_get", { scene_index: 1, only_clips: true });
+assert.deepEqual([row.name, row.clip_count, row.slots.map((x) => [x.track_id, x.clip.id])], ["Chorus", 1, [[synthIn, hook.id]]]);
+await usageError("scene_get", { scene_index: 9 }, /scene_index 9 out of range \(0-1\)/);
+
+let grid = await call("session_grid");
+assert.deepEqual(grid.scenes, scenes.map((x) => ({ index: x.index, id: x.id, name: x.name })));
+assert.equal(grid.tracks.length, 8);
+const gridRow = (id) => grid.tracks.find((t) => t.id === id);
+assert.deepEqual(gridRow(midiTrackId).cells.map((c) => c?.name ?? null), ["Bassline", null]);
+assert.deepEqual(Object.keys(gridRow(midiTrackId).cells[0]).sort(), ["class", "duration", "id", "looping", "muted", "name"]);
+assert.deepEqual([gridRow(synthIn).index, gridRow(synthIn).type, gridRow(synthIn).group_track_id, gridRow(synthIn).cells.map((c) => c?.id ?? null)],
+  [3, "midi", busId, [null, hook.id]]);
+assert.deepEqual([gridRow(busId).type, gridRow(busId).group_track_id], ["group", null]);
+assert.equal(grid.clip_count, 2);
+grid = await call("session_grid", { tracks: [{ track_name: "Lead Synth" }, { track_index: 0 }, { track_id: synthIn }], scene_index_min: 1 });
+assert.deepEqual([grid.scenes.map((x) => x.index), grid.tracks.map((t) => [t.id, t.cells.length]), grid.clip_count],
+  [[1], [[synthIn, 1], [midiTrackId, 1]], 1], "tracks in the given order, each once");
+assert.equal((await call("session_grid", { scene_index_max: 99 })).scenes.length, 2, "scene_index_max is capped");
+await usageError("session_grid", { scene_index_min: 1, scene_index_max: 0 }, /scene_index_max 0 is before scene_index_min 1/);
+await usageError("session_grid", { scene_index_min: 5 }, /scene_index_min 5 out of range \(0-1\)/);
+await usageError("session_grid", { tracks: [{ track_index: 0 }, { track_name: "nope" }] }, /tracks\[1\]: No track named "nope"/);
+fixtures.addScenes(1300);
+await usageError("session_grid", {}, /8 tracks × 1302 scenes = 10416 cells, at most 10000/);
+assert.equal((await call("session_grid", { scene_index_max: 9 })).scenes.length, 10);
+fixtures.removeScenes(2);
+assert.equal((await scenesNow()).length, 2);
+await call("track_delete", { track_id: big });
+
+const drop = await call("cue_point_create", { time: 16, name: "Drop" });
+const takeClip = await call("clip_create", { type: "midi", target_id: lane.id, start_time: 18, duration: 4, name: "Take clip" });
+const drumsArr = (await call("track_get", { track_id: audioTrackId, include: ["arrangement_clips"] })).arrangement_clips;
+const songEnd = Math.max(20, ...drumsArr.map((c) => c.end_time));
+let arr = await call("arrangement_get", { start_time: 14, end_time: 33 });
+assert.deepEqual([arr.start_time, arr.end_time, arr.song_end], [14, 33, songEnd]);
+assert.deepEqual(arr.cue_points.map((c) => [c.id, c.name, c.time]), [[drop.id, "Drop", 16]]);
+const arrRow = (id) => arr.tracks.find((t) => t.id === id);
+assert.deepEqual(arr.tracks.map((t) => t.id), (await tracksNow()).map((t) => t.id));
+assert.deepEqual(arrRow(midiTrackId).clips, [(await call("track_get", { track_id: midiTrackId, include: ["arrangement_clips"] })).arrangement_clips[0]]);
+assert.deepEqual(arrRow(audioTrackId).clips.map((c) => c.id), drumsArr.filter((c) => c.start_time < 33 && c.end_time > 14).map((c) => c.id));
+assert.deepEqual([arrRow(midiTrackId).take_lanes, arrRow(busId).clips, arr.clip_count],
+  [undefined, [], drumsArr.filter((c) => c.start_time < 33 && c.end_time > 14).length + 1]);
+// take lanes on request; tracks by name; a clip ending at start_time does not overlap
+arr = await call("arrangement_get", { start_time: 4, end_time: 18.5, tracks: [{ track_name: "bass 2" }, { track_id: audioTrackId }], include_take_lanes: true });
+assert.deepEqual(arr.tracks.map((t) => t.name), ["Bass 2", "Drums"]);
+assert.deepEqual(arr.tracks[0].clips.map((c) => c.id), [arrClip.id]);
+assert.deepEqual(arr.tracks[0].take_lanes.map((l) => [l.id, l.index, l.clips.map((c) => c.id)]),
+  [[lane.id, 0, [takeClip.id]], [laneByName.id, 1, []]]);
+assert.deepEqual(arr.tracks[1].clips.map((c) => c.start_time), drumsArr.filter((c) => c.start_time < 18.5 && c.end_time > 4).map((c) => c.start_time));
+// default range: from 0 to the song's end, every cue point
+arr = await call("arrangement_get");
+assert.deepEqual([arr.start_time, arr.end_time], [0, songEnd]);
+assert.deepEqual(arr.cue_points.map((c) => c.name), ["Start", "Drop"]);
+await usageError("arrangement_get", { start_time: 8, end_time: 8 }, /end_time 8 must be after start_time 8/);
+await usageError("arrangement_get", { tracks: [{ track_name: "nope" }] }, /tracks\[0\]: No track named "nope"/);
+const many = fixtures.addTrack({ kind: "midi", name: "Many" });
+fixtures.addClips(many, 520);
+await tracksNow(); // discover the fixture id, like any client would
+arr = await call("arrangement_get", { tracks: [{ track_id: many }] });
+assert.deepEqual([arr.tracks[0].clips.length, arr.clip_count], [500, 520]);
+assert.match(arr.truncated, /Only the first 500 of 520 clips are listed/);
+await call("track_delete", { track_id: many });
+
+// locations in clip_get, device_get, chain_get
+const bassRef = { track_id: midiTrackId, track_name: "Bass 2", track_index: 0, track_type: "midi" };
+assert.deepEqual((await call("clip_get", { clip_id: clipId })).location, { view: "session", ...bassRef,
+  scene_index: 0, scene_id: scenes[0].id, scene_name: "Verse", clip_slot_id: (await slotsOf(midiTrackId))[0].id });
+assert.deepEqual((await call("clip_get", { clip_id: arrClip.id })).location, { view: "arrangement", ...bassRef });
+assert.deepEqual((await call("clip_get", { clip_id: takeClip.id })).location,
+  { view: "take_lane", ...bassRef, take_lane_id: lane.id, take_lane_name: "Take 1", take_lane_index: 0 });
+const kitRef = { track_id: kitT.id, track_name: "Kit 2", track_index: 6, track_type: "midi" };
+assert.deepEqual((await call("device_get", { device_id: kickK.id })).location, { ...kitRef,
+  path: "Kit 2 > Drum Rack > pad 36 > Simpler", device_index: 0, chain_id: padK.id, rack_device_id: rackK });
+assert.deepEqual((await call("device_get", { device_id: reverbK })).location, { ...kitRef, path: "Kit 2 > Reverb", device_index: 1 });
+assert.deepEqual((await call("device_get", { device_id: returnFx.id })).location,
+  { track_id: song.return_tracks[0].id, track_name: "A-Reverb", track_type: "return", path: "A-Reverb > Reverb", device_index: 0 });
+assert.deepEqual((await call("chain_get", { chain_id: emptyPad.id })).location,
+  { ...kitRef, path: "Kit 2 > Drum Rack > pad 38", rack_device_id: rackK, chain_index: 1 });
+
+// --- the user's selection, handed over through context menus -----------------
+const selectMenus = calls.menus.filter((m) => m.title === SELECT_TITLE);
+assert.deepEqual(selectMenus.map((m) => m.scope).sort(), ["AudioClip", "AudioTrack", "AudioTrack.ArrangementSelection",
+  "ClipSlot", "ClipSlotSelection", "DrumRack", "MidiClip", "MidiTrack", "MidiTrack.ArrangementSelection", "Sample",
+  "Scene", "Simpler"]);
+assert.ok(selectMenus.every((m) => m.commandId === `ableton-live-mcp.select.${m.scope}`));
+let sel = await call("selection_get");
+assert.deepEqual([sel.captured, sel.seq], [false, 0]);
+assert.match(sel.hint, /"MCP: Use as selection"/);
+
+// a clicked clip: id, summary and location
+fixtures.contextMenu("MidiClip", clipId);
+sel = await call("selection_get");
+assert.deepEqual([sel.captured, sel.seq, sel.scope, sel.kind, sel.items.length], [true, 1, "MidiClip", "object", 1]);
+assert.ok(sel.age_s >= 0 && sel.age_s < 5 && Math.abs(Date.parse(sel.captured_at) - Date.now()) < 5000);
+assert.deepEqual([sel.items[0].id, sel.items[0].class, sel.items[0].name], [clipId, "MidiClip", "Bassline"]);
+assert.deepEqual(sel.items[0].location, (await call("clip_get", { clip_id: clipId })).location);
+// a clip-slot selection: each slot with its clip; a handle Live cannot resolve is reported, not fatal
+assert.equal((await slotsOf(midiTrackId))[1].id, emptySlotId);
+fixtures.contextMenu("ClipSlotSelection", { slots: [(await slotsOf(synthIn))[1].id, emptySlotId, fixtures.bogusHandle()] });
+sel = await call("selection_get");
+assert.deepEqual([sel.seq, sel.kind, sel.items.length], [2, "clip_slots", 3]);
+assert.deepEqual([sel.items[0].class, sel.items[0].clip.id, sel.items[0].location.track_id, sel.items[0].location.scene_name],
+  ["ClipSlot", hook.id, synthIn, "Chorus"]);
+assert.deepEqual([sel.items[1].id, sel.items[1].clip, sel.items[1].location.track_name, sel.items[1].location.scene_index],
+  [emptySlotId, null, "Bass 2", 1]);
+assert.match(sel.items[2].error, /^Live could not resolve the object: /);
+// an arrangement time selection (here dragged right to left): the selected lanes with the clips overlapping it
+fixtures.contextMenu("MidiTrack.ArrangementSelection", { start: 19, end: 15, lanes: [midiTrackId, lane.id] });
+sel = await call("selection_get");
+assert.deepEqual([sel.kind, sel.time_selection, sel.items], ["arrangement", { start_time: 15, end_time: 19, length: 4 }, undefined]);
+assert.deepEqual(sel.lanes.map((l) => [l.id, l.class, l.name, l.clips.map((c) => c.id)]),
+  [[midiTrackId, "MidiTrack", "Bass 2", [arrClip.id]], [lane.id, "TakeLane", "Take 1", [takeClip.id]]]);
+assert.deepEqual(sel.lanes[1].location, (await call("clip_get", { clip_id: takeClip.id })).location);
+fixtures.contextMenu("AudioTrack.ArrangementSelection", { start: 40, end: 40, lanes: [audioTrackId] });
+sel = await call("selection_get");
+assert.deepEqual(sel.lanes[0].clips, [], "no clip at beat 40");
+// devices, samples, scenes, tracks
+fixtures.contextMenu("Sample", kickSample.id);
+sel = await call("selection_get");
+assert.deepEqual(sel.items[0], { id: kickSample.id, class: "Sample", file_path: presentWav,
+  location: { simpler_device_id: kickK.id, ...(await call("device_get", { device_id: kickK.id })).location } });
+fixtures.contextMenu("Simpler", kickK.id);
+sel = await call("selection_get");
+assert.deepEqual([sel.scope, sel.items[0].id, sel.items[0].sample.file_path, sel.items[0].location.path],
+  ["Simpler", kickK.id, presentWav, "Kit 2 > Drum Rack > pad 36 > Simpler"]);
+fixtures.contextMenu("DrumRack", rackK);
+sel = await call("selection_get");
+assert.deepEqual([sel.items[0].is_drum_rack, sel.items[0].location], [true, { ...kitRef, path: "Kit 2 > Drum Rack", device_index: 0 }]);
+fixtures.contextMenu("Scene", scenes[1].id);
+sel = await call("selection_get");
+assert.deepEqual(sel.items[0], { class: "Scene", ...scenes[1] });
+fixtures.contextMenu("AudioTrack", audioTrackId);
+sel = await call("selection_get");
+assert.deepEqual([sel.items[0].class, sel.items[0].type, sel.items[0].location],
+  ["AudioTrack", "audio", { track_id: audioTrackId, track_name: "Drums", track_index: 1, track_type: "audio" }]);
+fixtures.contextMenu("AudioClip", audioClip.id);
+sel = await call("selection_get");
+assert.deepEqual(sel.items[0].location, { view: "arrangement", track_id: audioTrackId, track_name: "Drums", track_index: 1, track_type: "audio" });
+fixtures.contextMenu("ClipSlot", emptySlotId);
+assert.deepEqual((await call("selection_get")).items[0].location.clip_slot_id, emptySlotId);
+// a captured id works in every tool; an object deleted since reports an error
+const tempTrack = fixtures.addTrack({ kind: "audio", name: "Temp Sel" });
+fixtures.contextMenu("AudioTrack", tempTrack);
+assert.equal((await call("track_get", { track_id: tempTrack, include: [] })).name, "Temp Sel");
+await call("track_delete", { track_id: tempTrack });
+sel = await call("selection_get");
+assert.deepEqual([sel.items[0].id, sel.items[0].class], [tempTrack, "AudioTrack"]);
+assert.match(sel.items[0].error, /was it deleted or moved since it was captured\?/);
+// arguments that are not what the API documents are reported; JSON cannot forge a handle
+calls.commands["ableton-live-mcp.select.ClipSlotSelection"]({ nope: true });
+sel = await call("selection_get");
+assert.deepEqual([sel.items, sel.problems], [[], ["the argument has no selected_clip_slots list"]]);
+calls.commands["ableton-live-mcp.select.MidiTrack.ArrangementSelection"]({ selected_lanes: [] });
+sel = await call("selection_get");
+assert.deepEqual([sel.time_selection, sel.problems], [undefined, ["the argument has no numeric time_selection_start / time_selection_end"]]);
+await call("execute_command", { command_id: "ableton-live-mcp.select.MidiClip", args: [{ id: clipId }] });
+sel = await call("selection_get");
+assert.deepEqual(sel.items, [{ error: "Live passed an object without a bigint id where an object handle was expected" }]);
+
+// selection_wait: wakes up on the next capture...
+const seqNow = sel.seq;
+const waiting = call("selection_wait", { after_seq: seqNow, timeout_s: 10 });
+await new Promise((r) => setTimeout(r, 200));
+fixtures.contextMenu("MidiTrack", midiTrackId);
+sel = await waiting;
+assert.deepEqual([sel.seq, sel.scope, sel.items[0].id], [seqNow + 1, "MidiTrack", midiTrackId]);
+// ...returns at once for a capture newer than after_seq (one never handed out counts as the latest)...
+assert.equal((await call("selection_wait", { after_seq: seqNow, timeout_s: 5 })).seq, seqNow + 1);
+const futureWait = call("selection_wait", { after_seq: 999, timeout_s: 10 });
+await new Promise((r) => setTimeout(r, 200));
+calls.commands["ableton-live-mcp.select.Scene"]();
+sel = await futureWait;
+assert.deepEqual([sel.seq, sel.items], [seqNow + 2, [{ error: "Live passed nothing where an object handle was expected" }]]);
+// ...and by default waits for a capture after the call, or times out
+const waitStart = Date.now();
+sel = await call("selection_wait", { timeout_s: 1 });
+assert.deepEqual([sel.timed_out, sel.captured, sel.seq], [true, true, seqNow + 2]);
+assert.ok(Date.now() - waitStart >= 900, "waited for the timeout");
+await usageError("selection_wait", { timeout_s: 56 }, /Input validation error/);
+// a client that goes away stops the wait (the request is aborted, nothing breaks)
+const abort = new AbortController();
+const abandoned = fetch(`http://127.0.0.1:${PORT}/mcp`, {
+  method: "POST", signal: abort.signal,
+  headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "selection_wait", arguments: { timeout_s: 30 } } }),
+}).catch((e) => e.name);
+await new Promise((r) => setTimeout(r, 100));
+abort.abort();
+assert.equal(await abandoned, "AbortError");
+assert.equal((await call("selection_get")).seq, seqNow + 2);
+
+// --- song_audit ----------------------------------------------------------------
+const snareK = await call("device_insert", { target_id: (await call("rack_insert_chain", { rack_device_id: rackK, index: 2 })).id, device_name: "Simpler" });
+await call("simpler_replace_sample", { simpler_device_id: snareK.id, file_path: missingWav });
+const emptySimpler = await call("device_insert", { track_id: synthIn, device_name: "Simpler" });
+const relClip = await call("clip_create", { type: "audio", track_id: audioTrackId, start_time: 64, file_path: "relative.wav", import_into_project: false });
+const okClip = await call("clip_create", { type: "audio", track_id: audioTrackId, start_time: 72, file_path: presentWav, import_into_project: false });
+const twin = fixtures.addTrack({ kind: "audio", name: "bass 2" });
+let audit = await call("song_audit");
+const missingClips = [...drumsArr.map((c) => c.id), relClip.id];
+assert.deepEqual(audit.counts, { missing_media: missingClips.length + 1, empty_simplers: 1, empty_drum_chains: 1, duplicate_track_names: 1 });
+assert.equal(audit.issue_count, missingClips.length + 4);
+const snareLocation = (await call("device_get", { device_id: snareK.id })).location;
+assert.deepEqual(audit.missing_media.find((m) => m.kind === "simpler_sample"), {
+  kind: "simpler_sample", device_id: snareK.id, sample_id: audit.missing_media.find((m) => m.kind === "simpler_sample").sample_id,
+  file_path: missingWav, problem: "file not found", location: { ...kitRef, path: snareLocation.path },
+});
+assert.equal(snareLocation.path, "Kit 2 > Drum Rack > pad 60 > Simpler");
+const clipEntries = audit.missing_media.filter((m) => m.kind === "audio_clip");
+assert.deepEqual(clipEntries.map((m) => m.clip_id), missingClips);
+assert.deepEqual(clipEntries.at(-1), { kind: "audio_clip", clip_id: relClip.id, clip_name: "", file_path: "relative.wav",
+  problem: "not an absolute path, so it could not be checked",
+  location: { view: "arrangement", track_id: audioTrackId, track_name: "Drums", track_index: 1, track_type: "audio" } });
+assert.ok(clipEntries.slice(0, -1).every((m) => m.problem === "file not found"));
+assert.ok(!audit.missing_media.some((m) => m.clip_id === okClip.id || m.file_path === presentWav), "present files pass");
+assert.deepEqual(audit.empty_simplers, [{ device_id: emptySimpler.id,
+  location: { track_id: synthIn, track_name: "Lead Synth", track_index: 3, track_type: "midi", path: "Lead Synth > Simpler" } }]);
+assert.deepEqual(audit.empty_drum_chains.map((c) => [c.id, c.receiving_note_name, c.rack_device_id, c.location.path]),
+  [[emptyPad.id, "D1", rackK, "Kit 2 > Drum Rack > pad 38"]]);
+assert.deepEqual(audit.duplicate_track_names, [{ name: "Bass 2", case_differs: true, tracks: [
+  bassRef, { track_id: twin, track_name: "bass 2", track_index: 7, track_type: "audio" }] }]);
+assert.deepEqual([audit.truncated, audit.incomplete, audit.searched.tracks, audit.searched.files], [undefined, undefined, 10, 5]);
+audit = await call("song_audit", { checks: ["duplicate_track_names", "empty_simplers"] });
+assert.deepEqual([Object.keys(audit.counts), audit.missing_media, audit.empty_drum_chains, audit.issue_count],
+  [["empty_simplers", "duplicate_track_names"], undefined, undefined, 2]);
+
+// clean up: groups take their tracks with them
+for (const id of [busId, kitT.id, twin]) await call("track_delete", { track_id: id });
+for (const id of [relClip.id, okClip.id, takeClip.id]) await call("clip_delete", { clip_id: id });
+await call("device_delete", { device_id: returnFx.id });
+await call("cue_point_delete", { cue_point_id: drop.id });
+assert.deepEqual((await tracksNow()).map((t) => t.name), ["Bass 2", "Drums"]);
+
 // ui + commands; the status command and its menu entries are registered
 await call("execute_command", { command_id: "ableton-live-mcp.status" });
 assert.equal(calls.dialogs.length, 1);
 const statusPage = decodeURIComponent(calls.dialogs[0].url);
 assert.match(statusPage, new RegExp(`http://127\\.0\\.0\\.1:${PORT}/mcp`));
 assert.ok(statusPage.includes(path.join(storageDir, "config.json")), "status shows the config path");
-assert.deepEqual(calls.menus.map((m) => m.scope).sort(), ["AudioTrack", "MidiTrack"]);
-assert.ok(calls.menus.every((m) => m.commandId === "ableton-live-mcp.status"));
+const statusMenus = calls.menus.filter((m) => m.title === "Ableton Live MCP: Status");
+assert.deepEqual(statusMenus.map((m) => m.scope).sort(), ["AudioTrack", "MidiTrack"]);
+assert.ok(statusMenus.every((m) => m.commandId === "ableton-live-mcp.status"));
+assert.equal(calls.menus.length, 14, "2 status entries + 12 selection entries");
 const dlg = await call("show_dialog", { html: "<b>hi</b>" });
 assert.equal(dlg.result, "mock-dialog-result");
 
@@ -1358,7 +1678,7 @@ fs.writeFileSync(path.join(storageDir2, "config.json"), JSON.stringify({ port: P
 const second = { dialogs: [], commands: {}, menus: [] };
 activate(makeActivation(storageDir2, storageDir2, second));
 assert.ok(second.commands["ableton-live-mcp.status"], "status command registered before listen");
-assert.equal(second.menus.length, 2, "context-menu entries registered before listen");
+assert.equal(second.menus.length, 14, "context-menu entries registered before listen");
 let failedPage = "";
 for (let i = 0; i < 50 && !failedPage.includes("EADDRINUSE"); i++) {
   await new Promise((r) => setTimeout(r, 20));
