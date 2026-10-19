@@ -42,6 +42,21 @@ function arg(description: string, complete?: (value: string) => string[]) {
   const cb = (value: string | undefined) => complete(value ?? "");
   return completable(completable(z.string(), cb).optional().describe(description), cb);
 }
+
+// The longest prompt argument: far more than any real one (64 sections of
+// 100-character names), and short enough that parsing it stays instant.
+// Checked here rather than with a zod max, whose error the SDK reports with
+// its "MCP error" prefix twice.
+const MAX_ARG_LENGTH = 8000;
+
+// Renders a prompt after checking the arguments' length.
+export function renderPrompt(p: PromptDef, args: Record<string, string | undefined>, env: PromptEnv): string {
+  for (const [name, value] of Object.entries(args))
+    if (typeof value === "string" && value.length > MAX_ARG_LENGTH)
+      throw new UsageError(`${name}: at most ${MAX_ARG_LENGTH} characters, got ${value.length}.`);
+  return p.render(args, env);
+}
+
 const startingWith = (options: string[]) => (value: string) =>
   options.filter((o) => o.toLowerCase().startsWith(value.trim().toLowerCase()));
 
@@ -68,6 +83,15 @@ const list = (text: string) =>
     .split(/[,;\n]+/)
     .map((s) => s.trim())
     .filter(Boolean);
+// "name:value" → [name, value], split at the last colon; an entry without a
+// colon, or whose value would contain a space, is all name. A plain scan, not
+// a regex: a backtracking pattern takes quadratic time on long entries.
+function nameValue(entry: string): [string, string | undefined] {
+  const i = entry.lastIndexOf(":");
+  const value = i < 0 ? "" : entry.slice(i + 1).trim();
+  if (i < 0 || /\s/.test(value)) return [entry.trim(), undefined];
+  return [entry.slice(0, i).trim(), value];
+}
 
 const TRACK_STEP =
   "Live inserts a new track after the selected one, so go by the returned `index`/`id`, not by position";
@@ -82,11 +106,10 @@ const DEFAULT_SECTION_BARS = 8;
 
 function parseSections(text: string) {
   const sections = list(text).map((entry) => {
-    const m = /^(.*?)\s*:\s*(\S*)$/.exec(entry);
-    const name = (m ? m[1] : entry).trim();
+    const [name, count] = nameValue(entry);
     if (!name || name.length > 100)
       throw new UsageError(`sections: ${quote(entry)} needs a name of 1-100 characters, e.g. "Verse:16".`);
-    const bars = m ? intArg(m[2], `sections: the bars of ${quote(name)}`, 1, 512, DEFAULT_SECTION_BARS) : DEFAULT_SECTION_BARS;
+    const bars = intArg(count, `sections: the bars of ${quote(name)}`, 1, 512, DEFAULT_SECTION_BARS);
     return { name, bars };
   });
   if (!sections.length) throw new UsageError('sections: give at least one, e.g. "Intro:8, Verse:16".');
@@ -96,9 +119,8 @@ function parseSections(text: string) {
 
 function parseTracks(text: string) {
   return list(text).map((entry) => {
-    const m = /^(.*?)\s*:\s*(\S*)$/.exec(entry);
-    const name = (m ? m[1] : entry).trim();
-    const type = (m ? m[2] : "midi").toLowerCase();
+    const [name, given] = nameValue(entry);
+    const type = (given ?? "midi").toLowerCase();
     if (!name || name.length > 100) throw new UsageError(`tracks: ${quote(entry)} needs a name of 1-100 characters.`);
     if (type !== "midi" && type !== "audio")
       throw new UsageError(`tracks: the type of ${quote(name)} is "midi" or "audio", got ${quote(type)}.`);
@@ -250,7 +272,7 @@ function usesFlats(root: number, intervals: number[], written = "") {
 type Key = { root: number; intervals: number[]; name: string; flats: boolean };
 
 function parseKey(text: string): Key {
-  const m = /^([A-Ga-g])([#b♯♭]?)\s*(.*)$/.exec(text.trim());
+  const m = /^([A-Ga-g])([#b♯♭]?)([^]*)$/.exec(text.trim());
   const rest = m ? m[3].trim() : "";
   const mode = rest === "M" ? "major" : (lookup(MODE_ALIASES, rest.toLowerCase()) ?? rest.toLowerCase().replace(/\s+/g, " "));
   const intervals = lookup(MODES, mode);

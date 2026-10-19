@@ -55,8 +55,8 @@ import { bearerMatches, configFilePath, lock, readConfig, type Config } from "./
 import { UsageError } from "./errors.js";
 import INSTRUCTIONS from "./instructions.md";
 import SKILL from "../skills/ableton-live/SKILL.md";
-import { PROMPTS, type PromptEnv } from "./prompts.js";
-import { renderNotes, type Region } from "./region.js";
+import { PROMPTS, renderPrompt, type PromptEnv } from "./prompts.js";
+import { renderNotes, sessionClipLength, sessionLoopMismatch, type Region } from "./region.js";
 import { AUDIO_EXTENSIONS, configRoots, libraryRoots, searchSamples } from "./samples.js";
 import { SelectionStore, registerSelectionMenus, type Selection } from "./selection.js";
 import { remember, resolve } from "./store.js";
@@ -125,6 +125,9 @@ const SET: ToolAnnotations = {
   idempotentHint: true,
   openWorldHint: false,
 };
+// Sets values, or with `delta` adds to them (parameter_set, device_set): a
+// repeated call with a delta moves the value again, so it is not idempotent.
+const SET_RELATIVE: ToolAnnotations = { ...SET, idempotentHint: false };
 // Adds objects (tracks, clips, devices, ...); each call adds another one.
 const CREATE: ToolAnnotations = {
   readOnlyHint: false,
@@ -728,9 +731,11 @@ type Preset = z.infer<typeof presetSchema>;
 // on every OS: letters (with combining marks), digits, spaces and a few
 // punctuation marks, starting with a letter or digit (so never ".", ".." or a
 // hidden file), not ending in a dot (Windows drops those), and not a Windows
-// device name. Path separators, ":" and control characters can never pass.
+// device name: COM and LPT also take the superscript digits ¹ ² ³, which \p{N}
+// lets through, and Windows ignores spaces before the extension ("NUL .x").
+// Path separators, ":" and control characters can never pass.
 const PRESET_NAME = /^[\p{L}\p{N}][\p{L}\p{M}\p{N} _\-.,()'+&#]*$/u;
-const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+const WINDOWS_DEVICE_NAME = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]) *(\..*)?$/i;
 
 function presetBaseName(raw: string): string {
   const name = raw.normalize("NFC").trim();
@@ -934,8 +939,9 @@ function buildServer(
     "song_get",
     { title: "Get Live Set", annotations: READ },
     "Get the state of the current Live Set: tempo, scale, grid, all tracks " +
-      "(with ids, `index`, and the group hierarchy: `depth`, `group_track_id`, type " +
-      "'group' with `child_track_ids` for group tracks), return tracks (with " +
+      "(with ids, `index`, and the group hierarchy: `depth`, `group_track_id`, " +
+      "`is_group`, and `child_track_ids` for group tracks — whose `type` is 'other'), " +
+      "return tracks (with " +
       "`send_index`), main track, scenes, cue points, and extension environment " +
       "info. This is the entry point — object ids returned here are used by every " +
       "other tool. Times are in beats throughout the API. Use `include` to fetch " +
@@ -1014,7 +1020,7 @@ function buildServer(
   // The group hierarchy of song_get's track entries, from their group_track_id:
   // `depth` (0 = top level) on every track, `child_track_ids` (direct children,
   // in track order) on group tracks.
-  function groupHierarchy<T extends { id: string; type: string; group_track_id: string | null }>(rows: T[]) {
+  function groupHierarchy<T extends { id: string; is_group: boolean; group_track_id: string | null }>(rows: T[]) {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const children = new Map<string, string[]>();
     for (const r of rows)
@@ -1022,7 +1028,7 @@ function buildServer(
     return rows.map((r) => {
       let depth = 0;
       for (let g = r.group_track_id; g !== null && depth < 64; g = byId.get(g)?.group_track_id ?? null) depth++;
-      return { ...r, depth, child_track_ids: r.type === "group" ? (children.get(r.id) ?? []) : undefined };
+      return { ...r, depth, child_track_ids: r.is_group ? (children.get(r.id) ?? []) : undefined };
     });
   }
 
@@ -1471,10 +1477,13 @@ function buildServer(
     return track.handle.id === s.mainTrack.handle.id ? "main" : "other";
   }
 
-  // trackSummary with type "group" for group tracks (return and main tracks
-  // keep "other" here; song_get labels them by section).
-  const summarizeTrack = (track: Track<"1.0.0">, regular = song().tracks) =>
-    trackSummary(track, isGroupTrack(track, regular) ? "group" : undefined);
+  // trackSummary plus `is_group`. A group track's `type` stays "other", as it
+  // was before `is_group` existed (return and main tracks are "other" too
+  // here; song_get labels them by section).
+  const summarizeTrack = (track: Track<"1.0.0">, regular = song().tracks) => ({
+    ...trackSummary(track),
+    is_group: isGroupTrack(track, regular),
+  });
 
   // A track as locations name it: track_index only for regular tracks.
   function trackRef(track: Track<"1.0.0">, regular = song().tracks) {
@@ -2088,7 +2097,8 @@ function buildServer(
     "Get detail for one track: properties, clip slots (session view, with " +
       "clips), take lanes, arrangement clips, devices, and mixer (volume/pan/sends " +
       "with current values). Works for regular, return, and main tracks; group " +
-      "tracks have type 'group' (return and main tracks 'other'). Address " +
+      "tracks have `is_group: true` (their `type`, like return and main tracks', is " +
+      "'other'). Address " +
       "by track_id, track_index (0-based, regular tracks only), or track_name. " +
       "Use `include` to fetch only some sections.",
     {
@@ -2868,7 +2878,7 @@ function buildServer(
       "(requires start_time). MIDI clips require duration and can be created with " +
       "their notes inline: `notes`, step `patterns` (one pitch per string, e.g. " +
       "{note:\"C1\", steps:\"x...x...\"}) and `repeat` {length} to copy them along " +
-      "the clip (file_path, is_warped and loop_settings are rejected). " +
+      "the clip (file_path, is_warped and loop_settings are ignored, with a `warning`). " +
       "Audio clips require file_path; by default the file is first imported " +
       "into the Live project (recommended). Optional name/color apply right " +
       "after creation.",
@@ -2909,12 +2919,15 @@ function buildServer(
         .describe("Audio only: copy the file into the Live project first"),
     },
     async (args) => {
+      // Audio-only fields on a MIDI clip are ignored, as they always were
+      // (callers may build both types from one template); the result says so.
+      let warning: string | undefined;
       if (args.type === "midi") {
         const audioOnly = (["file_path", "is_warped", "loop_settings"] as const).filter(
           (k) => args[k] !== undefined,
         );
         if (audioOnly.length)
-          throw new UsageError(`MIDI clips take no ${audioOnly.join(", ")} (audio clips only).`);
+          warning = `${audioOnly.join(", ")} only apply to audio clips: ignored for this MIDI clip.`;
       } else {
         const midiOnly = (["notes", "patterns", "repeat"] as const).filter((k) => args[k] !== undefined);
         if (midiOnly.length) throw new UsageError(`${midiOnly.join(", ")} only apply to MIDI clips.`);
@@ -2947,7 +2960,7 @@ function buildServer(
           );
         }
         if (notes.length) clip.notes = notes;
-        return finish(clip);
+        return finish(clip, { warning });
       }
 
       need(args.file_path, "file_path");
@@ -3240,9 +3253,13 @@ function buildServer(
       "longer MIDI copy repeats the source's loop (or its region, when it does not loop), a " +
       "longer audio copy only repeats a looping source (Live caps the others). MIDI: the notes are " +
       "re-based to where the source plays them — the copy starts at its first played beat, " +
-      "since the API cannot set a MIDI clip's markers or loop — so it plays the same; " +
-      "`fidelity` is 'notes'. Audio: the copy uses the source's file, warping, warp mode and " +
-      "markers/loop (as Live allows them for a new clip); Live warps it itself, so " +
+      "since the API cannot set a MIDI clip's markers or loop — and `fidelity` is 'notes'. " +
+      "In the arrangement the copy plays the same. A session copy of a looping clip loops " +
+      "its whole length, so it only repeats like the source when the source's start marker " +
+      "is inside its loop and the copy holds whole loops; otherwise `lost` says what differs. " +
+      "A session MIDI source's default length comes from its markers (its first pass: any " +
+      "part before the loop, then the loop once). Audio: the copy uses the source's file, " +
+      "warping, warp mode and markers/loop (as Live allows them for a new clip); Live warps it itself, so " +
       "`fidelity` is 'approximate', `warp_markers_match` says whether it warped like the " +
       "source and `differs` lists region fields (or the length) Live set otherwise. `lost` lists what no copy " +
       "carries over (envelopes, groove, launch settings, ...). name and color default to the " +
@@ -3312,10 +3329,12 @@ function buildServer(
           `A ${kind} clip can only be copied to a ${kind} track; ${describeTrack(holder!)} is of type ` +
             `${trackKind(holder!)}.`,
         );
-      const length = args.duration ?? num(source.duration);
+      const home = parentOf(source);
+      const region = regionOf(source);
+      const length =
+        args.duration ?? (midi && home instanceof ClipSlot ? sessionClipLength(region) : num(source.duration));
       if (!(length > 0)) throw new Error(`Clip ${args.clip_id} has no length (${length} beats), so it cannot be copied.`);
       const start = args.start_time ?? 0;
-      const home = parentOf(source);
       if (
         args.move &&
         !(target instanceof ClipSlot) &&
@@ -3332,7 +3351,6 @@ function buildServer(
         };
 
       // Everything the copy needs is read before the first write.
-      const region = regionOf(source);
       const props: CopyProps = {
         name: args.name ?? source.name,
         color: color ?? num(source.color),
@@ -3341,6 +3359,7 @@ function buildServer(
       };
       const notes = source instanceof MidiClip ? renderNotes(source.notes, region, 0, length, MAX_EXPANDED_NOTES) : undefined;
       const spec = source instanceof AudioClip ? audioCopySpec(source) : undefined;
+      const loopMismatch = midi && target instanceof ClipSlot ? sessionLoopMismatch(region, length) : undefined;
       const laneClips = target instanceof Track ? target.arrangementClips : target instanceof TakeLane ? target.clips : [];
       const overlaps = clipsInRange(laneClips, start, start + length)
         .filter((c) => !(args.move && c.handle.id === source.handle.id))
@@ -3393,7 +3412,7 @@ function buildServer(
         source_id: args.clip_id,
         moved,
         fidelity: spec ? "approximate" : "notes",
-        lost: spec ? spec.lost : CLIP_COPY_LOST,
+        lost: spec ? spec.lost : loopMismatch ? [...CLIP_COPY_LOST, loopMismatch] : CLIP_COPY_LOST,
         ...(spec && copy instanceof AudioClip
           ? audioCopyCheck(copy, spec, target instanceof ClipSlot ? undefined : length)
           : {}),
@@ -3992,13 +4011,17 @@ function buildServer(
     }
   }
 
-  const importSampleSchema = z
-    .boolean()
-    .default(true)
-    .describe(
-      "Copy the sample into the Live project first and load the copy (recommended: the set keeps " +
-        "working when it is moved or the original is deleted)",
-    );
+  // import_into_project: on by default where a sample is new (device_insert
+  // sample_path, drum_kit_build); off by default on simpler_replace_sample,
+  // which loaded the file as it is before the parameter existed.
+  const importSampleSchema = (byDefault: boolean) =>
+    z
+      .boolean()
+      .default(byDefault)
+      .describe(
+        "Copy the sample into the Live project first and load the copy (recommended: the set keeps " +
+          `working when it is moved or the original is deleted); default ${byDefault}`,
+      );
 
   tool(
     "device_insert",
@@ -4024,7 +4047,7 @@ function buildServer(
         .min(1)
         .optional()
         .describe("Simpler only: absolute path of an audio file to load into it"),
-      import_into_project: importSampleSchema,
+      import_into_project: importSampleSchema(true),
       parameters: z.array(initialParameter).min(1).optional().describe("Initial parameter values"),
     },
     async ({ device_name, index, sample_path, import_into_project, parameters, ...address }) => {
@@ -4065,7 +4088,7 @@ function buildServer(
 
   tool(
     "device_set",
-    { title: "Set device", annotations: SET },
+    { title: "Set device", annotations: SET_RELATIVE },
     "Switch a device on or off and/or set several of its parameters, in one call and " +
       "one undo step (nothing is changed if any entry is invalid). Address the device " +
       "by device_id, or by its track (track_id/track_index/track_name) and `device`: a " +
@@ -4604,11 +4627,11 @@ function buildServer(
     "simpler_replace_sample",
     { title: "Replace Simpler sample", annotations: DESTRUCTIVE },
     "Replace the sample loaded in a Simpler device with another audio file " +
-      "(absolute path). By default the file is first copied into the Live project " +
-      "(import_into_project) and the copy is loaded, so the set keeps working when it is " +
-      "moved or the original is deleted; the result's file_path is then the copy's and " +
-      "`imported_path` is set.",
-    { simpler_device_id: z.string(), file_path: z.string(), import_into_project: importSampleSchema },
+      "(absolute path). The file is loaded as it is; with import_into_project:true " +
+      "(recommended) it is first copied into the Live project and the copy is loaded, so " +
+      "the set keeps working when it is moved or the original is deleted — the result's " +
+      "file_path is then the copy's and `imported_path` is set.",
+    { simpler_device_id: z.string(), file_path: z.string(), import_into_project: importSampleSchema(false) },
     async ({ simpler_device_id, file_path, import_into_project }) => {
       // The Simpler is checked first, so a bad id leaves no copy in the project.
       const simpler = resolve(simpler_device_id, Simpler);
@@ -4651,7 +4674,7 @@ function buildServer(
         )
         .min(1)
         .max(MAX_KIT_PADS),
-      import_into_project: importSampleSchema,
+      import_into_project: importSampleSchema(true),
     },
     async ({ pads, rack_device_id, import_into_project, ...address }) => {
       // 0. Check everything before the first change.
@@ -4915,7 +4938,7 @@ function buildServer(
 
   tool(
     "parameter_set",
-    { title: "Set parameter values", annotations: SET },
+    { title: "Set parameter values", annotations: SET_RELATIVE },
     "Set one or more device or mixer parameters in one undo step; nothing is changed if " +
       "any entry is invalid. Each entry addresses its parameter by parameter_id, or by " +
       "device and name as in parameter_get ({device_id | track + device, parameter}), " +
@@ -4996,13 +5019,17 @@ function buildServer(
     return writes;
   }
 
-  // all_tracks selection. Setting a group track already changes how its tracks
-  // sound, so only the top-most tracks are set: a track inside a group that is
-  // set is "covered" and left alone, so nothing is applied twice. Excluded
-  // tracks and everything inside an excluded group are left alone; a group that
-  // contains an excluded track is not set either (that would change the
-  // excluded track too) — its other tracks are set one by one instead.
-  function topmostTracks(exclude: TrackAddress[]) {
+  // all_tracks selection. A group's volume already changes how loud its tracks
+  // are, so volume is set on the top-most tracks only: a track inside a group
+  // that is set is "covered" and keeps its own volume, so the change is not
+  // applied twice. Panning and sends are each track's own (a grouped track's
+  // sends go straight to the return tracks), so with `perTrack` (panning or
+  // sends are set) a covered track is selected too, marked `coveredBy`, and
+  // only its volume is left alone. Excluded tracks and everything inside an
+  // excluded group are left alone; a group that contains an excluded track is
+  // not set either (that would change the excluded track too) — its other
+  // tracks are set one by one instead.
+  function topmostTracks(exclude: TrackAddress[], perTrack: boolean) {
     const excluded = new Set(exclude.map((a, i) => at(`exclude[${i}]`, () => findTrack(a)).handle.id));
     const tracks = song().tracks.map((track) => {
       const groups: Track<"1.0.0">[] = []; // innermost first
@@ -5014,7 +5041,7 @@ function buildServer(
         .filter(({ track }) => excluded.has(track.handle.id))
         .flatMap(({ groups }) => groups.map((g) => g.handle.id)),
     );
-    const selected: Track<"1.0.0">[] = [];
+    const selected: Array<{ track: Track<"1.0.0">; coveredBy?: string }> = [];
     const skipped: Array<{ track_id: string; name: string; reason: string }> = [];
     for (const { track, groups } of tracks) {
       const skip = (reason: string) => skipped.push({ track_id: remember(track), name: track.name, reason });
@@ -5025,9 +5052,11 @@ function buildServer(
       else if (excludedGroup) skip(`inside the excluded group ${JSON.stringify(excludedGroup.name)}`);
       else if (holdsExcluded.has(track.handle.id))
         skip("group containing an excluded track; its other tracks are set instead");
-      else if (setGroups.length)
-        skip(`covered by its group ${JSON.stringify(setGroups[setGroups.length - 1].name)}`);
-      else selected.push(track);
+      else if (setGroups.length) {
+        const coveredBy = `covered by its group ${JSON.stringify(setGroups[setGroups.length - 1].name)}`;
+        if (perTrack) selected.push({ track, coveredBy });
+        else skip(coveredBy);
+      } else selected.push({ track });
     }
     return { selected, skipped };
   }
@@ -5042,11 +5071,14 @@ function buildServer(
       "Choose the mixers with ONE of: target_id (Track, Chain, or mixer id) or " +
       "track_id/track_index/track_name; `targets` (the same values on several); " +
       "`all_tracks` (every regular track, minus `exclude`); or `items` (one entry " +
-      "per mixer with its own values). all_tracks sets the top-most tracks only: a " +
-      "group track covers the tracks inside it, which are left alone; tracks inside " +
-      "an excluded group are left alone, and a group holding an excluded track is " +
-      "not set itself — its other tracks are. A single target returns its mixer; " +
-      "the other forms return {items} (plus `skipped` for all_tracks).",
+      "per mixer with its own values). all_tracks sets volume on the top-most tracks " +
+      "only: a group track covers the tracks inside it, which keep their volume " +
+      "(listed in `skipped`, or with `volume_skipped` when they get panning or sends); " +
+      "panning and sends are set on every track, grouped tracks included (a grouped " +
+      "track's sends go straight to the returns). Tracks inside an excluded group are " +
+      "left alone, and a group holding an excluded track is not set itself — its " +
+      "other tracks are. A single target returns its mixer; the other forms return " +
+      "{items} (plus `skipped` for all_tracks).",
     {
       ...mixerTarget,
       ...mixerValues,
@@ -5058,7 +5090,7 @@ function buildServer(
       all_tracks: z
         .boolean()
         .optional()
-        .describe("Apply the top-level values to every regular track (top-most only, see description)"),
+        .describe("Apply the top-level values to every regular track (volume: top-most only, see description)"),
       exclude: z
         .array(z.object(trackAddress))
         .optional()
@@ -5091,7 +5123,12 @@ function buildServer(
         throw new UsageError("Nothing to set — provide volume, panning, and/or sends.");
 
       // Validate every target before the first write.
-      type Plan = { mixer: AnyMixer; owner: DataModelObject<"1.0.0">; writes: Array<() => Promise<void>> };
+      type Plan = {
+        mixer: AnyMixer;
+        owner: DataModelObject<"1.0.0">;
+        writes: Array<() => Promise<void>>;
+        volumeSkipped?: string;
+      };
       let plan: Plan[];
       let skipped: ReturnType<typeof topmostTracks>["skipped"] | undefined;
       if (args.items) {
@@ -5109,13 +5146,15 @@ function buildServer(
           }),
         );
       } else if (args.all_tracks) {
-        const sel = topmostTracks(args.exclude ?? []);
+        const sel = topmostTracks(args.exclude ?? [], args.panning !== undefined || args.sends !== undefined);
         skipped = sel.skipped;
-        plan = sel.selected.map((track) =>
+        plan = sel.selected.map(({ track, coveredBy }) =>
           at(() => `track ${describeTrack(track)}`, () => ({
             mixer: track.mixer,
             owner: track,
-            writes: mixerWrites(track.mixer, args),
+            // a covered track gets the panning and sends, not the volume
+            writes: mixerWrites(track.mixer, coveredBy ? { ...args, volume: undefined } : args),
+            volumeSkipped: coveredBy && args.volume !== undefined ? coveredBy : undefined,
           })),
         );
       } else {
@@ -5127,10 +5166,11 @@ function buildServer(
       if (single) return await mixerDetail(plan[0].mixer);
       return {
         items: await Promise.all(
-          plan.map(async ({ mixer, owner }) => ({
+          plan.map(async ({ mixer, owner, volumeSkipped }) => ({
             target_id: remember(owner),
             name: owner instanceof Track ? owner.name : undefined,
             ...(await mixerDetail(mixer)),
+            volume_skipped: volumeSkipped,
           })),
         ),
         skipped,
@@ -6086,7 +6126,7 @@ function buildServer(
       { title: p.title, description: p.description, argsSchema: p.args(promptEnv) },
       (args) => {
         try {
-          const text = p.render(args as Record<string, string | undefined>, promptEnv);
+          const text = renderPrompt(p, args as Record<string, string | undefined>, promptEnv);
           return { description: p.title, messages: [{ role: "user", content: { type: "text", text } }] };
         } catch (e) {
           throw e instanceof UsageError ? rpcError(ErrorCode.InvalidParams, `${p.name}: ${e.message}`) : e;
@@ -6327,7 +6367,9 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
         sendJsonRpcError(res, 403, -32000, `Forbidden: ${refused}`);
         return;
       }
-      const pathname = (req.url ?? "").split("?")[0];
+      // One trailing slash is accepted ("/mcp/"), as clients are configured either way.
+      const rawPath = (req.url ?? "").split("?")[0];
+      const pathname = rawPath.length > 1 && rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
       if (pathname === "/health") {
         // Unauthenticated: only what any local client may know (no paths, no
         // config details, never the token). 503 while config.json locks /mcp.
@@ -6342,7 +6384,8 @@ export async function startServer(context: Ctx, hostApiVersion: string): Promise
             auth_required: config.tokenDigest !== undefined,
             uptime_s: Math.floor((Date.now() - listeningSince) / 1000),
             error: config.locked
-              ? "config.json has an invalid security setting: every /mcp request is refused (the Status dialog in Live says why)"
+              ? "config.json has an invalid security setting, or cannot be read or parsed: every /mcp request is " +
+                "refused (the Status dialog in Live says why)"
               : undefined,
           }),
         );

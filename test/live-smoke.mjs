@@ -315,7 +315,7 @@ step(`locations: session clip in scene "${clipLoc.scene_name}", chain at "${chai
 const deepSong = await call("song_get", { include: ["devices", "mixer", "clips"] });
 const smokeRow = deepSong.tracks.find((t) => t.id === midi.id);
 assert.ok(smokeRow.devices.length >= 1 && smokeRow.mixer && smokeRow.clips.session.some((c) => c.id === clip.id));
-const groupCount = deepSong.tracks.filter((t) => t.type === "group").length;
+const groupCount = deepSong.tracks.filter((t) => t.is_group).length;
 step(`song_get deep: ${deepSong.tracks.length} tracks (${groupCount} group tracks), ` +
   `${smokeRow.devices[0].name} enabled=${smokeRow.devices[0].enabled}, truncated=${JSON.stringify(deepSong.truncated ?? null)}`);
 const sceneRow = await call("scene_get", { scene_index: 0 });

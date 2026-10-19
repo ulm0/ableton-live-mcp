@@ -83,9 +83,10 @@ const annotationGroups = [
     "parameter_find", "device_preset_list", "scene_get", "session_grid", "arrangement_get", "song_audit",
     "selection_get", "selection_wait", "sample_search", "dialog_result", "batch_read"]],
   [write(false, true), ["song_set", "track_set", "take_lane_set", "scene_set", "cue_point_set",
-    "clip_set", "drum_chain_set", "parameter_set", "mixer_set", "device_set"]],
-  [write(false, false), ["track_create", "track_duplicate", "take_lane_create", "scene_create",
-    "scene_duplicate", "cue_point_create", "clip_create", "device_insert", "device_duplicate",
+    "clip_set", "drum_chain_set", "mixer_set"]],
+  // parameter_set / device_set take `delta`: a repeated call moves the value again
+  [write(false, false), ["parameter_set", "device_set", "track_create", "track_duplicate", "take_lane_create",
+    "scene_create", "scene_duplicate", "cue_point_create", "clip_create", "device_insert", "device_duplicate",
     "rack_insert_chain", "import_file",
     // render_track_audio persist:true imports the render into the project
     "render_track_audio"]],
@@ -228,20 +229,15 @@ assert.equal(newClip.duration, 8);
 assert.equal(newClip.name, "Lead");
 assert.equal(newClip.color, "#00ff88");
 assert.equal(newClip.note_count, 2);
-// midi clips reject audio-only arguments before creating anything
+// midi clips ignore audio-only arguments, as before, and say so in a warning
 const slotsOf = async (id) => (await call("track_get", { track_id: id, include: ["clip_slots"] })).clip_slots;
-const slotClipBefore = (await slotsOf(midiTrackId))[1].clip;
-for (const extra of [{ file_path: "/tmp/kick.wav" }, { is_warped: true },
-  { loop_settings: { looping: false, start_marker: 0, end_marker: 4, loop_start: 0, loop_end: 4 } }]) {
-  const r = await client.callTool({
-    name: "clip_create", arguments: { type: "midi", target_id: emptySlotId, duration: 8, ...extra },
-  });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /audio clips only/);
-  assert.doesNotMatch(r.content[0].text, /stale/);
-}
-assert.deepEqual((await slotsOf(midiTrackId))[1].clip, slotClipBefore);
-assert.equal((await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8 })).class, "MidiClip");
+const templated = await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8, file_path: "/tmp/kick.wav",
+  is_warped: false, loop_settings: { looping: false, start_marker: 0, end_marker: 4, loop_start: 0, loop_end: 4 } });
+assert.deepEqual([templated.class, templated.duration], ["MidiClip", 8]);
+assert.equal(templated.warning, "file_path, is_warped, loop_settings only apply to audio clips: ignored for this MIDI clip.");
+await call("clip_delete", { clip_id: templated.id });
+const plainMidi = await call("clip_create", { type: "midi", target_id: emptySlotId, duration: 8 });
+assert.deepEqual([plainMidi.class, plainMidi.warning], ["MidiClip", undefined]);
 
 // clip_set roundtrip
 const colored = await call("clip_set", { clip_id: newClip.id, name: "Lead 2" });
@@ -303,9 +299,11 @@ const chainDetail = await call("chain_get", { chain_id: chainE.id });
 assert.equal(chainDetail.receiving_note, 36);
 assert.equal(chainDetail.mixer.volume.name, "Volume");
 const simplerE = await call("device_insert", { target_id: chainE.id, device_name: "Simpler" });
-const sampleE = await call("simpler_replace_sample", { simpler_device_id: simplerE.id, file_path: "/tmp/kick.wav" });
-assert.ok(sampleE.file_path.includes("kick.wav"));
-// by default the sample is copied into the project and the copy is loaded
+// by default the file is loaded as it is (as before import_into_project existed)...
+const sampleAsIs = await call("simpler_replace_sample", { simpler_device_id: simplerE.id, file_path: "/tmp/kick.wav" });
+assert.deepEqual([sampleAsIs.file_path, sampleAsIs.imported_path], ["/tmp/kick.wav", undefined]);
+// ...with import_into_project the sample is copied into the project and the copy is loaded
+const sampleE = await call("simpler_replace_sample", { simpler_device_id: simplerE.id, file_path: "/tmp/kick.wav", import_into_project: true });
 assert.deepEqual([sampleE.imported_path, sampleE.file_path],
   ["/mock-project/Samples/Imported/kick.wav", "/mock-project/Samples/Imported/kick.wav"]);
 const deepRack = await call("device_get", { device_id: rackE.id, include_chain_devices: true });
@@ -578,6 +576,28 @@ assert.match(batch.result.skipped.find((x) => x.name === "Drum Bus").reason, /gr
 assert.match(batch.result.skipped.find((x) => x.name === "Perc").reason, /group containing an excluded track/);
 assert.deepEqual(await Promise.all([drumBus, perc, kick, shaker, vocals, lead, backing].map(volumeOf)),
   [0.3, 0.85, 0.2, 0.85, 0.85, 0.85, 0.2]);
+// panning and sends are each track's own (a grouped track's sends go straight to the returns):
+// they are set on grouped tracks too, whose volume stays covered by their group
+const mixOf = async (id) => {
+  const m = await call("mixer_get", { track_id: id });
+  return [m.volume.value, m.panning.value, m.sends[0].value];
+};
+await call("mixer_set", { items: [{ track_id: kick, sends: [{ index: 0, value: 0.7 }], panning: -0.5 },
+  { track_id: shaker, sends: [{ index: 0, value: 0.7 }] }] });
+batch = await undoSteps(() => call("mixer_set", { all_tracks: true, exclude: [{ track_name: "Vocals" }], volume: 0.4,
+  panning: 0, sends: [{ return_name: "A-Reverb", value: 0 }] }));
+assert.equal(batch.steps, 1);
+const covered = 'covered by its group "Drum Bus"';
+assert.deepEqual(batch.result.items.map((x) => [x.name, x.volume_skipped]), [["Bass 2", undefined], ["Drums", undefined],
+  ["Pad 1", undefined], ["Pad", undefined], ["Drum Bus", undefined], ["Kick", covered], ["Perc", covered], ["Shaker", covered]]);
+assert.deepEqual(batch.result.skipped.map((x) => x.name), ["Vocals", "Lead", "Backing"]);
+assert.deepEqual(await Promise.all([drumBus, kick, shaker].map(mixOf)), [[0.4, 0, 0], [0.2, 0, 0], [0.85, 0, 0]]);
+assert.equal((await mixOf(lead))[0], 0.85, "excluded group: left alone");
+// without volume nothing is covered
+const panned = await call("mixer_set", { all_tracks: true, panning: 0.1 });
+assert.equal(panned.items.length, 11, "every regular track");
+assert.ok(panned.items.every((x) => x.volume_skipped === undefined && x.panning.value === 0.1));
+assert.deepEqual(panned.skipped, []);
 await usageError("mixer_set", { all_tracks: true, exclude: [{ track_name: "Vocal" }], volume: 0 }, /exclude\[0\]: No track named "Vocal"/);
 assert.equal(await volumeOf(lead), 0.85, "a mistyped exclude changes nothing");
 await usageError("mixer_set", { track_name: "Drums", exclude: [{ track_name: "Vocals" }], volume: 0 }, /only applies with all_tracks/);
@@ -1009,7 +1029,8 @@ loaded = await call("device_preset_load", { name: "Kick 1", device_id: compId })
 assert.match(loaded.warning, /saved from "Simpler"/);
 assert.deepEqual(loaded.not_applied.map((x) => x.name), ["sample", "Volume", "Transpose"]);
 // names are one safe file name: no traversal, no hidden or reserved names
-for (const bad of ["../evil", "a/b", "..", ".hidden", "CON", "x\\y", "a:b", "", "   ", "trailing.", "x".repeat(65), "tab\there"])
+for (const bad of ["../evil", "a/b", "..", ".hidden", "CON", "x\\y", "a:b", "", "   ", "trailing.", "x".repeat(65), "tab\there",
+  "COM\u00b9", "lpt\u00b3.x", "Com\u00b2", "nul .x", "LPT1"])
   await usageError("device_preset_save", { name: bad, device_id: filterId }, /Invalid preset name|1-64 characters/);
 assert.deepEqual(fs.readdirSync(presetDir).sort(), ["Bright Filter.json", "Kick 1.json"]);
 // letters with combining marks (NFC) are fine
@@ -1272,18 +1293,23 @@ const voxId = fixtures.addTrack({ kind: "audio", name: "Vox", group: subId });
 song = await call("song_get");
 let rowOf = (id) => song.tracks.find((t) => t.id === id);
 assert.deepEqual(song.tracks.map((t) => t.index), [0, 1, 2, 3, 4, 5]);
-assert.deepEqual([rowOf(busId).type, rowOf(busId).depth, rowOf(busId).child_track_ids], ["group", 0, [synthIn, subId]]);
-assert.deepEqual([rowOf(subId).type, rowOf(subId).depth, rowOf(subId).child_track_ids], ["group", 1, [voxId]]);
-assert.deepEqual([rowOf(voxId).type, rowOf(voxId).depth, rowOf(voxId).child_track_ids, rowOf(voxId).group_track_id],
-  ["audio", 2, undefined, subId]);
+// a group track's type stays "other" (as before is_group existed)
+assert.deepEqual([rowOf(busId).type, rowOf(busId).is_group, rowOf(busId).depth, rowOf(busId).child_track_ids], ["other", true, 0, [synthIn, subId]]);
+assert.deepEqual([rowOf(subId).type, rowOf(subId).is_group, rowOf(subId).depth, rowOf(subId).child_track_ids], ["other", true, 1, [voxId]]);
+assert.deepEqual([rowOf(voxId).type, rowOf(voxId).is_group, rowOf(voxId).depth, rowOf(voxId).child_track_ids, rowOf(voxId).group_track_id],
+  ["audio", false, 2, undefined, subId]);
 assert.deepEqual([rowOf(midiTrackId).depth, rowOf(midiTrackId).child_track_ids], [0, undefined]);
 assert.deepEqual(song.return_tracks.map((t) => [t.name, t.type, t.send_index, t.index]), [["A-Reverb", "return", 0, undefined]]);
 assert.equal(song.main_track.type, "main");
 assert.equal(song.environment.server_version, JSON.parse((await (await fetch(`http://127.0.0.1:${PORT}/health`)).text())).version);
 assert.ok(!("devices" in rowOf(midiTrackId)) && !("mixer" in rowOf(midiTrackId)) && !song.truncated, "deep sections are opt-in");
-// group tracks are "group" everywhere; return tracks keep "other" outside song_get
-assert.equal((await call("track_get", { track_id: subId, include: [] })).type, "group");
-assert.equal((await call("track_set", { items: [{ track_id: busId, mute: false }] })).items[0].type, "group");
+// group tracks are is_group everywhere, type "other"; return tracks are "other", not groups, outside song_get
+const subGot = await call("track_get", { track_id: subId, include: [] });
+assert.deepEqual([subGot.type, subGot.is_group], ["other", true]);
+const busSet = (await call("track_set", { items: [{ track_id: busId, mute: false }] })).items[0];
+assert.deepEqual([busSet.type, busSet.is_group], ["other", true]);
+const returnGot = await call("track_get", { track_name: "A-Reverb", include: [] });
+assert.deepEqual([returnGot.type, returnGot.is_group], ["other", false]);
 
 // a kit: pad C1 with a Simpler, an empty pad D1, a Reverb switched off; and a return device
 const kitT = await call("track_create", { type: "midi", name: "Kit 2", devices: ["Drum Rack", "Reverb"] });
@@ -1609,7 +1635,7 @@ assert.match(noLoad.content[0].text, /Could not load the sample .*kick\.wav: .*T
 assert.equal((await devicesOf("Sampler T")).length, samplerCount, "nothing is left behind");
 // simpler_replace_sample: a failing import changes nothing
 fixtures.refuseImports(true);
-const noImport = await client.callTool({ name: "simpler_replace_sample", arguments: { simpler_device_id: plainLoad.id, file_path: snareWav } });
+const noImport = await client.callTool({ name: "simpler_replace_sample", arguments: { simpler_device_id: plainLoad.id, file_path: snareWav, import_into_project: true } });
 fixtures.refuseImports(false);
 assert.equal(noImport.isError, true);
 assert.match(noImport.content[0].text, /Could not import .*snare\.wav into the project: mock: could not copy/);
@@ -1718,6 +1744,8 @@ fixtures.setClipRegion(riff.id, { startMarker: 1, loopStart: 2, loopEnd: 4, loop
 cc = await call("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_name: "Chorus", duration: 6 });
 assert.deepEqual([cc.location.view, cc.location.scene_index, cc.duration, cc.looping], ["session", 1, 6, true]);
 assert.deepEqual(await playOf(cc.id), [[61, 0, 0.5], [62, 1, 0.5], [63, 2, 1], [62, 3, 0.5], [63, 4, 1], [62, 5, 0.5]]);
+// ...but the copy loops its whole length, so the beat before the source's loop repeats: said in `lost`
+assert.match(cc.lost.at(-1), /the source's start before its loop: the copy loops its whole 6 beats, so the part before the source's loop start \(its first 1 beat\) comes back/);
 const slotCopy = cc;
 // not looping, markers 1-3: the region; a longer copy repeats it
 fixtures.setClipRegion(riff.id, { looping: false, startMarker: 1, endMarker: 3, endTime: 2 });
@@ -1753,6 +1781,32 @@ await usageError("clip_copy", { clip_id: riff.id, target_id: (await slotsOf(midi
 await usageError("clip_copy", { clip_id: riff.id, track_name: "Copy Src", start_time: 40, color: "red" }, /Invalid color/);
 await usageError("clip_copy", { clip_id: riff.id, target_id: kit3.id, start_time: 0, track_name: "Copy Src" }, /not both/);
 assert.equal(await arrCount("Copy Src"), copyClipsBefore);
+// a session source's default length comes from its markers (its first pass), not its duration
+fixtures.setClipRegion(riff.id, { looping: true, startMarker: 1, loopStart: 2, loopEnd: 4, endTime: 9 });
+cc = await call("clip_copy", { clip_id: riff.id, track_id: copySrcTrack.id, start_time: 40 });
+assert.deepEqual([cc.start_time, cc.end_time, cc.lost.length], [40, 43, 2], "in the arrangement nothing is lost to the loop");
+assert.deepEqual(await playOf(cc.id), [[61, 0, 0.5], [62, 1, 0.5], [63, 2, 1]]);
+await call("clip_delete", { clip_id: cc.id });
+// a session copy repeats like the source when its start marker is inside its loop and it holds whole loops
+await call("clip_delete", { clip_id: slotCopy.id });
+fixtures.setClipRegion(riff.id, { startMarker: 3 });
+cc = await call("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_index: 1 });
+assert.deepEqual([cc.duration, cc.looping, cc.lost.length], [2, true, 2], "one loop, starting at the start marker");
+assert.deepEqual(await playOf(cc.id), [[63, 0, 1], [62, 1, 0.5]]);
+await call("clip_delete", { clip_id: cc.id });
+cc = await call("clip_copy", { clip_id: riff.id, track_name: "Copy Src", scene_index: 1, duration: 3 });
+assert.match(cc.lost.at(-1), /the loop length: the copy loops its whole 3 beats, not a whole number of the source's 2-beat loops/);
+await call("clip_delete", { clip_id: cc.id });
+// a long copy of a dense clip with a short loop: each repeat only visits its own notes
+const dense = await call("clip_create", { type: "midi", track_name: "Copy Src", start_time: 100, duration: 4 });
+fixtures.setClipRegion(dense.id, { looping: true, startMarker: 0, loopStart: 0, loopEnd: 1,
+  notes: Array.from({ length: 20000 }, (_, i) => ({ pitch: 60, startTime: 1 + i / 10000, duration: 0.01, velocity: 100 })) });
+let copyStarted = Date.now();
+cc = await call("clip_copy", { clip_id: dense.id, track_name: "Copy Src", start_time: 200, duration: 99999 });
+assert.ok(Date.now() - copyStarted < 3000, `the copy took ${Date.now() - copyStarted} ms`);
+assert.deepEqual([cc.duration, cc.note_count], [99999, 0]);
+await call("clip_delete", { clip_id: cc.id });
+await call("clip_delete", { clip_id: dense.id });
 // audio: file, warping, warp mode and markers/loop; Live warps the copy itself
 await call("track_create", { type: "audio", name: "Copy Audio" });
 const loopSrc = await call("clip_create", { type: "audio", track_name: "Copy Audio", start_time: 0, duration: 8, file_path: "/tmp/loop.wav",
@@ -2452,6 +2506,14 @@ for (const [time, name] of [[32, "Verse"], [96, "Chorus"]]) assert.ok(skeletonCu
 assert.deepEqual(skeletonRun.filter((c) => c.tool === "track_create").map((c) => [c.result.name, c.result.type]), [["Keys2", "midi"], ["Vox2", "audio"]]);
 await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { sections: "Intro:0" } }), -32602, /song_skeleton: sections: the bars of "Intro"/);
 await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { tracks: "Pad:video" } }), -32602, /"midi" or "audio"/);
+// entries split at their last colon, a value with a space is part of the name; parsing is linear
+// and arguments are capped, so a long whitespace-padded entry fails fast
+assert.match(await getPrompt("song_skeleton", { sections: "Part: A:4, Big Drop: very soon" }), /1\. Part: A: 4 bars[^]*2\. Big Drop: very soon: 8 bars/);
+let promptStarted = Date.now();
+await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { sections: `a${" ".repeat(60000)}b` } }), -32602, /song_skeleton: sections: at most 8000 characters, got 60002/);
+await rpcFailure(client.getPrompt({ name: "song_skeleton", arguments: { tracks: `a${" ".repeat(7990)}b` } }), -32602, /needs a name of 1-100/);
+await rpcFailure(client.getPrompt({ name: "chord_progression", arguments: { key: `C${" ".repeat(7000)}x\ny` } }), -32602, /is not a key/);
+assert.ok(Date.now() - promptStarted < 1000, `long prompt arguments took ${Date.now() - promptStarted} ms`);
 
 // chord_progression: Roman numerals in a key, spelled in it, close voicing; the clip as written
 const chordsText = await getPrompt("chord_progression", { progression: "ii7 V7 Imaj7", key: "Bb major", track: "Chords1" });
@@ -2622,6 +2684,12 @@ assert.equal(client.getServerVersion().version, pkg.version);
 assert.equal((await rpc({}, "/mcp?x=1")).status, 200);
 assert.equal((await rpc({}, "/mcpfoo")).status, 404);
 assert.equal((await raw("GET", "/healthz")).status, 404);
+// one trailing slash is fine, as clients are configured either way
+assert.equal((await rpc({}, "/mcp/")).status, 200);
+assert.equal((await rpc({}, "/mcp/?x=1")).status, 200);
+assert.equal((await raw("GET", "/health/")).status, 200);
+assert.equal((await rpc({}, "/mcp//")).status, 404);
+assert.equal((await rpc({}, "/mcp/x")).status, 404);
 // stateless server: no GET stream, no DELETE session
 for (const method of ["GET", "DELETE"]) {
   const r = await raw(method, "/mcp", { accept: "text/event-stream" });
@@ -2701,7 +2769,9 @@ fs.rmSync(storageDir3, { recursive: true, force: true });
 // Another extension instance with its own config.json (the same mock Live Set).
 const startInstance = async (port, config) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ableton-mcp-test-"));
-  fs.writeFileSync(path.join(dir, "config.json"), config);
+  // a string or bytes, or a function that makes the file itself
+  if (typeof config === "function") config(path.join(dir, "config.json"));
+  else fs.writeFileSync(path.join(dir, "config.json"), config);
   const sink = { dialogs: [], commands: {}, menus: [] };
   activate(makeActivation(dir, dir, sink));
   for (let i = 0; port; i++) {
@@ -2851,9 +2921,44 @@ assert.match(JSON.parse(lockedAuthedMcp.body).error.message, /"read_only" in con
 // a file that cannot be parsed but names a security setting locks too (the port falls
 // back to the default, so only the Status dialog is checked here)
 const unparsable = await startInstance(undefined, '{ "port": 8722, "read_only": true, }');
-assert.ok(unparsable.status().includes("Every request is refused: config.json names a security setting but could not be parsed"));
+const PARSE_LOCK = "Every request is refused: config.json could not be parsed (it may hold a security setting)";
+assert.ok(unparsable.status().includes(PARSE_LOCK));
+// it fails closed whatever the file holds: smart quotes (TextEdit), unquoted or single-quoted keys,
+// a file that cannot be read (here a directory), or a misspelled security setting
+const failClosed = [unparsable];
+for (const [config, reason] of [
+  ['{\u201cauth_token\u201d: \u201c0123456789abcdef0123\u201d}', PARSE_LOCK],
+  ["{ port: 8722, auth_token: \"0123456789abcdef0123\", read_only: true }", PARSE_LOCK],
+  ["{ 'read_only': true }", PARSE_LOCK],
+  ["[]", PARSE_LOCK],
+  [(file) => fs.mkdirSync(file), "Every request is refused: config.json exists but could not be read"],
+  [JSON.stringify({ readOnly: true, "auth-token": TOKEN }),
+    'Every request is refused: config.json has "readOnly": write it as "read_only"; config.json has "auth-token": write it as "auth_token"'],
+]) {
+  const instance = await startInstance(undefined, config);
+  failClosed.push(instance);
+  const page = instance.status();
+  assert.ok(page.includes(reason.replaceAll('"', "&#34;")), `${typeof config === "string" ? config : "unreadable"}: ${page}`);
+  assert.ok(!page.includes(TOKEN) && !page.includes("0123456789abcdef0123"), "the token is never shown");
+}
+// an empty file is no setting at all: the defaults, not a lock
+const empty = await startInstance(undefined, " \n");
+failClosed.push(empty);
+assert.ok(!empty.status().includes("Every request is refused") && empty.status().includes("is empty, using the defaults"));
+// UTF-16 with a byte order mark (Windows PowerShell 5.1) is read, in either byte order
+const utf16 = (text, bigEndian) => {
+  const le = Buffer.from(`\ufeff${text}`, "utf16le");
+  return bigEndian ? le.swap16() : le;
+};
+for (const [port, bigEndian] of [[PORT + 6, false], [PORT + 7, true]]) {
+  const instance = await startInstance(port, utf16(JSON.stringify({ port, auth_token: TOKEN, read_only: true }), bigEndian));
+  failClosed.push(instance);
+  const h = JSON.parse((await rawAt(port, "GET", "/health")).body);
+  assert.deepEqual([h.ok, h.read_only, h.auth_required, h.tool_count], [true, true, true, readTools.length + 1], `UTF-16 ${bigEndian ? "BE" : "LE"}`);
+  unauthorized(await rawAt(port, "POST", "/mcp/", rpcHeaders, listBody), false, "UTF-16 config: the token is required");
+}
 console.log = consoleLog;
-for (const dir of [ro.dir, authed.dir, locked.dir, lockedAuthed.dir, unparsable.dir]) fs.rmSync(dir, { recursive: true, force: true });
+for (const dir of [ro.dir, authed.dir, locked.dir, lockedAuthed.dir, ...failClosed.map((x) => x.dir)]) fs.rmSync(dir, { recursive: true, force: true });
 
 await client.close();
 fs.rmSync(storageDir, { recursive: true, force: true });

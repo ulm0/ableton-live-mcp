@@ -105,13 +105,17 @@ restart Live after a change. Default:
 
 Every value is validated at startup. Problems are logged to `ExtensionHost.txt` (prefixed
 `[ableton-live-mcp] config:`) and listed in the Status dialog: a `port` or
-`progress_notifications` of the wrong type falls back to its default, unknown keys are ignored.
+`progress_notifications` of the wrong type falls back to its default, unknown keys are ignored
+(misspelled security settings excepted, see below).
 The security settings never fall back to something less safe: an invalid `read_only`,
-`disabled_tools` or `auth_token`, a `disabled_tools` entry that names no tool (probably a typo),
-or a file that cannot be parsed but mentions one of them, makes `/mcp` refuse every request
-with `503` and the reason until the file is fixed. A switched-off tool is not listed at all;
-`batch` steps naming it fail with "switched off", the server instructions tell the agent which
-tools are off, and a prompt is only offered when every tool it uses is on.
+`disabled_tools` or `auth_token`, a misspelled one (`readOnly`, `auth-token`, ...), a
+`disabled_tools` entry that names no tool (probably a typo), or a file that exists but cannot be
+read or parsed (smart quotes, unquoted keys, ...), makes `/mcp` refuse every request with `503`
+and the reason until the file is fixed. The file is read as UTF-8, or as UTF-16 when it starts
+with a byte order mark (as Windows PowerShell 5.1 writes it); an empty file means the defaults.
+A switched-off tool is not listed at all; `batch` steps naming it fail with "switched off", the
+server instructions tell the agent which tools are off, and a prompt is only offered when every
+tool it uses is on.
 
 For example `{ "port": 8722, "read_only": true }`,
 `{ "port": 8722, "disabled_tools": ["execute_command", "track_delete", "scene_delete"] }` or
@@ -163,6 +167,8 @@ deleting a file deletes the preset.
   track), and `mixer_set` takes `targets` (same values on several mixers) or `all_tracks` with
   `exclude`. Every entry is validated before the first write, and all of a call's changes form
   **one undo step** in Live — as do the multi-value writes of `parameter_set` and `mixer_set`.
+  The exception: `cue_point_set` moves take up to three undo steps (creates, names, deletes);
+  its renames are one.
 - **Create with initial config**: `track_create` takes a `name` and `devices` (each a name or
   `{name, parameters}`) and returns the new track's `index` (Live inserts it after the selected
   track); `device_insert` takes initial `parameters`; `scene_create` and `cue_point_create` take
@@ -198,14 +204,17 @@ deleting a file deletes the preset.
 - **Samples, kits and copies in one call**: `drum_kit_build {track_name | rack_device_id, pads:
   [{note, sample_path, volume?, panning?}]}` builds or updates a Drum Rack kit — per pad it reuses
   or creates the chain receiving that note, inserts a Simpler, imports the sample into the project
-  and loads it; every path is checked before anything changes. `simpler_replace_sample` and
-  `device_insert {device_name: "Simpler", sample_path}` import samples into the project by default
-  (`import_into_project`), so the set survives being moved. `sample_search` finds audio files in
+  and loads it; every path is checked before anything changes. `device_insert {device_name:
+  "Simpler", sample_path}` imports the sample into the project by default (`import_into_project`),
+  so the set survives being moved; `simpler_replace_sample` loads the file as it is, as before,
+  unless it is given `import_into_project: true` (recommended). `sample_search` finds audio files in
   the configured `sample_roots` and Live's library folders (read-only, confined to those folders).
   Live's API has no clip copy, so `clip_copy` creates a new clip: MIDI notes are re-based to where
-  the source plays them (markers, loop) and repeated when the copy is longer, so it plays the same;
-  audio copies get the file, warping and markers/loop but Live warps them itself
-  (`fidelity: "approximate"`, `lost`, `warp_markers_match`). `move: true` deletes the source once
+  the source plays them (markers, loop) and repeated when the copy is longer, so it plays the same
+  in the arrangement; a session copy loops its whole length, so a source that starts before its
+  loop, or a length that is not whole loops, repeats differently (`lost` says so); audio copies
+  get the file, warping and markers/loop but Live warps them itself (`fidelity: "approximate"`,
+  `lost`, `warp_markers_match`). `move: true` deletes the source once
   the copy exists. `arrangement_copy_range` overwrites a target range with a copy of a source range
   across tracks ("repeat the chorus"): MIDI clips crossing the edges are trimmed, audio clips
   crossing them are skipped and listed (there is no way to insert time). `audio_track_consolidate`
@@ -214,13 +223,14 @@ deleting a file deletes the preset.
   a silence flag and a 32-part envelope read from the WAV; `persist: true` imports the render;
   `tracks` renders several audio tracks.
 - **Whole-set reads**: `song_get` lists every track with its `index`, `depth` in the group
-  hierarchy and, for group tracks, type `group` and `child_track_ids`; `include: ["devices",
-  "mixer", "clips"]` adds each track's device tree (through racks, with each device's on-state),
-  mixer values (sends labeled with return names) and clips (session and arrangement, in brief),
-  capped at 500 devices / 500 clips (`truncated` says where it stopped). `scene_get` returns one
-  session row across all tracks, `session_grid` a compact track × scene matrix, and
-  `arrangement_get {start_time, end_time, tracks?, include_take_lanes?}` the cue points and every
-  track's clips in a beat range, plus a derived `song_end` (the API has no song length).
+  hierarchy, `is_group` and, for group tracks, `child_track_ids` (their `type` stays `other`);
+  `include: ["devices", "mixer", "clips"]` adds each track's device tree (through racks, with each
+  device's on-state), mixer values (sends labeled with return names) and clips (session and
+  arrangement, in brief), capped at 500 devices / 500 clips (`truncated` says where it stopped).
+  `scene_get` returns one session row across all tracks, `session_grid` a compact track × scene
+  matrix, and `arrangement_get {start_time, end_time, tracks?, include_take_lanes?}` the cue
+  points and every track's clips in a beat range, plus a derived `song_end` (the API has no song
+  length).
   `song_audit` lists missing media files, Simplers without a sample, empty drum pads and track
   names that make `track_name` ambiguous. `clip_get`, `device_get` and `chain_get` report a
   `location` (track, scene index or take lane, path through racks).
@@ -279,7 +289,8 @@ deleting a file deletes the preset.
   - read-only (`readOnlyHint`): the `*_get` tools, `midi_clip_get_notes`, `parameter_find`,
     `device_preset_list`, `session_grid`, `song_audit`, `selection_wait`, `sample_search`,
     `dialog_result`, `batch_read` (it refuses steps that are not read-only);
-  - setters (`*_set`): non-destructive, idempotent;
+  - setters (`*_set`): non-destructive, idempotent — except `parameter_set` and `device_set`,
+    which take `delta` (added to the current value on every call), so they are not idempotent;
   - creators (`*_create`, `*_duplicate`, `*_insert*`, `import_file`, `render_track_audio` —
     `persist` copies the render into the project): non-destructive;
   - destructive (`destructiveHint`): the deletes, `track_clear_clips_in_range`,
@@ -325,14 +336,14 @@ call nor `batch` can reach them.
 ### Song
 | Tool | Description |
 |------|-------------|
-| `song_get` | Live Set state: tempo, scale, grid, tracks (with `index`, group hierarchy: `depth`, `child_track_ids`, type `group`), return/main tracks, scenes, cue points, environment info (incl. `server_version`). The entry point — returns the object ids used everywhere else. `include` fetches only selected sections; the opt-in `devices`, `mixer` and `clips` add every track's device tree (with on-states), mixer values and clips in one call (capped, see `truncated`). |
+| `song_get` | Live Set state: tempo, scale, grid, tracks (with `index`, group hierarchy: `depth`, `is_group`, `child_track_ids`), return/main tracks, scenes, cue points, environment info (incl. `server_version`). The entry point — returns the object ids used everywhere else. `include` fetches only selected sections; the opt-in `devices`, `mixer` and `clips` add every track's device tree (with on-states), mixer values and clips in one call (capped, see `truncated`). |
 | `song_set` | Set song properties (tempo). |
 | `song_audit` | Read-only check for missing media files (audio clips, Simpler samples), Simplers without a sample, empty drum pads and duplicate track names, each entry with ids and location. |
 
 ### Tracks
 | Tool | Description |
 |------|-------------|
-| `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. Group tracks have type `group`. |
+| `track_get` | Track detail: clip slots + clips, take lanes, arrangement clips, devices, mixer with values. Address by `track_id`, `track_index`, or `track_name`; `include` selects sections. Group tracks have `is_group: true` (their `type` is `other`). |
 | `track_set` | Name / mute / solo / arm, by id, index or name; `items` changes many tracks in one undo step. |
 | `track_create` | New audio or MIDI track, optionally with a `name` and `devices` (names, or `{name, parameters}` with initial values). Returns the track's `index` (Live inserts it after the selected track); a failing device is reported in `errors` instead of failing the call. |
 | `track_delete` | Delete track (by id, index, or exact name). |
@@ -356,11 +367,11 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 ### Clips
 | Tool | Description |
 |------|-------------|
-| `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes`, step `patterns` and `repeat` (and reject the audio-only `file_path`/`is_warped`/`loop_settings`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
+| `clip_create` | Create MIDI or audio clips in a session slot (by id, or track + `scene_index`/`scene_id`/`scene_name`), arrangement track, or take lane. The track can be given as `target_id` or `track_id`/`track_index`/`track_name`. MIDI clips take inline `notes`, step `patterns` and `repeat` (and ignore the audio-only `file_path`/`is_warped`/`loop_settings`, with a `warning`); `name`/`color` apply at creation. Audio files are imported into the project automatically. |
 | `clip_get` | Full clip detail (audio: warp settings + markers; MIDI: note count) and its `location`: session (track, scene, slot), arrangement (track) or take lane. |
 | `clip_set` | Name, color, mute, looping, warping, warp mode — for one clip, several (`items`), or every clip of a track (`select: {track_name, scope, name_contains}`), in one undo step. |
 | `clip_delete` | Delete a session or arrangement clip. |
-| `clip_copy` | Copy a clip to an empty session slot, an arrangement position or a take lane (`move: true` deletes the source afterwards). MIDI notes are re-based from the source's markers/loop and repeated to fill a longer `duration`; audio copies keep file, warping, warp mode and markers/loop but are re-warped by Live (`fidelity`, `lost`, `warp_markers_match`, `differs`). |
+| `clip_copy` | Copy a clip to an empty session slot, an arrangement position or a take lane (`move: true` deletes the source afterwards). MIDI notes are re-based from the source's markers/loop and repeated to fill a longer `duration` (a session copy loops its whole length: `lost` says when that repeats differently from the source); audio copies keep file, warping, warp mode and markers/loop but are re-warped by Live (`fidelity`, `lost`, `warp_markers_match`, `differs`). |
 | `midi_clip_get_notes` | Read MIDI notes: all, or those matching `select` (pitch/time range, `in_scale`, `every_nth`, `only_selected`); `format: "compact"` returns tuples. Notes carry `selected` when Live reports it. |
 | `midi_clip_set_notes` | Write notes: `replace` all or `merge` (layer on top); step `patterns` and `repeat` write repetitive parts in a few characters. |
 | `midi_clip_edit_notes` | Server-side note transforms — transpose, snap to scale, set fields, velocity scale/offset, time-shift, quantize (beats or Live's grid), swing, duration set/scale, legato, seeded humanize, delete — on the notes matching `select`, for one clip or several (`clip_ids`, one undo step). No read-modify-write roundtrip. |
@@ -377,7 +388,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `chain_get` | Rack chain detail: devices + chain mixer and `location`; drum chains report `receiving_note` and `receiving_note_name`. |
 | `rack_insert_chain` | Add a chain to a rack. |
 | `drum_chain_set` | Set the MIDI note of a drum rack pad (a number or a name like `"D1"`). |
-| `simpler_replace_sample` | Swap the sample in a Simpler; by default the file is imported into the project first (`import_into_project`). |
+| `simpler_replace_sample` | Swap the sample in a Simpler; `import_into_project: true` (recommended; default `false`, as before the option existed) imports the file into the project first and loads the copy. |
 | `drum_kit_build` | Build or update a Drum Rack kit from sample files: per pad `{note, sample_path, volume?, panning?}` the chain receiving the note is reused or created, a Simpler inserted, the sample imported and loaded. All paths are checked first; later per-pad failures are reported per pad. The rack is `rack_device_id`, or a MIDI track's Drum Rack (inserted when missing). |
 
 ### Parameters & mixing
@@ -387,7 +398,7 @@ Every tool above except `take_lane_set` takes the track as `track_id`, `track_in
 | `parameter_set` | Write parameter values (batch, single undo step, nothing written if any entry is invalid): each entry by id or `{track, device, parameter}` with one of `value`, `value_item`, `reset` or `delta`. |
 | `parameter_find` | Search parameter names (and quantized choices) across the set, a track or a device, through racks; returns ids, devices and readable paths. |
 | `mixer_get` | Volume / pan / sends of a track (by id, index or name) or chain, with parameter ids and unit hints. |
-| `mixer_set` | Set volume / pan / sends (by index or `return_name`) in one undo step: one track or chain, the same values on several (`targets`) or on every track (`all_tracks` minus `exclude`), or per-target values (`items`). `all_tracks` sets the top-most tracks only: a group covers its tracks, an excluded group keeps its tracks, and a group holding an excluded track is skipped while its other tracks are set; the result lists what was `skipped` and why. |
+| `mixer_set` | Set volume / pan / sends (by index or `return_name`) in one undo step: one track or chain, the same values on several (`targets`) or on every track (`all_tracks` minus `exclude`), or per-target values (`items`). `all_tracks` sets volume on the top-most tracks only (a group covers its tracks, which keep their volume: `skipped`, or `volume_skipped` when they get panning or sends); panning and sends go to every track, grouped ones included. An excluded group keeps its tracks, and a group holding an excluded track is skipped while its other tracks are set; the result lists what was `skipped` and why. |
 
 ### Files & rendering
 | Tool | Description |
@@ -542,8 +553,8 @@ Also: if the dev Extension Host crashes, Live may refuse the next control-channe
 - **401 Unauthorized**: `config.json` has an `auth_token` and the client did not send it as
   `Authorization: Bearer <token>` (see [Connect a client](#connect-a-client)).
 - **503 Service unavailable**: a security setting in `config.json` (`read_only`,
-  `disabled_tools`, `auth_token`) is invalid, or the file cannot be parsed and mentions one; the
-  error and the Status dialog say which. Fix it and restart Live.
+  `disabled_tools`, `auth_token`) is invalid or misspelled, or the file exists but cannot be read
+  or parsed; the error and the Status dialog say which. Fix it and restart Live.
 - **A tool is missing**: `read_only` or `disabled_tools` in `config.json` switched it off.
 - **"A dialog is already open in Live"**: the server shows one dialog at a time. `dialog_result`
   returns the open one's answer once the user closes it; if the user did close it and Live

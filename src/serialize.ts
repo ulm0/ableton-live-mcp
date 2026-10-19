@@ -105,7 +105,8 @@ export function trackType(track: Track<V>): string {
   if (track instanceof AudioTrack) return "audio";
   if (track instanceof MidiTrack) return "midi";
   // main, return, or group track: only the song's track lists tell them apart,
-  // so the server passes the role ("group", "return", "main") to trackSummary
+  // so the server passes the role ("return", "main") to trackSummary, or adds
+  // `is_group` for a group track
   return "other";
 }
 

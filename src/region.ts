@@ -62,6 +62,40 @@ export function playedSegments(r: Region, from: number, length: number): Segment
   return segments;
 }
 
+// A session copy of a MIDI clip loops its whole length when the source loops
+// (the API cannot set a new MIDI clip's loop, index.d.mts ClipSlot.createMidiClip
+// takes only a length). It repeats like the source only when the source plays
+// the same from its start on every pass — its start marker is inside its loop —
+// and the copy holds whole loops. Otherwise: what differs, for `lost`.
+export function sessionLoopMismatch(r: Region, length: number): string | undefined {
+  const loopLength = r.loopEnd - r.loopStart;
+  if (!r.looping || !(loopLength > EPS)) return undefined;
+  const beats = (n: number) => `${n} beat${n === 1 ? "" : "s"}`;
+  const intro = r.loopStart - r.startMarker;
+  if (intro > EPS)
+    return (
+      `the source's start before its loop: the copy loops its whole ${beats(length)}, so the part ` +
+      `before the source's loop start (its first ${beats(intro)}) comes back on every pass, while the ` +
+      "source plays it once"
+    );
+  const loops = length / loopLength;
+  if (Math.round(loops) < 1 || Math.abs(loops - Math.round(loops)) > 1e-6)
+    return (
+      `the loop length: the copy loops its whole ${beats(length)}, not a whole number of the source's ` +
+      `${loopLength}-beat loops, so its repeats differ from the source's`
+    );
+  return undefined;
+}
+
+// The default length of a copy of a session MIDI clip, from its markers: a
+// looping clip's first pass (any part before the loop, then the loop once),
+// or the region between the markers. (Clip.duration is endTime - startTime,
+// which index.d.mts does not define for a session clip.)
+export function sessionClipLength(r: Region): number {
+  if (!r.looping) return r.endMarker - r.startMarker;
+  return Math.max(0, r.loopStart - r.startMarker) + (r.loopEnd - r.loopStart);
+}
+
 // The notes a copy of `length` beats plays, from playback position `from`,
 // in the copy's own time (0 = its start). A note that starts before a played
 // stretch is not played (as in Live, which only plays notes from their start);
@@ -84,10 +118,21 @@ export function renderNotes(
     probability: n.probability === undefined ? undefined : Number(n.probability),
     velocityDeviation: n.velocityDeviation === undefined ? undefined : Number(n.velocityDeviation),
     releaseVelocity: n.releaseVelocity === undefined ? undefined : Number(n.releaseVelocity),
-  }));
+  })).filter((n) => Number.isFinite(n.startTime));
+  // Sorted by start, so each stretch only visits the notes starting in it (a
+  // long copy of a dense clip with a short loop must not scan every note once
+  // per repeat).
+  plain.sort((a, b) => a.startTime - b.startTime);
   for (const s of playedSegments(r, from, length)) {
-    for (const n of plain) {
-      if (n.startTime < s.clipFrom - EPS || n.startTime >= s.clipTo - EPS) continue;
+    let lo = 0;
+    let hi = plain.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (plain[mid].startTime < s.clipFrom - EPS) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < plain.length && plain[i].startTime < s.clipTo - EPS; i++) {
+      const n = plain[i];
       const duration = Math.min(n.duration, s.clipTo - n.startTime);
       if (!(duration > EPS)) continue;
       if (out.length >= limit)

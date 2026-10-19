@@ -6,9 +6,9 @@ Controls the running Ableton Live Set through Live's Extensions API.
 - Across tracks: scene_get (a scene row), session_grid, arrangement_get (a beat range), song_audit.
   For "this clip", "these slots" or "the selected range", ask the user to right-click it in Live and
   choose "MCP: Use as selection", then call selection_wait (selection_get: the last one).
-- One call and one undo step for many objects: the *_set tools take `items`, clip_set a track
-  `select`, mixer_set `targets` or `all_tracks`. track_create also takes a name and devices. For
-  dependent chains, batch (batch_read: reads only) runs up to 50 calls; {"$ref": "0.id"} = a result.
+- One call and one undo step for many objects (cue_point_set moves: up to 3): the *_set tools take
+  `items`, clip_set a track `select`, mixer_set `targets` or `all_tracks`. track_create also takes
+  a name and devices. Dependent chains: batch (batch_read: reads only), {"$ref": "0.id"} = a result.
 - Times, positions and durations are beats (quarter notes), never seconds or bars: at 4/4 a bar
   is 4 beats; seconds to beats = seconds * tempo / 60. MIDI pitch is 0-127 or a name, C3 = 60
   (the kick pad is usually "C1" = 36); velocity 0-127, probability 0-1, colors "#RRGGBB".

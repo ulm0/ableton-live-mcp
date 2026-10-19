@@ -61,8 +61,9 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
 ## Reading the whole set
 
 - `song_get` tracks carry `index` (the `track_index`), `depth` in the group hierarchy and
-  `group_track_id`; group tracks have type `"group"` and `child_track_ids` ("the drum bus" is
-  the group whose children are the drums). Return tracks carry `send_index` (their send).
+  `group_track_id`; group tracks have `is_group: true` and `child_track_ids` ("the drum bus" is
+  the group whose children are the drums) — their `type` is `"other"`, as for return tracks.
+  Return tracks carry `send_index` (their send).
 - Deep sections, only when listed in `include` (they imply the tracks): `devices` (each track's
   device tree through racks — chains with `receiving_note_name` and their devices — and every
   device's on-state `enabled`), `mixer` (volume, panning, sends labeled with `return_track`),
@@ -112,7 +113,8 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
   `all`).
 - Every entry is validated first: one bad entry (unknown name, bad color, warp settings on a
   MIDI clip) fails the whole call and changes nothing; the error names the entry
-  (`items[2]: ...`). The user undoes the whole batch with one Cmd/Ctrl-Z.
+  (`items[2]: ...`). The user undoes the whole batch with one Cmd/Ctrl-Z — except
+  `cue_point_set` moves, which take up to three undo steps (creates, names, deletes).
 - Prefer one batched call over a loop of single calls.
 
 ## Chaining dependent calls (`batch`, `batch_read`)
@@ -164,7 +166,8 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
     (or `target_id:<track_id>, scene_index:0`)
   - Arrangement: `clip_create {type:"midi", target_id:<midi_track_id>, start_time, duration, notes:[...]}`
   - Take lane: `clip_create {type:"midi", target_id:<take_lane_id>, start_time, duration, ...}`
-  - MIDI clips reject the audio-only `file_path`, `is_warped` and `loop_settings`.
+  - MIDI clips ignore the audio-only `file_path`, `is_warped` and `loop_settings` (the result's
+    `warning` says so): don't send them for MIDI.
 - Drum lines and other repetitive parts: step `patterns` instead of one note per hit — one
   pitch per string, `"x"` a hit, `"X"` an accent (`accent_velocity`, default 127), `"."` or `"-"`
   a rest, spaces and `|` ignored; `step` is the beats per character (default 0.25 = 1/16).
@@ -257,10 +260,11 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
   `panning` set the pad's chain mixer. Every path is checked first; a pad that fails later
   carries `error` in its entry while the others are built (Live cannot delete a chain, so a
   created chain stays). Need the paths? `sample_search {query:"808 kick"}` first.
-- Samples go into the project by default: `simpler_replace_sample` and `device_insert
-  {device_name:"Simpler", sample_path}` copy the file into the Live project and load the copy
+- Samples go into the project: `device_insert {device_name:"Simpler", sample_path}` and
+  `drum_kit_build` copy the file into the Live project by default and load the copy
   (`imported_path`), so the set keeps working when moved; `import_into_project:false` loads the
-  original.
+  original. `simpler_replace_sample` loads the file as it is unless you pass
+  `import_into_project:true` — do pass it.
 
 ## Copying, moving and presets (lossy)
 
@@ -289,9 +293,12 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
 - Many mixers at once, still one undo step: `targets:[{track_name:"Bass"}, {track_name:"Keys"}]`
   (same values), `items:[{track_name, volume}, ...]` (own values), or
   `all_tracks:true, exclude:[{track_name:"Vocals"}]` (every regular track but those).
-  `all_tracks` only sets the top-most tracks: a group covers its tracks (they are not set
-  again), tracks inside an excluded group are left alone, and a group holding an excluded
-  track is skipped while its other tracks are set. The result's `skipped` says why.
+  With `all_tracks`, volume is only set on the top-most tracks: a group covers its tracks
+  (they keep their volume, so it is not changed twice); panning and sends are set on every
+  track, grouped ones included (a grouped track's sends go straight to the returns), and a
+  covered track then says `volume_skipped`. Tracks inside an excluded group are left alone,
+  and a group holding an excluded track is skipped while its other tracks are set. The
+  result's `skipped` says why.
 - There is no relative or dB setting: read the current values with `mixer_get` first if the
   user asks for "3 dB quieter", and say that the dB mapping is approximate.
 - `mixer_get` returns the same values with parameter ids (for `parameter_set` automation).
@@ -338,7 +345,9 @@ Status dialog in Live too). Ask the user to fix their client or config; never gu
   track_name, scene_name}` (an empty session slot) or `{clip_id, target_id:<take lane>,
   start_time}`; `move:true` deletes the source afterwards; `duration` makes it longer (the loop
   repeats). Live's API has no clip copy: the copy is a new clip with a new id. MIDI notes are
-  re-based to where the source plays them, so it plays the same (`fidelity:"notes"`); audio
+  re-based to where the source plays them (`fidelity:"notes"`), so an arrangement copy plays the
+  same. A session copy loops its whole length: when the source starts before its loop, or the
+  copy is not whole loops, it repeats differently and `lost` says so — tell the user; audio
   copies keep the file, warping and markers but Live warps them itself
   (`fidelity:"approximate"`, check `warp_markers_match` and `differs`). Clip envelopes, groove
   and launch settings are never copied (`lost`) — say so.

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readConfigText } from "./config.js";
 
 // sample_search: a read-only walk of sample folders. Live's API has no browser
 // access, so the folders are the `sample_roots` of config.json plus Live's
@@ -32,7 +33,7 @@ export function configRoots(configFile: string | undefined): { roots: SampleRoot
   if (!configFile) return { roots: [], problems };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(configFile, "utf8").replace(/^\uFEFF/, "")); // a BOM, as config.ts
+    parsed = JSON.parse(readConfigText(configFile)); // UTF-8 or UTF-16, as config.ts reads it
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT")
       problems.push(`${configFile} could not be read: ${(e as Error).message}`);
