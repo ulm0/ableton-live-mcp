@@ -24,7 +24,7 @@
     "@types/node": "^24.1.0",
     "esbuild": "0.28.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.0"
   },
   "allowScripts": {
     "esbuild@0.28.0": true
